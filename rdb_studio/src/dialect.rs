@@ -302,6 +302,273 @@ pub fn role_password_sql(name: &str, password: &str) -> Result<String, String> {
     ))
 }
 
+// --- what each role may reach (the ROLES tab's detail)
+
+/// Every grant on a table outside the catalogues: who granted what to whom.
+/// A row whose grantor is its grantee is an owner's own privilege.
+pub fn table_grants_sql() -> &'static str {
+    "SELECT grantor, grantee, table_name, privilege_type, is_grantable FROM information_schema.role_table_grants \
+     WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY grantee, table_name"
+}
+
+/// The default privileges: (owner, object kind letter, ACL text).
+pub fn default_privileges_sql() -> &'static str {
+    "SELECT pg_get_userbyid(defaclrole) AS owner, defaclobjtype AS kind, defaclacl::text AS acl FROM pg_default_acl"
+}
+
+/// Every row-level security policy, with its table.
+pub fn policies_sql(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => {
+            "SELECT p.polname AS name, c.relname AS table_name, p.polcmd AS cmd, p.polpermissive AS permissive, \
+             p.polroles::text AS roles, p.polqual AS using_expr, p.polwithcheck AS check_expr \
+             FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid ORDER BY c.relname, p.polname"
+        }
+        Flavor::Postgres => {
+            "SELECT policyname AS name, tablename AS table_name, cmd, permissive = 'PERMISSIVE' AS permissive, \
+             roles::text AS roles, qual AS using_expr, with_check AS check_expr FROM pg_policies \
+             ORDER BY tablename, policyname"
+        }
+    }
+}
+
+/// The tables with row-level security on.
+pub fn rls_tables_sql() -> &'static str {
+    "SELECT relname AS name FROM pg_class WHERE relkind = 'r' AND relrowsecurity ORDER BY relname"
+}
+
+/// The grants, grouped per (grantee, table), and what each role owns.
+pub fn parse_table_grants(grid: &Grid) -> (Vec<crate::model::TableGrant>, Vec<(String, String)>) {
+    let mut grants: Vec<crate::model::TableGrant> = Vec::new();
+    let mut owned: Vec<(String, String)> = Vec::new();
+    for row in 0..grid.rows.len() {
+        let (Some(grantor), Some(grantee), Some(table), Some(privilege)) = (
+            grid.value(row, "grantor"),
+            grid.value(row, "grantee"),
+            grid.value(row, "table_name"),
+            grid.value(row, "privilege_type"),
+        ) else {
+            continue;
+        };
+        if grantor == grantee {
+            if !owned.iter().any(|(o, t)| o == grantee && t == table) {
+                owned.push((grantee.to_string(), table.to_string()));
+            }
+            continue;
+        }
+        let grantable = grid.value(row, "is_grantable").is_some_and(|v| v.eq_ignore_ascii_case("YES"));
+        let at = match grants.iter().position(|g| g.grantee == grantee && g.table == table) {
+            Some(i) => i,
+            None => {
+                grants.push(crate::model::TableGrant { grantee: grantee.to_string(), table: table.to_string(), ..Default::default() });
+                grants.len() - 1
+            }
+        };
+        let g = &mut grants[at];
+        if !g.privileges.iter().any(|p| p == privilege) {
+            g.privileges.push(privilege.to_string());
+        }
+        if grantable && !g.grantable.iter().any(|p| p == privilege) {
+            g.grantable.push(privilege.to_string());
+        }
+    }
+    (grants, owned)
+}
+
+/// The privilege an ACL letter stands for, as `aclitem` writes them.
+fn acl_privilege(letter: char) -> Option<&'static str> {
+    Some(match letter {
+        'r' => "SELECT",
+        'a' => "INSERT",
+        'w' => "UPDATE",
+        'd' => "DELETE",
+        'D' => "TRUNCATE",
+        'x' => "REFERENCES",
+        't' => "TRIGGER",
+        'm' => "MAINTAIN",
+        'X' => "EXECUTE",
+        'U' => "USAGE",
+        'C' => "CREATE",
+        _ => return None,
+    })
+}
+
+fn default_kind(letter: &str) -> &'static str {
+    match letter {
+        "S" => "SEQUENCES",
+        "f" => "FUNCTIONS",
+        "T" => "TYPES",
+        "n" => "SCHEMAS",
+        _ => "TABLES",
+    }
+}
+
+/// One entry per (owner, kind, grantee) of `pg_default_acl`.
+pub fn parse_default_privileges(grid: &Grid) -> Vec<crate::model::DefaultPrivilege> {
+    let mut out = Vec::new();
+    for row in 0..grid.rows.len() {
+        let owner = grid.value(row, "owner").unwrap_or("").to_string();
+        let kind = default_kind(grid.value(row, "kind").unwrap_or("r"));
+        let acl = grid.value(row, "acl").unwrap_or("").trim_matches(|c| c == '{' || c == '}');
+        for item in acl.split(',').filter(|i| !i.is_empty()) {
+            let item = item.trim_matches('"');
+            let Some((grantee, rest)) = item.split_once('=') else { continue };
+            let letters = rest.split('/').next().unwrap_or("");
+            let privileges: Vec<String> = letters.chars().filter_map(acl_privilege).map(str::to_string).collect();
+            out.push(crate::model::DefaultPrivilege {
+                owner: owner.clone(),
+                kind: kind.to_string(),
+                grantee: if grantee.is_empty() { "public".to_string() } else { grantee.to_string() },
+                privileges,
+            });
+        }
+    }
+    out
+}
+
+pub fn parse_policies(grid: &Grid) -> Vec<crate::model::PolicyInfo> {
+    (0..grid.rows.len())
+        .filter_map(|row| {
+            let command = match grid.value(row, "cmd").unwrap_or("*") {
+                "r" | "SELECT" => "SELECT",
+                "a" | "INSERT" => "INSERT",
+                "w" | "UPDATE" => "UPDATE",
+                "d" | "DELETE" => "DELETE",
+                _ => "ALL",
+            };
+            Some(crate::model::PolicyInfo {
+                name: grid.value(row, "name")?.to_string(),
+                table: grid.value(row, "table_name")?.to_string(),
+                command: command.to_string(),
+                permissive: grid.flag(row, "permissive").unwrap_or(true),
+                roles: grid
+                    .value(row, "roles")
+                    .unwrap_or("{public}")
+                    .trim_matches(|c| c == '{' || c == '}')
+                    .split(',')
+                    .map(|r| r.trim_matches('"').to_string())
+                    .filter(|r| !r.is_empty())
+                    .collect(),
+                using: grid.value(row, "using_expr").unwrap_or("").to_string(),
+                check: grid.value(row, "check_expr").unwrap_or("").to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The privileges a table grant can name, in the order PostgreSQL lists them.
+pub const TABLE_PRIVILEGES: [&str; 7] = ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"];
+
+/// `ALTER ROLE` for what changed between `role` and the wanted attributes;
+/// `Err` when nothing did or a value is not one.
+pub fn alter_role_sql(
+    role: &RoleInfo,
+    login: bool,
+    superuser: bool,
+    create_db: bool,
+    create_role: bool,
+    bypass_rls: bool,
+    conn_limit: &str,
+    valid_until: &str,
+) -> Result<String, String> {
+    let mut parts = Vec::new();
+    let mut flag = |now: bool, want: bool, on: &str, off: &str| {
+        if now != want {
+            parts.push(if want { on.to_string() } else { off.to_string() });
+        }
+    };
+    flag(role.can_login, login, "LOGIN", "NOLOGIN");
+    flag(role.superuser, superuser, "SUPERUSER", "NOSUPERUSER");
+    flag(role.create_db, create_db, "CREATEDB", "NOCREATEDB");
+    flag(role.create_role, create_role, "CREATEROLE", "NOCREATEROLE");
+    flag(role.bypass_rls, bypass_rls, "BYPASSRLS", "NOBYPASSRLS");
+    let limit = conn_limit.trim();
+    let limit: i64 = if limit.is_empty() { -1 } else { limit.parse().map_err(|_| "a connection limit is a whole number (empty: none)".to_string())? };
+    if limit < -1 {
+        return Err("a connection limit is -1 (none) or more".to_string());
+    }
+    if limit != role.conn_limit {
+        parts.push(format!("CONNECTION LIMIT {limit}"));
+    }
+    let until = valid_until.trim();
+    if until != role.valid_until.as_deref().unwrap_or("").trim() {
+        parts.push(format!("VALID UNTIL {}", quote_literal(if until.is_empty() { "infinity" } else { until })));
+    }
+    if parts.is_empty() {
+        return Err("nothing changed".to_string());
+    }
+    Ok(format!("ALTER ROLE {} {}", quote_ident(&role.name), parts.join(" ")))
+}
+
+/// `GRANT <privileges> ON <table> TO <role>`.
+pub fn grant_table_sql(table: &str, privileges: &[&str], role: &str, with_grant: bool) -> Result<String, String> {
+    if table.trim().is_empty() {
+        return Err("choose a table".to_string());
+    }
+    if privileges.is_empty() {
+        return Err("tick at least one privilege".to_string());
+    }
+    Ok(format!(
+        "GRANT {} ON {} TO {}{}",
+        privileges.join(", "),
+        quote_ident(table.trim()),
+        quote_ident(role),
+        if with_grant { " WITH GRANT OPTION" } else { "" }
+    ))
+}
+
+pub fn revoke_table_sql(table: &str, privileges: &[String], role: &str) -> String {
+    format!("REVOKE {} ON {} FROM {}", privileges.join(", "), quote_ident(table), quote_ident(role))
+}
+
+/// `ALTER DEFAULT PRIVILEGES GRANT … ON TABLES TO role`: what tables the
+/// session's role creates from now on give `role`.
+pub fn grant_default_sql(privileges: &[&str], role: &str) -> Result<String, String> {
+    if privileges.is_empty() {
+        return Err("tick at least one privilege".to_string());
+    }
+    Ok(format!("ALTER DEFAULT PRIVILEGES GRANT {} ON TABLES TO {}", privileges.join(", "), quote_ident(role)))
+}
+
+pub fn revoke_default_sql(d: &crate::model::DefaultPrivilege, current_user: &str) -> String {
+    let owner = if d.owner.is_empty() || d.owner == current_user { String::new() } else { format!("FOR ROLE {} ", quote_ident(&d.owner)) };
+    format!(
+        "ALTER DEFAULT PRIVILEGES {owner}REVOKE {} ON {} FROM {}",
+        d.privileges.join(", "),
+        d.kind,
+        if d.grantee == "public" { "PUBLIC".to_string() } else { quote_ident(&d.grantee) }
+    )
+}
+
+/// `CREATE POLICY name ON table FOR command TO role USING (…) WITH CHECK (…)`.
+pub fn create_policy_sql(name: &str, table: &str, command: &str, role: &str, using: &str, check: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name the policy".to_string());
+    }
+    if table.trim().is_empty() {
+        return Err("choose its table".to_string());
+    }
+    let (using, check) = (using.trim(), check.trim());
+    if using.is_empty() && check.is_empty() {
+        return Err("give it a USING condition (rows it may see) or a WITH CHECK (rows it may write)".to_string());
+    }
+    if matches!(command, "SELECT" | "DELETE") && !check.is_empty() {
+        return Err(format!("a {command} policy takes USING only"));
+    }
+    if command == "INSERT" && !using.is_empty() {
+        return Err("an INSERT policy takes WITH CHECK only".to_string());
+    }
+    let mut sql = format!("CREATE POLICY {} ON {} FOR {command} TO {}", quote_ident(name), quote_ident(table.trim()), quote_ident(role));
+    if !using.is_empty() {
+        sql.push_str(&format!(" USING ({using})"));
+    }
+    if !check.is_empty() {
+        sql.push_str(&format!(" WITH CHECK ({check})"));
+    }
+    Ok(sql)
+}
+
 /// A statement as it may be kept and shown: every string literal after
 /// `PASSWORD` replaced, so the history, its export and the status bar never
 /// hold a password the console sent (or one typed in the editor).
@@ -3268,6 +3535,54 @@ mod tests {
     }
 
     #[test]
+    fn what_a_role_may_reach_is_read_and_changed() {
+        let grants = index_grid(
+            &["grantor", "grantee", "table_name", "privilege_type", "is_grantable"],
+            &[
+                &["rdb", "app", "pay", "SELECT", "NO"],
+                &["rdb", "app", "pay", "INSERT", "YES"],
+                &["rdb", "rdb", "pay", "SELECT", "YES"],
+                &["rdb", "auditors", "sec", "SELECT", "NO"],
+            ],
+        );
+        let (g, owned) = parse_table_grants(&grants);
+        assert_eq!(owned, [("rdb".to_string(), "pay".to_string())]);
+        assert_eq!(g.len(), 2);
+        assert_eq!((g[0].privileges.clone(), g[0].grantable.clone()), (vec!["SELECT".to_string(), "INSERT".to_string()], vec!["INSERT".to_string()]));
+
+        let d = parse_default_privileges(&index_grid(&["owner", "kind", "acl"], &[&["rdb", "r", "{auditors=rw/rdb,=r/rdb}"]]));
+        assert_eq!(d.len(), 2);
+        assert_eq!((d[0].grantee.as_str(), d[0].kind.as_str(), d[0].privileges.clone()), ("auditors", "TABLES", vec!["SELECT".to_string(), "UPDATE".to_string()]));
+        assert_eq!(d[1].grantee, "public");
+        assert_eq!(revoke_default_sql(&d[0], "rdb"), "ALTER DEFAULT PRIVILEGES REVOKE SELECT, UPDATE ON TABLES FROM \"auditors\"");
+
+        let p = parse_policies(&index_grid(
+            &["name", "table_name", "cmd", "permissive", "roles", "using_expr", "check_expr"],
+            &[&["own", "pay", "r", "t", "{app,ops}", "id > 1", ""]],
+        ));
+        assert_eq!((p[0].command.as_str(), p[0].roles.clone()), ("SELECT", vec!["app".to_string(), "ops".to_string()]));
+
+        let role = RoleInfo { name: "app".into(), can_login: true, conn_limit: -1, ..RoleInfo::default() };
+        assert_eq!(alter_role_sql(&role, true, false, false, false, false, "", ""), Err("nothing changed".to_string()));
+        assert_eq!(
+            alter_role_sql(&role, false, false, true, false, false, "5", "2027-01-01").unwrap(),
+            "ALTER ROLE \"app\" NOLOGIN CREATEDB CONNECTION LIMIT 5 VALID UNTIL '2027-01-01'"
+        );
+        assert!(alter_role_sql(&role, true, false, false, false, false, "x", "").is_err());
+        assert_eq!(
+            grant_table_sql("sec", &["SELECT"], "app", true).unwrap(),
+            "GRANT SELECT ON \"sec\" TO \"app\" WITH GRANT OPTION"
+        );
+        assert!(grant_table_sql("sec", &[], "app", false).is_err());
+        assert_eq!(
+            create_policy_sql("mine", "pay", "SELECT", "app", "owner = current_user", "").unwrap(),
+            "CREATE POLICY \"mine\" ON \"pay\" FOR SELECT TO \"app\" USING (owner = current_user)"
+        );
+        assert!(create_policy_sql("p", "pay", "SELECT", "app", "", "x").is_err());
+        assert!(create_policy_sql("p", "pay", "INSERT", "app", "x", "").is_err());
+    }
+
+    #[test]
     fn a_role_is_created_in_the_form_both_servers_take() {
         assert_eq!(
             create_role_sql(" ops ", "pw'1", true, true).unwrap(),
@@ -3980,5 +4295,104 @@ mod broker_tests {
             "BROKER UNBIND 'ev' FROM 'orders' KEY 'k'"
         );
         assert_eq!(broker_retention(7 * 86_400_000), "7d");
+    }
+}
+
+// Broker permissions (GRANT/REVOKE … ON TOPIC|QUEUE|EXCHANGE, ALTER … OWNER TO)
+
+pub const BROKER_GRANTS_SQL: &str = "BROKER SHOW GRANTS";
+
+/// A grantee: PUBLIC as the keyword, a role quoted.
+fn broker_grantee(role: &str) -> Result<String, String> {
+    let r = role.trim();
+    if r.is_empty() {
+        return Err("A role (or PUBLIC) is needed".to_string());
+    }
+    Ok(if r.eq_ignore_ascii_case("public") { "PUBLIC".to_string() } else { quote_ident(r) })
+}
+
+/// `ON TOPIC "x"`, or `ON ALL TOPICS` for an empty name.
+fn broker_on(kind: crate::model::BrokerObjectKind, object: &str) -> String {
+    let o = object.trim();
+    if o.is_empty() {
+        format!("ON ALL {}S", kind.label())
+    } else {
+        format!("ON {} {}", kind.label(), quote_ident(o))
+    }
+}
+
+/// `GRANT …` (or `REVOKE … FROM`) for the permissions form.
+pub fn broker_grant_sql(form: &crate::model::BrokerPermForm, revoke: bool) -> Result<String, String> {
+    let [a, b] = form.kind.privileges();
+    let privileges = match (form.first, form.second) {
+        (true, true) => "ALL".to_string(),
+        (true, false) => a.to_string(),
+        (false, true) => b.to_string(),
+        (false, false) => return Err(format!("Pick {a}, {b} or both")),
+    };
+    let on = broker_on(form.kind, &form.object);
+    let who = broker_grantee(&form.grantee)?;
+    Ok(if revoke {
+        format!("REVOKE {privileges} {on} FROM {who}")
+    } else {
+        format!("GRANT {privileges} {on} TO {who}")
+    })
+}
+
+/// One listed grant taken back.
+pub fn broker_revoke_row_sql(g: &crate::model::BrokerGrant) -> String {
+    let kind = g.object_type.to_ascii_uppercase();
+    let who = if g.grantee.eq_ignore_ascii_case("public") { "PUBLIC".to_string() } else { quote_ident(&g.grantee) };
+    format!("REVOKE {} ON {kind} {} FROM {who}", g.privilege.to_ascii_uppercase(), quote_ident(&g.object))
+}
+
+pub fn broker_owner_sql(form: &crate::model::BrokerPermForm) -> Result<String, String> {
+    let o = form.object.trim();
+    if o.is_empty() {
+        return Err("An object is needed to change its owner".to_string());
+    }
+    let r = form.owner.trim();
+    if r.is_empty() || r.eq_ignore_ascii_case("public") {
+        return Err("A role is needed as the new owner".to_string());
+    }
+    Ok(format!("ALTER {} {} OWNER TO {}", form.kind.label(), quote_ident(o), quote_ident(r)))
+}
+
+pub fn parse_broker_grants(grid: &Grid) -> Vec<crate::model::BrokerGrant> {
+    (0..grid.rows.len())
+        .map(|i| {
+            let t = |c: &str| grid.value(i, c).unwrap_or("").to_string();
+            crate::model::BrokerGrant {
+                object_type: t("object_type"),
+                object: t("object"),
+                owner: t("owner"),
+                grantee: t("grantee"),
+                privilege: t("privilege"),
+                grantor: t("grantor"),
+                grantable: broker_flag(grid, i, "grantable"),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod broker_acl_tests {
+    use super::*;
+    use crate::model::{BrokerGrant, BrokerObjectKind, BrokerPermForm};
+
+    #[test]
+    fn broker_permission_statements() {
+        let mut f = BrokerPermForm { object: "orders".into(), grantee: "app".into(), first: true, second: true, ..Default::default() };
+        assert_eq!(broker_grant_sql(&f, false).unwrap(), "GRANT ALL ON TOPIC \"orders\" TO \"app\"");
+        f.second = false;
+        assert_eq!(broker_grant_sql(&f, true).unwrap(), "REVOKE PRODUCE ON TOPIC \"orders\" FROM \"app\"");
+        f.first = false;
+        assert!(broker_grant_sql(&f, false).is_err());
+        let x = BrokerPermForm { kind: BrokerObjectKind::Exchange, grantee: "public".into(), second: true, ..Default::default() };
+        assert_eq!(broker_grant_sql(&x, false).unwrap(), "GRANT BIND ON ALL EXCHANGES TO PUBLIC");
+        let o = BrokerPermForm { kind: BrokerObjectKind::Queue, object: "jobs".into(), owner: "billing".into(), ..Default::default() };
+        assert_eq!(broker_owner_sql(&o).unwrap(), "ALTER QUEUE \"jobs\" OWNER TO \"billing\"");
+        let g = BrokerGrant { object_type: "topic".into(), object: "a.b".into(), grantee: "PUBLIC".into(), privilege: "CONSUME".into(), ..Default::default() };
+        assert_eq!(broker_revoke_row_sql(&g), "REVOKE CONSUME ON TOPIC \"a.b\" FROM PUBLIC");
     }
 }

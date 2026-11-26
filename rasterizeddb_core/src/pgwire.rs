@@ -998,8 +998,9 @@ async fn serve_pgwire(
         #[cfg(not(unix))]
         let auth = auth.clone();
         let registered = sessions.admit(&stream);
+        let quiet = registered.as_ref().map(|r| r.quiet.clone());
 
-        tokio::spawn(async move {
+        tokio::spawn(SESSION_QUIET.scope(quiet, async move {
             let context = ConnectionContext {
                 too_many: matches!(admission, Admission::TooMany(_)),
                 handshake_finished: StdArc::new(AtomicBool::new(false)),
@@ -1014,10 +1015,10 @@ async fn serve_pgwire(
             // Released here at the latest; on a panic, by the unwind.
             drop(admission);
             drop(registered);
-        });
+        }));
     }
 
-    drain_pgwire_connections(&active).await;
+    drain_pgwire_connections(&active, &sessions).await;
     end_remaining_sessions(&active, &sessions).await;
 
     Ok(())
@@ -1165,7 +1166,7 @@ async fn seed_roles(database: &Arc<Database>, auth: &AuthConfig) -> Result<(), S
 /// Waits out the sessions still running once the accept loop has stopped. The
 /// grace period bounds it, so one long-running query cannot hold the process
 /// open indefinitely.
-async fn drain_pgwire_connections(active: &AtomicUsize) {
+async fn drain_pgwire_connections(active: &AtomicUsize, sessions: &SessionsEnd) {
     const DRAIN_GRACE: Duration = Duration::from_secs(10);
     const DRAIN_POLL: Duration = Duration::from_millis(50);
 
@@ -1181,6 +1182,9 @@ async fn drain_pgwire_connections(active: &AtomicUsize) {
     let deadline = tokio::time::Instant::now() + DRAIN_GRACE;
 
     loop {
+        // Idle sessions outside a block have nothing to finish: ended at
+        // once, and on every tick after, as busy ones become idle.
+        sessions.end_quiet();
         let remaining = active.load(Ordering::Relaxed);
 
         if remaining == 0 {
@@ -1226,7 +1230,18 @@ struct ServerSessions {
     /// half was shut down.
     ended: tokio::sync::watch::Sender<bool>,
     next: std::sync::atomic::AtomicU64,
-    open: parking_lot::Mutex<Vec<(u64, WatchSocket)>>,
+    /// Each admitted session's socket, and whether it is quiet: waiting for
+    /// its next message outside a transaction block. See [`SessionsEnd::end_quiet`].
+    open: parking_lot::Mutex<Vec<(u64, WatchSocket, StdArc<AtomicBool>)>>,
+    /// The drain has begun: a quiet session whose read was ended is told
+    /// 57P01, as one ended by `end_all` is.
+    draining: AtomicBool,
+}
+
+tokio::task_local! {
+    /// The running session's quiet flag (`ServerSessions::open`), set by its
+    /// message loop around each wait for a message.
+    static SESSION_QUIET: Option<StdArc<AtomicBool>>;
 }
 
 static SERVERS: parking_lot::Mutex<Vec<(usize, StdArc<ServerSessions>)>> = parking_lot::Mutex::new(Vec::new());
@@ -1236,11 +1251,12 @@ static SERVERS: parking_lot::Mutex<Vec<(usize, StdArc<ServerSessions>)>> = parki
 struct SessionEntry {
     server: StdArc<ServerSessions>,
     id: u64,
+    quiet: StdArc<AtomicBool>,
 }
 
 impl Drop for SessionEntry {
     fn drop(&mut self) {
-        self.server.open.lock().retain(|(id, _)| *id != self.id);
+        self.server.open.lock().retain(|(id, _, _)| *id != self.id);
     }
 }
 
@@ -1257,11 +1273,34 @@ impl SessionsEnd {
     fn admit(&self, stream: &PgSock) -> Option<SessionEntry> {
         let dup = watch_socket(stream).ok()?;
         let id = self.server.next.fetch_add(1, Ordering::Relaxed);
-        self.server.open.lock().push((id, dup));
+        let quiet = StdArc::new(AtomicBool::new(false));
+        self.server.open.lock().push((id, dup, quiet.clone()));
         Some(SessionEntry {
             server: self.server.clone(),
             id,
+            quiet,
         })
+    }
+
+    /// Ends, now, every session that is quiet: idle, outside a transaction
+    /// block, so there is nothing to wait for. Called through the drain, so
+    /// a session that finishes its block during the grace is ended then
+    /// rather than at its end. Without this an idle pooled connection, which
+    /// never ends by itself, held every stop for the whole 10 s grace —
+    /// denevcloud's units took ~10 s to stop. PostgreSQL's fast shutdown
+    /// ends idle sessions the same way; one running a statement or holding
+    /// a block still gets the grace.
+    ///
+    /// A session that turns busy between the check and the shutdown of its
+    /// read half runs that statement to its end and is ended at its next
+    /// read, as `end_all` ends it.
+    fn end_quiet(&self) {
+        self.server.draining.store(true, Ordering::Release);
+        for (_, socket, quiet) in self.server.open.lock().iter() {
+            if quiet.load(Ordering::Acquire) {
+                shutdown_read(socket);
+            }
+        }
     }
 
     /// Marks the server ending and shuts down the read half of every open
@@ -1269,7 +1308,7 @@ impl SessionsEnd {
     fn end_all(&self) {
         self.server.ending.store(true, Ordering::Release);
         self.server.ended.send_replace(true);
-        for (_, socket) in self.server.open.lock().iter() {
+        for (_, socket, _) in self.server.open.lock().iter() {
             shutdown_read(socket);
         }
     }
@@ -1290,7 +1329,7 @@ impl SessionsEnd {
             .iter()
             .rev()
             .find(|(k, _)| *k == key)
-            .is_some_and(|(_, s)| s.ending.load(Ordering::Acquire))
+            .is_some_and(|(_, s)| s.ending.load(Ordering::Acquire) || s.draining.load(Ordering::Acquire))
     }
 }
 
@@ -2801,6 +2840,8 @@ where
     // is read.
     let mut pending: std::collections::VecDeque<(u8, Vec<u8>)> = std::collections::VecDeque::new();
 
+    // This session's flag for the shutdown drain (`SessionsEnd::end_quiet`).
+    let quiet = SESSION_QUIET.try_with(|q| q.clone()).ok().flatten();
 
     loop {
         let (tag, payload) = match pending.pop_front() {
@@ -2817,6 +2858,10 @@ where
                 // completed has consumed nothing, so a message arriving as the timer
                 // fires is not torn.
                 let idle = if ready { state.idle_limit() } else { None };
+                // Quiet while it waits with nothing open: the drain may end it.
+                if let Some(q) = &quiet {
+                    q.store(ready && state.transaction.is_none(), Ordering::Release);
+                }
                 let deadline = idle.map(|(limit, kind)| (tokio::time::Instant::now() + limit, kind));
                 // A listening session is sent its notifications while it waits
                 // (`notify`), as drivers' listen loops wait for them; the read
@@ -2847,7 +2892,12 @@ where
                         }
                     };
                     match woke {
-                        Woke::Read(read) => break read,
+                        Woke::Read(read) => {
+                            if let Some(q) = &quiet {
+                                q.store(false, Ordering::Release);
+                            }
+                            break read;
+                        }
                         Woke::Note(Some(note)) => {
                             notify::send_note(stream, &note).await?;
                             stream.flush().await?;
@@ -6237,8 +6287,10 @@ async fn describe_resolved(
         QueryPurpose::Broker(sql) => {
             return Ok(Some((crate::core::broker::sql::result_fields(sql), true)));
         }
+        // One text column of answer lines, named for what they are (it was
+        // "replication", whose arm this was copied from).
         QueryPurpose::Ledger(_) => {
-            return Ok(Some((crate::replication::sql::result_fields(), true)));
+            return Ok(Some((vec![("ledger".to_string(), DbType::STRING)], true)));
         }
         QueryPurpose::Replication(sql) => {
             return Ok(Some((
@@ -10081,7 +10133,7 @@ where
             // scalar subqueries were replaced by their values.
             match crate::core::rql::no_from::parse(stmt) {
                 Some(Ok(select)) => {
-                    let rows = match select.rows() {
+                    let rows = match select.wait().await.and_then(|()| select.rows()) {
                         Ok(rows) => rows,
                         Err(e) => {
                             let code = sqlstate_for(&e);
@@ -10220,6 +10272,13 @@ where
     // else until COMMIT. Outside one, `execute` opens and closes a transaction
     // of its own.
     let resp = match state.current_tx() {
+        // A `BROKER` statement runs as the session's role, which the
+        // executor does not know (`privilege_statements::broker_statement`).
+        #[cfg(feature = "broker")]
+        _ if matches!(purpose_exec, QueryPurpose::Broker(_)) => {
+            let QueryPurpose::Broker(sql) = &purpose_exec else { unreachable!() };
+            privilege_statements::broker_statement(database, state, sql).await
+        }
         Some(tx) => {
             crate::core::rql::executor::execute_in_txn(purpose_exec, database.clone(), tx).await
         }
@@ -10291,7 +10350,7 @@ pub(crate) fn result_description(
             crate::replication::sql::structured_fields(sql)
                 .unwrap_or_else(crate::replication::sql::result_fields),
         ),
-        QueryPurpose::Ledger(_) => Some(crate::replication::sql::result_fields()),
+        QueryPurpose::Ledger(_) => Some(vec![("ledger".to_string(), DbType::STRING)]),
         // Likewise for the storage surface: its rows describe directories, not
         // a relation, so nothing can derive their names from a schema.
         #[cfg(feature = "storage_pools")]
@@ -11376,6 +11435,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     }
     if has("rdb03: ") {
         return "RDB03";
+    }
+    // `pg_sleep` evaluated over rows (`pg_functions::call`), wrapped by the
+    // scan that evaluated it: feature_not_supported.
+    if has("() is supported only as an item of a select with no from") {
+        return "0A000";
     }
     if has("more than one row returned by a subquery used as an expression") {
         return "21000";

@@ -548,11 +548,13 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
             let mut lines = Vec::new();
             for (name, (newest, state)) in &secrets {
                 let v = newest.as_ref();
+                // `updated_us`: when the newest version was set.
                 lines.push(format!(
-                    "{name} v{} {state}{}{}",
+                    "{name} v{} {state}{}{}{}",
                     v.map_or(0, |r| r.version),
                     v.filter(|r| !r.content_type.is_empty()).map_or_else(String::new, |r| format!(" type={}", r.content_type)),
                     v.filter(|r| r.expires_at != 0).map_or_else(String::new, |r| format!(" expires_us={}", r.expires_at)),
+                    v.filter(|r| r.created_at != 0).map_or_else(String::new, |r| format!(" updated_us={}", r.created_at)),
                 ));
             }
             Ok(reply(lines, Vec::new()))

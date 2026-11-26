@@ -16,6 +16,8 @@ pub mod dashboard;
 pub mod connect;
 pub mod data;
 pub mod keys;
+#[cfg(feature = "enterprise")]
+pub mod ledger_kit;
 pub mod overview;
 pub mod migrate;
 pub mod query;
@@ -232,19 +234,18 @@ fn pane(studio: &Studio) -> Element<'_, Message> {
         Tab::Roles => roles::view(studio),
         Tab::Config => config::view(studio),
         #[cfg(feature = "enterprise")]
-        Tab::Ledger => framed(
-            "LEDGER",
-            None,
-            rdb_studio_enterprise::view(
-                studio.ledger.as_ref(),
-                rdb_studio_enterprise::Actions {
-                    reload: Message::ReloadLedger,
-                    verify: Message::VerifyLedger,
-                    audit: Message::LedgerAudit,
-                    run: Message::LedgerRun,
-                    input: Message::LedgerInput,
-                },
-            ),
+        Tab::Ledger => rdb_studio_enterprise::view(
+            studio.ledger.as_ref(),
+            rdb_studio_enterprise::Actions {
+                reload: Message::ReloadLedger,
+                verify: Message::VerifyLedger,
+                audit: Message::LedgerAudit,
+                run: Message::LedgerRun,
+                input: Message::LedgerInput,
+                confirm: ledger_confirm,
+                open_table: Message::LedgerOpenTable,
+            },
+            &ledger_kit::StudioKit { studio },
         ),
     };
     container(inner).width(Fill).height(Fill).padding(12).into()
@@ -2122,6 +2123,13 @@ pub fn elide(value: &str, limit: usize) -> std::borrow::Cow<'_, str> {
     }
     let head: String = flattened.chars().take(limit - 1).collect();
     std::borrow::Cow::Owned(format!("{}…", head))
+}
+
+/// The LEDGER page's destructive statements, through the confirmation
+/// dialog, reloading the page once run.
+#[cfg(feature = "enterprise")]
+fn ledger_confirm(title: String, body: String, statement: String) -> Message {
+    Message::Confirm { title, body, statement, refresh: Refresh::Ledger }
 }
 
 /// Wraps a destructive statement in a confirmation.

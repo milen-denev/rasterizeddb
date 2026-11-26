@@ -388,6 +388,57 @@ pub struct RoleInfo {
     pub member_of: Vec<String>,
 }
 
+/// What each role may reach beyond its attributes, for the ROLES tab:
+/// table grants, default privileges and row-level security policies.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RoleAccess {
+    /// Grants on tables (vaults and ledger tables among them), one entry per
+    /// (grantee, table). An owner's implicit privileges are in `owned`.
+    pub grants: Vec<TableGrant>,
+    /// `(owner, table)`: the tables each role owns.
+    pub owned: Vec<(String, String)>,
+    pub defaults: Vec<DefaultPrivilege>,
+    pub policies: Vec<PolicyInfo>,
+    /// Tables with row-level security enabled.
+    pub rls_tables: Vec<String>,
+    /// Which parts the server answered: a server without policies still
+    /// shows its grants.
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TableGrant {
+    pub grantee: String,
+    pub table: String,
+    pub privileges: Vec<String>,
+    /// The privileges held WITH GRANT OPTION.
+    pub grantable: Vec<String>,
+}
+
+/// One `ALTER DEFAULT PRIVILEGES` entry: what `grantee` gets on objects of
+/// `kind` that `owner` creates from now on.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DefaultPrivilege {
+    pub owner: String,
+    /// `TABLES`, `SEQUENCES`, `FUNCTIONS`, `TYPES` or `SCHEMAS`.
+    pub kind: String,
+    pub grantee: String,
+    pub privileges: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PolicyInfo {
+    pub name: String,
+    pub table: String,
+    /// `ALL`, `SELECT`, `INSERT`, `UPDATE` or `DELETE`.
+    pub command: String,
+    pub permissive: bool,
+    /// The roles it applies to; `public` for every role.
+    pub roles: Vec<String>,
+    pub using: String,
+    pub check: String,
+}
+
 /// A column of a table.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ColumnInfo {
@@ -2568,6 +2619,8 @@ pub struct BrokerSnapshot {
     pub subscriptions: Vec<BrokerSubscription>,
     pub exchanges: Vec<BrokerExchange>,
     pub bindings: Vec<BrokerBinding>,
+    /// `BROKER SHOW GRANTS`; empty on a server without broker permissions.
+    pub grants: Vec<BrokerGrant>,
 }
 
 /// What the create form makes.
@@ -2694,4 +2747,64 @@ impl Default for BrokerReadForm {
     fn default() -> Self {
         Self { partition: String::new(), from: "EARLIEST".to_string(), limit: "100".to_string() }
     }
+}
+
+/// One row of `BROKER SHOW GRANTS`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerGrant {
+    /// `topic`, `queue` or `exchange`.
+    pub object_type: String,
+    pub object: String,
+    pub owner: String,
+    /// A role, or `PUBLIC`.
+    pub grantee: String,
+    /// `OWNER` for the owner's own row, else PRODUCE, CONSUME, PUBLISH or BIND.
+    pub privilege: String,
+    pub grantor: String,
+    pub grantable: bool,
+}
+
+/// What a grant, a revoke or an owner change is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BrokerObjectKind {
+    #[default]
+    Topic,
+    Queue,
+    Exchange,
+}
+
+impl BrokerObjectKind {
+    pub const ALL: [BrokerObjectKind; 3] = [BrokerObjectKind::Topic, BrokerObjectKind::Queue, BrokerObjectKind::Exchange];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BrokerObjectKind::Topic => "TOPIC",
+            BrokerObjectKind::Queue => "QUEUE",
+            BrokerObjectKind::Exchange => "EXCHANGE",
+        }
+    }
+
+    /// The two privileges it takes: PRODUCE/CONSUME, or PUBLISH/BIND.
+    pub fn privileges(self) -> [&'static str; 2] {
+        match self {
+            BrokerObjectKind::Exchange => ["PUBLISH", "BIND"],
+            _ => ["PRODUCE", "CONSUME"],
+        }
+    }
+}
+
+/// The permissions form: a grant or revoke of up to two privileges to one
+/// role, and an owner change.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BrokerPermForm {
+    pub kind: BrokerObjectKind,
+    /// Empty: every one of the kind (`ON ALL TOPICS`).
+    pub object: String,
+    /// A role, or PUBLIC.
+    pub grantee: String,
+    /// The kind's first and second privilege (`privileges()`).
+    pub first: bool,
+    pub second: bool,
+    /// The new owner for ALTER … OWNER TO.
+    pub owner: String,
 }

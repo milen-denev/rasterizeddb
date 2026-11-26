@@ -122,5 +122,9 @@ name = "broker_crash"
 required-features = ["broker"]
 
 [[example]]
+name = "broker_acl"
+required-features = ["broker"]
+
+[[example]]
 name = "broker_repl"
 required-features = ["broker"]

@@ -1,25 +1,25 @@
 //! RasterizedDB Studio's LEDGER page (licensed: see LICENSE). It covers the
 //! ledger and vault features (docs/ledger-and-vault-plan.md):
 //!
-//! - **Chain and tables:** chain status, anchors, each ledger table's
-//!   policy, VERIFY (all or one table), receipts, raising retention, legal
-//!   holds, adding anchors, acknowledging a restore's rollback.
-//! - **Creating:** ledger tables and vaults.
-//! - **Each vault:** its secrets (names and states; a value only on an
-//!   explicit Reveal, shown until Hide or the next load), versions, set,
-//!   disable and enable, delete and recover, purge, key rotation, the audit
-//!   trail, and keys used in place (create, encrypt, decrypt, sign, verify,
-//!   public key).
+//! - **Chain:** entries, head, anchors and location as tiles, the server's
+//!   warnings as pills, and VERIFY's findings as a table.
+//! - **Ledger tables:** a grid (rows, mode, retention, holds), each table's
+//!   actions (verify, history, receipt, retention, legal holds, anchors,
+//!   its data), and a form that creates one.
+//! - **Vaults:** a grid of secrets with a name filter, a revealed value in a
+//!   marked box until HIDE (and never past a tab or vault switch), versions,
+//!   the forms that set a secret, use a key, rotate the key and create a
+//!   vault, and the audit trail.
 //!
-//! Studio's GPL side holds the tab and runs statements. This crate builds
-//! every statement, reads the answers into a [`LedgerPage`], and draws it
-//! ([`view`]). Studio sends two generic messages back: run this statement
-//! ([`Actions::run`]) and an input changed ([`Actions::input`]). The server
-//! decides who may do what; a refusal is shown as the answer.
+//! Studio's GPL side holds the tab, runs statements and supplies the widgets
+//! ([`Kit`], drawn with its own theme, grid and confirmation dialog). This
+//! crate builds every statement, reads the answers into a [`LedgerPage`] and
+//! lays the page out ([`view`]). The server decides who may do what; a
+//! refusal is shown as the answer.
 
 use std::collections::BTreeMap;
 
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{column, row, Space};
 use iced::{Element, Fill};
 
 /// Every statement the page runs to load.
@@ -36,10 +36,227 @@ pub fn audit_sql(vault: &str) -> String {
     format!("VAULT {vault} AUDIT")
 }
 
+/// How many rows a ledger table holds, for its grid.
+pub fn count_sql(table: &str) -> String {
+    format!("SELECT count(*) FROM {table}")
+}
+
 /// `s` as a SQL string literal.
 pub fn q(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
+
+// ---------------------------------------------------------------------------
+// What the server said, read into structure
+// ---------------------------------------------------------------------------
+
+/// The chain line of `SHOW LEDGER`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Chain {
+    pub entries: u64,
+    pub head: String,
+    pub location: String,
+}
+
+/// A ledger table or vault, from its `SHOW LEDGER` line.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Special {
+    pub name: String,
+    pub vault: bool,
+    pub retention_s: i64,
+    pub drop_idle_s: i64,
+    pub hash: String,
+    pub versioned: bool,
+    pub anchors: Vec<String>,
+    pub holds: Vec<String>,
+    pub key_provider: Option<String>,
+}
+
+/// `SHOW LEDGER`, read.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Shown {
+    pub chain: Option<Chain>,
+    /// The anchor sinks, and the mode and signing note in parentheses.
+    pub anchors: Vec<String>,
+    pub anchor_mode: String,
+    pub unanchored: String,
+    /// `WARNING: …` lines, and `last anchor error`.
+    pub warnings: Vec<String>,
+    pub specials: Vec<Special>,
+    /// Anything not read above, shown as it came.
+    pub other: Vec<String>,
+}
+
+fn parse_special(name: &str, rest: &str) -> Option<Special> {
+    let (vault, rest) = if let Some(r) = rest.strip_prefix("vault id ") {
+        (true, r)
+    } else {
+        (false, rest.strip_prefix("ledger id ")?)
+    };
+    let mut s = Special { name: name.to_string(), vault, ..Special::default() };
+    for part in rest.split(", ").skip(1) {
+        if let Some(v) = part.strip_prefix("retention ") {
+            s.retention_s = v.trim_end_matches(" s").parse().unwrap_or(0);
+        } else if let Some(v) = part.strip_prefix("drop after ") {
+            s.drop_idle_s = v.trim_end_matches(" s idle").parse().unwrap_or(0);
+        } else if let Some(v) = part.strip_prefix("hash ") {
+            s.hash = v.to_string();
+        } else if part == "versioned" {
+            s.versioned = true;
+        } else if let Some(v) = part.strip_prefix("anchors ") {
+            s.anchors = v.split(' ').map(str::to_string).collect();
+        } else if let Some(v) = part.strip_prefix("holds ") {
+            s.holds = v.split(' ').map(str::to_string).collect();
+        } else if let Some(v) = part.strip_prefix("key provider ") {
+            s.key_provider = Some(v.to_string());
+        }
+    }
+    Some(s)
+}
+
+impl Shown {
+    pub fn parse(lines: &[String]) -> Shown {
+        let mut out = Shown::default();
+        for l in lines {
+            if let Some(rest) = l.strip_prefix("chain: ") {
+                let mut c = Chain::default();
+                for part in rest.split(", ") {
+                    if let Some(n) = part.strip_suffix(" entries") {
+                        c.entries = n.parse().unwrap_or(0);
+                    } else if let Some(h) = part.strip_prefix("head ") {
+                        c.head = h.to_string();
+                    } else if let Some(at) = part.strip_prefix("at ") {
+                        c.location = at.to_string();
+                    }
+                }
+                out.chain = Some(c);
+            } else if let Some(w) = l.strip_prefix("WARNING: ") {
+                out.warnings.push(w.to_string());
+            } else if let Some(e) = l.strip_prefix("last anchor error: ") {
+                out.warnings.push(format!("last anchor error: {e}"));
+            } else if let Some(rest) = l.strip_prefix("anchors: ") {
+                if rest != "none" {
+                    let (sinks, tail) = rest.split_once(" (").unwrap_or((rest, ""));
+                    out.anchors = sinks.split(' ').map(str::to_string).collect();
+                    if let Some((mode, un)) = tail.split_once("), unanchored: ") {
+                        out.anchor_mode = mode.to_string();
+                        out.unanchored = un.to_string();
+                    }
+                }
+            } else if let Some(s) = l.split_once(": ").and_then(|(n, r)| parse_special(n, r)) {
+                out.specials.push(s);
+            } else {
+                out.other.push(l.clone());
+            }
+        }
+        out
+    }
+}
+
+/// One line of a vault's `LIST`: never a value.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Secret {
+    pub name: String,
+    pub version: i64,
+    pub state: String,
+    pub content_type: String,
+    pub expires_us: i64,
+    pub updated_us: i64,
+}
+
+impl Secret {
+    pub fn parse(line: &str) -> Option<Secret> {
+        let mut w = line.split_whitespace();
+        let mut s = Secret {
+            name: w.next()?.to_string(),
+            version: w.next()?.trim_start_matches('v').parse().ok()?,
+            state: w.next()?.to_string(),
+            ..Secret::default()
+        };
+        for kv in w {
+            match kv.split_once('=') {
+                Some(("type", v)) => s.content_type = v.to_string(),
+                Some(("expires_us", v)) => s.expires_us = v.parse().unwrap_or(0),
+                Some(("updated_us", v)) => s.updated_us = v.parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+        Some(s)
+    }
+
+    /// A key used in place (`key:<name>`), not a secret: never revealed.
+    pub fn is_key(&self) -> bool {
+        self.name.starts_with("key:")
+    }
+}
+
+/// A status word at the head of a line (`OK`, `WARNING`, `TAMPERED`,
+/// `UNKNOWN`, `chained`, `UNCHAINED`), and the rest.
+pub fn status_of(line: &str) -> (&str, &str) {
+    let line = line.trim_start();
+    match line.split_once(char::is_whitespace) {
+        Some((w, rest)) if w.chars().all(|c| c.is_ascii_alphabetic()) => (w, rest.trim_start()),
+        _ => ("", line),
+    }
+}
+
+/// The tone a status word is shown in.
+pub fn status_tone(status: &str) -> Tone {
+    match status {
+        "OK" | "chained" | "intact" => Tone::Good,
+        "WARNING" => Tone::Warn,
+        "TAMPERED" | "UNKNOWN" | "UNCHAINED" | "FAILED" | "REFUSED" => Tone::Bad,
+        _ => Tone::Dim,
+    }
+}
+
+/// Microseconds since the Unix epoch as `YYYY-MM-DD HH:MM:SS` UTC.
+pub fn when(us: i64) -> String {
+    if us <= 0 {
+        return "—".to_string();
+    }
+    let secs = us.div_euclid(1_000_000);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}", rem / 3_600, rem % 3_600 / 60, rem % 60)
+}
+
+/// A span in seconds, in the largest unit that divides it.
+pub fn span(secs: i64) -> String {
+    if secs <= 0 {
+        return "—".to_string();
+    }
+    for (unit, n) in [("year", 366 * 86_400), ("day", 86_400), ("hour", 3_600), ("minute", 60)] {
+        if secs % n == 0 {
+            let k = secs / n;
+            return format!("{k} {unit}{}", if k == 1 { "" } else { "s" });
+        }
+    }
+    format!("{secs} s")
+}
+
+/// The middle of a long value cut out: `edbb21ed…87502c`.
+pub fn elide_middle(s: &str, keep: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= keep * 2 + 1 {
+        return s.to_string();
+    }
+    format!("{}…{}", chars[..keep].iter().collect::<String>(), chars[chars.len() - keep..].iter().collect::<String>())
+}
+
+// ---------------------------------------------------------------------------
+// The page's state
+// ---------------------------------------------------------------------------
 
 /// One vault on the page.
 #[derive(Clone, Debug, Default)]
@@ -56,15 +273,20 @@ pub struct LedgerPage {
     pub show: Vec<String>,
     pub verify: Option<Vec<String>>,
     pub vaults: Vec<VaultView>,
+    /// Each ledger table's row count, where `count(*)` answered.
+    pub counts: BTreeMap<String, i64>,
     /// Why the page could not load: no ledger support on the server, or no
     /// permission.
     pub error: Option<String>,
     /// The page's text inputs, by key.
     pub inputs: BTreeMap<String, String>,
-    /// The last action and its answer.
+    /// The last action's heading (its verb, never the statement) and answer.
     pub last: Option<(String, Result<Vec<String>, String>)>,
-    /// A secret revealed on request: (vault, name, value). Cleared by Hide
-    /// and by every load.
+    /// An answer that belongs beside what asked for it: a secret's versions,
+    /// a row's history or receipt, a key's output. (heading, lines).
+    pub detail: Option<(String, Vec<String>)>,
+    /// A value revealed on request: (vault, name, value). Cleared by HIDE, a
+    /// load, a vault switch and leaving the tab.
     pub revealed: Option<(String, String, String)>,
 }
 
@@ -74,6 +296,15 @@ fn label(sql: &str) -> String {
     let w: Vec<&str> = sql.split_whitespace().take(3).collect();
     w.join(" ")
 }
+
+/// Input keys the page itself reads.
+pub const VIEW: &str = "__view";
+pub const VAULT: &str = "__vault";
+pub const TABLE: &str = "__table";
+pub const HIDE: &str = "__hide";
+pub const CLEAR: &str = "__clear";
+pub const ADD_COLUMN: &str = "__add_column";
+pub const DROP_COLUMN: &str = "__drop_column";
 
 impl LedgerPage {
     /// The vaults `SHOW LEDGER` names (its lines `<name>: vault id …`).
@@ -100,39 +331,337 @@ impl LedgerPage {
         self.verify.as_ref().map(|v| !v.iter().any(|l| l.starts_with("TAMPERED") || l.starts_with("UNKNOWN")))
     }
 
-    /// Keeps what a reload must not lose: the inputs and the last answer.
-    /// A revealed secret is dropped.
+    /// Keeps what a reload must not lose: the inputs, the last answer and
+    /// the detail panel. A revealed value is dropped.
     pub fn carry_over(&mut self, old: LedgerPage) {
         self.inputs = old.inputs;
         self.last = old.last;
+        self.detail = old.detail;
+        if self.verify.is_none() {
+            self.verify = old.verify;
+        }
+        for v in &mut self.vaults {
+            if let Some(o) = old.vaults.iter().find(|o| o.name == v.name) {
+                v.audit = o.audit.clone();
+            }
+        }
         self.revealed = None;
     }
 
-    /// Records an action's answer. A `GET SECRET` is shown as a revealed
-    /// value, never kept as an answer line.
+    /// Records an action's answer. A value that is a secret (`GET SECRET`,
+    /// `DECRYPT`) goes to the revealed box, never to the answer lines; an
+    /// answer about one thing (versions, history, a receipt, a key's output)
+    /// goes to the detail panel.
     pub fn ran(&mut self, sql: &str, result: Result<Vec<String>, String>) {
         let w: Vec<&str> = sql.split_whitespace().collect();
-        if w.len() >= 5 && w[0].eq_ignore_ascii_case("VAULT") && w[2].eq_ignore_ascii_case("GET") && w[3].eq_ignore_ascii_case("SECRET") {
+        let up = |i: usize| w.get(i).map(|s| s.to_ascii_uppercase()).unwrap_or_default();
+        let unquote = |i: usize| w.get(i).map(|s| s.trim_matches('\'').to_string()).unwrap_or_default();
+        // A value written by a form is not kept in the inputs once sent.
+        self.inputs.retain(|k, _| !k.ends_with(":value") && !k.ends_with(":plain"));
+        if up(0) == "VAULT" {
             if let Ok(lines) = &result {
-                let name = w[4].trim_matches('\'').to_string();
-                self.revealed = Some((w[1].to_string(), name, lines.join("\n")));
-                self.last = Some((label(sql), Ok(vec!["revealed below".to_string()])));
+                let reveal = match (up(2).as_str(), up(3).as_str()) {
+                    ("GET", "SECRET") => Some(unquote(4)),
+                    ("DECRYPT", "KEY") => Some(format!("decrypted with {}", unquote(4))),
+                    _ => None,
+                };
+                if let Some(name) = reveal {
+                    self.revealed = Some((w[1].to_string(), name, lines.join("\n")));
+                    self.last = None;
+                    return;
+                }
+                let about = match (up(2).as_str(), up(3).as_str()) {
+                    ("VERSIONS", "SECRET") => Some(format!("VERSIONS OF {}", unquote(4))),
+                    ("ENCRYPT" | "SIGN" | "VERIFY", "KEY") => Some(format!("{} WITH {}", up(2), unquote(4))),
+                    ("PUBLIC", "KEY") => Some(format!("PUBLIC KEY {}", unquote(4))),
+                    _ => None,
+                };
+                if let Some(heading) = about {
+                    self.detail = Some((heading, lines.clone()));
+                    self.last = None;
+                    return;
+                }
+            }
+        }
+        if up(0) == "SHOW" && up(1) == "LEDGER" && matches!(up(2).as_str(), "HISTORY" | "RECEIPT") {
+            if let Ok(lines) = &result {
+                self.detail = Some((format!("{} {} {}", up(2), w.get(3).unwrap_or(&""), w.get(4).unwrap_or(&"")), lines.clone()));
+                self.last = None;
                 return;
             }
         }
-        // A value written by a form is not kept in the inputs once sent.
-        self.inputs.retain(|k, _| !k.ends_with(":value") && !k.ends_with(":plain"));
+        if up(0) == "VERIFY" && up(1) == "LEDGER" {
+            if let Ok(lines) = &result {
+                self.verify = Some(lines.clone());
+                self.last = None;
+                return;
+            }
+        }
         self.last = Some((label(sql), result));
     }
 
-    /// Hides a revealed secret.
+    /// Hides a revealed value.
     pub fn hide(&mut self) {
         self.revealed = None;
     }
 
-    fn input(&self, key: &str) -> &str {
+    /// An input changed. The page's own keys switch the view, select a vault
+    /// or table (hiding a revealed value) and edit the column list.
+    pub fn input(&mut self, key: String, value: String) {
+        match key.as_str() {
+            HIDE => self.hide(),
+            CLEAR => {
+                self.last = None;
+                self.detail = None;
+            }
+            VAULT | VIEW => {
+                self.hide();
+                self.detail = None;
+                self.inputs.insert(key, value);
+            }
+            ADD_COLUMN => {
+                let n = self.columns();
+                self.inputs.insert("new:ledger:ncols".into(), (n + 1).to_string());
+            }
+            DROP_COLUMN => {
+                let (n, at) = (self.columns(), value.parse::<usize>().unwrap_or(usize::MAX));
+                if n > 1 && at < n {
+                    for i in at..n - 1 {
+                        for f in ["name", "type"] {
+                            let next = self.get(&format!("new:ledger:col:{}:{f}", i + 1)).to_string();
+                            self.inputs.insert(format!("new:ledger:col:{i}:{f}"), next);
+                        }
+                    }
+                    for f in ["name", "type"] {
+                        self.inputs.remove(&format!("new:ledger:col:{}:{f}", n - 1));
+                    }
+                    self.inputs.insert("new:ledger:ncols".into(), (n - 1).to_string());
+                }
+            }
+            _ => {
+                self.inputs.insert(key, value);
+            }
+        }
+    }
+
+    /// How many rows the new table's column list has.
+    pub fn columns(&self) -> usize {
+        self.get("new:ledger:ncols").parse().unwrap_or(2).max(1)
+    }
+
+    pub fn get(&self, key: &str) -> &str {
         self.inputs.get(key).map(String::as_str).unwrap_or("")
     }
+
+    fn on(&self, key: &str) -> bool {
+        self.get(key) == "true"
+    }
+
+    /// The vault the page shows: the chosen one, or the first.
+    pub fn current_vault(&self) -> Option<&VaultView> {
+        let chosen = self.get(VAULT);
+        self.vaults.iter().find(|v| v.name == chosen).or(self.vaults.first())
+    }
+
+    /// The `CREATE LEDGER TABLE` the form describes, or what it still lacks.
+    pub fn create_ledger_sql(&self) -> Result<String, String> {
+        let name = self.get("new:ledger:name").trim();
+        if !ident_ok(name) {
+            return Err("Name the table: letters, digits and underscores.".into());
+        }
+        let mut cols = Vec::new();
+        for i in 0..self.columns() {
+            let (c, t) = (self.get(&format!("new:ledger:col:{i}:name")).trim(), self.get(&format!("new:ledger:col:{i}:type")).trim());
+            if c.is_empty() && t.is_empty() {
+                continue;
+            }
+            if !ident_ok(c) {
+                return Err(format!("Column {} needs a name.", i + 1));
+            }
+            let t = if t.is_empty() { "TEXT" } else { t };
+            if t.contains([';', '\'', '(', ')']) && !t.to_ascii_uppercase().starts_with("NUMERIC(") && !t.to_ascii_uppercase().starts_with("VARCHAR(") {
+                return Err(format!("Column {c}: type {t:?} is not a type name."));
+            }
+            cols.push(format!("{c} {t}"));
+        }
+        if cols.is_empty() {
+            return Err("Give it at least one column.".into());
+        }
+        let n = self.get("new:ledger:keep").trim();
+        if n.parse::<u64>().map_or(true, |n| n == 0) {
+            return Err("How long must a row stay undeletable? A whole number.".into());
+        }
+        let unit = unit_or(self.get("new:ledger:keep_unit"), "YEARS");
+        let mut sql = format!("CREATE LEDGER TABLE {name} ({}) NO DELETE UNTIL {n} {unit} AFTER INSERT", cols.join(", "));
+        if self.on("new:ledger:versioned") {
+            sql.push_str(" VERSIONED");
+        }
+        let idle = self.get("new:ledger:idle").trim();
+        if !idle.is_empty() {
+            if idle.parse::<u64>().is_err() {
+                return Err("NO DROP UNTIL takes a whole number.".into());
+            }
+            sql.push_str(&format!(" NO DROP UNTIL {idle} {} IDLE", unit_or(self.get("new:ledger:idle_unit"), "DAYS")));
+        }
+        let anchor = self.get("new:ledger:anchor").trim();
+        if !anchor.is_empty() {
+            sql.push_str(&format!(" ANCHOR TO {}", q(anchor)));
+        }
+        Ok(sql)
+    }
+
+    /// The `CREATE VAULT` the form describes, or what it still lacks.
+    pub fn create_vault_sql(&self) -> Result<String, String> {
+        let name = self.get("new:vault:name").trim();
+        if !ident_ok(name) {
+            return Err("Name the vault: letters, digits and underscores.".into());
+        }
+        let provider = self.get("new:vault:provider").trim();
+        if !["file:", "pkcs11:", "mlkem:", "tpm:"].iter().any(|p| provider.starts_with(p)) {
+            return Err("Choose where its key lives: pkcs11:…, tpm:…, mlkem:… or file:….".into());
+        }
+        let mut sql = format!("CREATE VAULT {name} KEY PROVIDER {}", q(provider));
+        let n = self.get("new:vault:retain").trim();
+        if !n.is_empty() {
+            if n.parse::<u64>().is_err() {
+                return Err("RETAIN DELETED takes a whole number.".into());
+            }
+            sql.push_str(&format!(" RETAIN DELETED {n} {}", unit_or(self.get("new:vault:retain_unit"), "DAYS")));
+        }
+        Ok(sql)
+    }
+
+    /// The `VAULT … SET SECRET` the form describes. The value is in it, so
+    /// the preview shows it masked ([`Self::set_secret_preview`]).
+    pub fn set_secret_sql(&self, vault: &str) -> Result<String, String> {
+        let k = |f: &str| format!("vault:{vault}:{f}");
+        let name = self.get(&k("name")).trim();
+        let value = self.get(&k("value"));
+        if name.is_empty() {
+            return Err("Name the secret (e.g. db/password).".into());
+        }
+        if value.is_empty() {
+            return Err("Type its value.".into());
+        }
+        let mut sql = format!("VAULT {vault} SET SECRET {} = {}", q(name), q(value));
+        let ct = self.get(&k("type")).trim();
+        if !ct.is_empty() {
+            sql.push_str(&format!(" CONTENT TYPE {}", q(ct)));
+        }
+        let ex = self.get(&k("expires")).trim();
+        if !ex.is_empty() {
+            sql.push_str(&format!(" EXPIRES {}", q(ex)));
+        }
+        Ok(sql)
+    }
+
+    pub fn set_secret_preview(&self, vault: &str) -> Result<String, String> {
+        self.set_secret_sql(vault).map(|_| {
+            let k = |f: &str| format!("vault:{vault}:{f}");
+            let mut sql = format!("VAULT {vault} SET SECRET {} = '••••••'", q(self.get(&k("name")).trim()));
+            let ct = self.get(&k("type")).trim();
+            if !ct.is_empty() {
+                sql.push_str(&format!(" CONTENT TYPE {}", q(ct)));
+            }
+            let ex = self.get(&k("expires")).trim();
+            if !ex.is_empty() {
+                sql.push_str(&format!(" EXPIRES {}", q(ex)));
+            }
+            sql
+        })
+    }
+}
+
+fn ident_ok(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !s.starts_with(|c: char| c.is_ascii_digit())
+}
+
+const UNITS: [&str; 7] = ["SECONDS", "MINUTES", "HOURS", "DAYS", "WEEKS", "MONTHS", "YEARS"];
+
+fn unit_or<'s>(chosen: &'s str, default: &'static str) -> &'s str {
+    if UNITS.contains(&chosen) { chosen } else { default }
+}
+
+// ---------------------------------------------------------------------------
+// The widgets Studio lends the page
+// ---------------------------------------------------------------------------
+
+/// How a piece of text or a pill is coloured, in Studio's palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Normal,
+    Dim,
+    Faint,
+    Good,
+    Warn,
+    Bad,
+    Accent,
+}
+
+/// One column of a [`Kit::grid`].
+pub struct Col {
+    pub key: &'static str,
+    pub header: &'static str,
+    pub width: f32,
+    pub right: bool,
+    pub sortable: bool,
+}
+
+impl Col {
+    pub const fn new(key: &'static str, header: &'static str, width: f32) -> Col {
+        Col { key, header, width, right: false, sortable: true }
+    }
+    pub const fn right(mut self) -> Col {
+        self.right = true;
+        self
+    }
+    pub const fn unsortable(mut self) -> Col {
+        self.sortable = false;
+        self
+    }
+}
+
+/// A cell of a [`Kit::grid`].
+pub enum Cell<'a, M> {
+    Text(String, Tone),
+    Widget(Element<'a, M>),
+}
+
+/// What a column sorts by, for one row.
+pub enum SortVal {
+    Text(String),
+    Num(f64),
+}
+
+/// One row of a [`Kit::grid`]: its cells, and a sort value per column.
+pub struct GridRow<'a, M> {
+    pub cells: Vec<Cell<'a, M>>,
+    pub keys: Vec<SortVal>,
+}
+
+/// Studio's widgets, in its theme: what the page is drawn with.
+pub trait Kit<'a, M: Clone + 'a> {
+    /// A titled panel, as every Studio page is framed.
+    fn frame(&self, title: String, trailing: Option<Element<'a, M>>, body: Element<'a, M>) -> Element<'a, M>;
+    /// A section: a panel holding a section label and its body.
+    fn section(&self, label: String, trailing: Option<Element<'a, M>>, body: Element<'a, M>) -> Element<'a, M>;
+    /// A form's raised strip (the create forms).
+    fn form(&self, label: String, body: Element<'a, M>) -> Element<'a, M>;
+    /// A box that says what it holds is sensitive (a revealed value).
+    fn alert(&self, body: Element<'a, M>) -> Element<'a, M>;
+    fn text(&self, text: String, tone: Tone) -> Element<'a, M>;
+    fn mono(&self, text: String, tone: Tone) -> Element<'a, M>;
+    fn small_button(&self, label: &str, on: Option<M>) -> Element<'a, M>;
+    /// A compact button for a grid row.
+    fn row_button(&self, label: &str, on: Option<M>, destructive: bool) -> Element<'a, M>;
+    fn primary_button(&self, label: &str, on: Option<M>) -> Element<'a, M>;
+    fn choice(&self, label: &str, selected: bool, on: M) -> Element<'a, M>;
+    fn field(&self, label: String, value: &'a str, secret: bool, width: f32, on: Box<dyn Fn(String) -> M + 'a>) -> Element<'a, M>;
+    fn toggle(&self, label: String, value: bool, on: Box<dyn Fn(bool) -> M + 'a>) -> Element<'a, M>;
+    fn tile(&self, label: String, value: String, note: Option<String>) -> Element<'a, M>;
+    fn pill(&self, label: String, tone: Tone) -> Element<'a, M>;
+    /// A sortable grid with resizable columns, at most `max_height` tall.
+    fn grid(&self, scope: &str, cols: Vec<Col>, rows: Vec<GridRow<'a, M>>, max_height: f32) -> Element<'a, M>;
 }
 
 /// The messages the page sends back to Studio.
@@ -145,266 +674,772 @@ pub struct Actions<M> {
     /// Run a statement this page built; its answer comes back to
     /// [`LedgerPage::ran`] and the page reloads.
     pub run: fn(String) -> M,
-    /// An input changed: (key, value). The key `__hide` hides a revealed secret.
+    /// An input changed: (key, value), to [`LedgerPage::input`].
     pub input: fn(String, String) -> M,
+    /// A destructive statement, through Studio's confirmation dialog:
+    /// (title, what it does, the statement).
+    pub confirm: fn(String, String, String) -> M,
+    /// Open a table on the DATA tab.
+    pub open_table: fn(String) -> M,
 }
 
-fn line<'a, M: 'a>(l: &str) -> Element<'a, M> {
-    let bad = l.starts_with("TAMPERED") || l.starts_with("UNKNOWN") || l.contains("UNCHAINED");
-    let warn = l.starts_with("WARNING");
-    let t = text(l.to_string()).size(12).font(iced::Font::MONOSPACE);
-    let t = if bad {
-        t.color(iced::Color::from_rgb(0.9, 0.3, 0.3))
-    } else if warn {
-        t.color(iced::Color::from_rgb(0.9, 0.7, 0.2))
-    } else {
-        t
-    };
-    t.into()
-}
-
-fn section<'a, M: 'a>(title: String, body: Element<'a, M>) -> Element<'a, M> {
-    column![text(title).size(13), container(body).padding(8).width(Fill)].spacing(4).into()
-}
-
-fn act<'a, M: Clone + 'a>(label: &str, msg: Option<M>) -> Element<'a, M> {
-    let b = button(text(label.to_string()).size(12));
-    match msg {
-        Some(m) => b.on_press(m).into(),
-        None => b.into(),
-    }
-}
-
-/// A text input bound to `key`.
-fn field<'a, M: Clone + 'a>(page: &'a LedgerPage, a: &Actions<M>, key: String, hint: &str, secret: bool) -> Element<'a, M> {
-    let input = a.input;
-    let k = key.clone();
-    text_input(hint, page.input(&key))
-        .secure(secret)
-        .size(12)
-        .width(180)
-        .on_input(move |v| input(k.clone(), v))
-        .into()
-}
-
-/// `Some(run(sql))` when every input it needs is filled.
-fn when<M>(a: &Actions<M>, ready: bool, sql: impl FnOnce() -> String) -> Option<M> {
-    ready.then(|| (a.run)(sql()))
-}
+// ---------------------------------------------------------------------------
+// The page
+// ---------------------------------------------------------------------------
 
 /// The page.
-pub fn view<'a, M: Clone + 'a>(page: Option<&'a LedgerPage>, a: Actions<M>) -> Element<'a, M> {
-    let bar = row![act("RELOAD", Some(a.reload.clone())), act("VERIFY LEDGER", Some(a.verify.clone()))].spacing(8);
+pub fn view<'a, M: Clone + 'a, K: Kit<'a, M>>(page: Option<&'a LedgerPage>, a: Actions<M>, k: &K) -> Element<'a, M> {
+    let bar: Element<'a, M> = row![
+        k.small_button("VERIFY ALL", Some(a.verify.clone())),
+        k.small_button("RELOAD", Some(a.reload.clone())),
+    ]
+    .spacing(6)
+    .into();
     let Some(page) = page else {
-        return column![bar, text("Loading…").size(13)].spacing(10).into();
+        return k.frame("LEDGER".into(), Some(bar), k.text("Loading…".into(), Tone::Faint));
     };
     if let Some(e) = &page.error {
-        return column![bar, text(e.as_str()).size(13)].spacing(10).into();
+        return k.frame("LEDGER".into(), Some(bar), unsupported(k, e));
     }
-    let mut body = column![bar].spacing(12);
+    let shown = Shown::parse(&page.show);
+    let tables: Vec<&Special> = shown.specials.iter().filter(|s| !s.vault).collect();
+    let view = match page.get(VIEW) {
+        "vaults" => "vaults",
+        "tables" => "tables",
+        _ if tables.is_empty() && !page.vaults.is_empty() => "vaults",
+        _ => "tables",
+    };
+    let input = a.input;
+    let switch = row![
+        k.choice(&format!("LEDGER TABLES · {}", tables.len()), view == "tables", input(VIEW.into(), "tables".into())),
+        k.choice(&format!("VAULTS · {}", page.vaults.len()), view == "vaults", input(VIEW.into(), "vaults".into())),
+    ]
+    .spacing(4);
 
-    // The last answer, and a revealed secret.
-    if let Some((what, result)) = &page.last {
-        let lines: Vec<Element<'a, M>> = match result {
-            Ok(l) if l.is_empty() => vec![line("done")],
-            Ok(l) => l.iter().map(|x| line(x)).collect(),
-            Err(e) => vec![line(&format!("REFUSED   {e}"))],
-        };
-        body = body.push(section(format!("LAST: {what}"), column(lines).spacing(2).into()));
+    let mut body = column![chain(k, &shown, page)].spacing(10);
+    if let Some(r) = result(k, &a, page) {
+        body = body.push(r);
     }
-    if let Some((vault, name, value)) = &page.revealed {
-        body = body.push(section(
-            format!("SECRET {vault} / {name}"),
-            column![
-                text(value.as_str()).size(13).font(iced::Font::MONOSPACE),
-                act("HIDE", Some((a.input)("__hide".to_string(), String::new()))),
+    body = body.push(switch);
+    if view == "tables" {
+        body = body.push(tables_grid(k, &a, page, &tables));
+        if let Some(t) = page.inputs.get(TABLE).and_then(|n| tables.iter().find(|t| &t.name == n)) {
+            body = body.push(table_detail(k, &a, page, t));
+        }
+        body = body.push(create_ledger_form(k, &a, page));
+        body = body.push(rollback_form(k, &a, page));
+    } else {
+        body = body.push(vaults(k, &a, page, &shown));
+    }
+    k.frame(
+        "LEDGER".into(),
+        Some(bar),
+        iced::widget::scrollable(body.padding(iced::Padding { right: 12.0, ..iced::Padding::ZERO })).height(Fill).into(),
+    )
+}
+
+fn unsupported<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, e: &str) -> Element<'a, M> {
+    column![
+        k.text("This server has no ledger tables or vaults".into(), Tone::Normal),
+        k.text(
+            format!(
+                "SHOW LEDGER was refused: {e}. Ledger tables and vaults need a server built with the enterprise \
+                 features (rasterizeddb_core_enterprise), and a role allowed to read them."
+            ),
+            Tone::Dim
+        ),
+    ]
+    .spacing(8)
+    .max_width(720)
+    .into()
+}
+
+/// The chain as tiles, with the warnings as pills, and VERIFY's findings.
+fn chain<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, shown: &Shown, page: &'a LedgerPage) -> Element<'a, M> {
+    let c = shown.chain.clone().unwrap_or_default();
+    let anchors = if shown.anchors.is_empty() { "none".to_string() } else { shown.anchors.len().to_string() };
+    let tiles = row![
+        k.tile("CHAIN ENTRIES".into(), c.entries.to_string(), None),
+        k.tile("HEAD".into(), elide_middle(&c.head, 6), Some("sha256 of the newest entry".into())),
+        k.tile(
+            "ANCHORS".into(),
+            anchors,
+            Some(if shown.anchors.is_empty() {
+                "nothing outside this server holds the head".into()
+            } else {
+                format!("{} · unanchored: {}", shown.anchor_mode, shown.unanchored)
+            })
+        ),
+        k.tile("LOCATION".into(), elide_middle(&c.location, 10), Some(c.location.clone())),
+    ]
+    .spacing(8);
+    let mut pills = row![].spacing(6);
+    let mut any = false;
+    for w in &shown.warnings {
+        pills = pills.push(k.pill(w.to_uppercase(), Tone::Warn));
+        any = true;
+    }
+    if shown.anchors.is_empty() && shown.chain.is_some() {
+        pills = pills.push(k.pill("NO ANCHORS: A ROLLBACK OF THE WHOLE SERVER WOULD GO UNSEEN".into(), Tone::Warn));
+        any = true;
+    }
+    if !shown.anchors.is_empty() {
+        for s in &shown.anchors {
+            pills = pills.push(k.pill(format!("ANCHOR {}", elide_middle(s, 24)), Tone::Dim));
+        }
+        any = true;
+    }
+    let mut col = column![tiles].spacing(8);
+    if any {
+        col = col.push(pills.wrap());
+    }
+    for o in &shown.other {
+        col = col.push(k.mono(o.clone(), Tone::Dim));
+    }
+    if let Some(v) = &page.verify {
+        let (label, tone) = if page.verified_intact() == Some(true) { ("INTACT", Tone::Good) } else { ("PROBLEMS FOUND", Tone::Bad) };
+        let mut list = column![row![k.text("VERIFY".into(), Tone::Dim), k.pill(label.into(), tone)].spacing(8)].spacing(3);
+        for l in v {
+            let (status, rest) = status_of(l);
+            list = list.push(
+                row![
+                    iced::widget::container(k.pill(if status.is_empty() { "—".into() } else { status.to_string() }, status_tone(status))).width(64),
+                    k.mono(rest.to_string(), Tone::Normal),
+                ]
+                .spacing(8)
+                .align_y(iced::alignment::Vertical::Center),
+            );
+        }
+        col = col.push(list);
+    }
+    k.section("CHAIN".into(), None, col.into())
+}
+
+/// The last action's answer, and the detail panel.
+fn result<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage) -> Option<Element<'a, M>> {
+    if page.last.is_none() && page.detail.is_none() {
+        return None;
+    }
+    let mut col = column![].spacing(4);
+    if let Some((what, result)) = &page.last {
+        let (pill, lines): (Element<'a, M>, Vec<String>) = match result {
+            Ok(l) => (k.pill("DONE".into(), Tone::Good), if l.is_empty() { Vec::new() } else { l.clone() }),
+            Err(e) => (k.pill("REFUSED".into(), Tone::Bad), vec![e.clone()]),
+        };
+        col = col.push(row![pill, k.mono(what.clone(), Tone::Dim)].spacing(8).align_y(iced::alignment::Vertical::Center));
+        for l in lines.iter().take(12) {
+            col = col.push(k.mono(l.clone(), Tone::Normal));
+        }
+        if lines.len() > 12 {
+            col = col.push(k.text(format!("… {} more lines", lines.len() - 12), Tone::Faint));
+        }
+    }
+    if let Some((heading, lines)) = &page.detail {
+        col = col.push(k.text(heading.clone(), Tone::Dim));
+        for l in lines {
+            let (status, rest) = status_of(l);
+            let line: Element<'a, M> = if status_tone(status) == Tone::Dim {
+                k.mono(versions_line(l), Tone::Normal)
+            } else {
+                row![k.pill(status.to_string(), status_tone(status)), k.mono(rest.to_string(), Tone::Normal)].spacing(8).into()
+            };
+            col = col.push(line);
+        }
+    }
+    Some(k.section("RESULT".into(), Some(k.small_button("CLEAR", Some((a.input)(CLEAR.into(), String::new())))), col.into()))
+}
+
+/// `v2 set by alice at 1795…` with the time readable.
+fn versions_line(l: &str) -> String {
+    match l.rsplit_once(" at ") {
+        Some((head, us)) if us.chars().all(|c| c.is_ascii_digit()) && us.len() > 12 => format!("{head} at {}", when(us.parse().unwrap_or(0))),
+        _ => l.to_string(),
+    }
+}
+
+fn tables_grid<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, tables: &[&Special]) -> Element<'a, M> {
+    if tables.is_empty() {
+        return k.section(
+            "LEDGER TABLES".into(),
+            None,
+            k.text("No ledger tables. Make one below: rows can be added, never changed, and not deleted before their retention ends.".into(), Tone::Faint),
+        );
+    }
+    let selected = page.get(TABLE);
+    let cols = vec![
+        Col::new("name", "TABLE", 150.0),
+        Col::new("actions", "", 230.0).unsortable(),
+        Col::new("rows", "ROWS", 80.0).right(),
+        Col::new("mode", "MODE", 110.0),
+        Col::new("retention", "NO DELETE FOR", 120.0),
+        Col::new("holds", "LEGAL HOLDS", 160.0),
+        Col::new("anchors", "OWN ANCHORS", 160.0),
+    ];
+    let rows = tables
+        .iter()
+        .map(|t| {
+            let count = page.counts.get(&t.name).copied();
+            let actions = row![
+                k.row_button("VERIFY", Some((a.run)(format!("VERIFY LEDGER {}", t.name))), false),
+                k.row_button(if selected == t.name { "CLOSE" } else { "MANAGE" }, Some((a.input)(TABLE.into(), if selected == t.name { String::new() } else { t.name.clone() })), false),
+                k.row_button("DATA", Some((a.open_table)(t.name.clone())), false),
             ]
-            .spacing(6)
-            .into(),
+            .spacing(4);
+            GridRow {
+                cells: vec![
+                    Cell::Text(t.name.clone(), if selected == t.name { Tone::Accent } else { Tone::Normal }),
+                    Cell::Widget(actions.into()),
+                    Cell::Text(count.map_or("—".into(), |c| c.to_string()), Tone::Dim),
+                    Cell::Text(if t.versioned { "versioned" } else { "append-only" }.into(), Tone::Dim),
+                    Cell::Text(span(t.retention_s), Tone::Dim),
+                    Cell::Text(if t.holds.is_empty() { "—".into() } else { t.holds.join(", ") }, if t.holds.is_empty() { Tone::Faint } else { Tone::Warn }),
+                    Cell::Text(if t.anchors.is_empty() { "—".into() } else { t.anchors.join(" ") }, Tone::Faint),
+                ],
+                keys: vec![
+                    SortVal::Text(t.name.clone()),
+                    SortVal::Text(String::new()),
+                    SortVal::Num(count.unwrap_or(-1) as f64),
+                    SortVal::Text(if t.versioned { "versioned" } else { "append-only" }.into()),
+                    SortVal::Num(t.retention_s as f64),
+                    SortVal::Text(t.holds.join(" ")),
+                    SortVal::Text(t.anchors.join(" ")),
+                ],
+            }
+        })
+        .collect();
+    k.section("LEDGER TABLES".into(), None, k.grid("ledger-tables", cols, rows, 320.0))
+}
+
+fn field<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, key: String, label: &str, secret: bool, width: f32) -> Element<'a, M> {
+    let input = a.input;
+    let value = page.inputs.get(&key).map(String::as_str).unwrap_or("");
+    k.field(label.to_string(), value, secret, width, Box::new(move |v| input(key.clone(), v)))
+}
+
+/// A unit picker: one choice per unit, the chosen one lit.
+fn units<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, key: &str, default: &'static str, only: &[&'static str]) -> Element<'a, M> {
+    let chosen = unit_or(page.get(key), default);
+    let mut r = row![].spacing(2);
+    for u in only {
+        r = r.push(k.choice(u, chosen == *u, (a.input)(key.to_string(), u.to_string())));
+    }
+    column![k.text("Unit".into(), Tone::Dim), r].spacing(4).into()
+}
+
+fn preview<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, sql: &Result<String, String>) -> Element<'a, M> {
+    match sql {
+        Ok(s) => k.mono(s.clone(), Tone::Dim),
+        Err(why) => k.text(why.clone(), Tone::Faint),
+    }
+}
+
+/// Bottom-aligned beside fields that have a label above them.
+fn lowered<'a, M: 'a>(e: Element<'a, M>) -> Element<'a, M> {
+    column![Space::new().height(15), e].into()
+}
+
+fn table_detail<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, t: &Special) -> Element<'a, M> {
+    let name = t.name.clone();
+    let key = |f: &str| format!("ledger:{name}:{f}");
+    let (n, hold, anchor, stamp) = (
+        page.get(&key("retention")).trim().to_string(),
+        page.get(&key("hold")).trim().to_string(),
+        page.get(&key("anchor")).trim().to_string(),
+        page.get(&key("stamp")).trim().to_string(),
+    );
+    let unit = unit_or(page.get(&key("retention_unit")), "YEARS").to_string();
+    let retention_sql = (n.parse::<u64>().is_ok_and(|n| n > 0)).then(|| format!("ALTER LEDGER TABLE {name} SET RETENTION {n} {unit}"));
+    let stamp_ok = stamp.parse::<i64>().is_ok();
+    let place = (!hold.is_empty()).then(|| format!("ALTER LEDGER TABLE {name} SET LEGAL HOLD {}", q(&hold)));
+    let mut holds = row![k.text("Legal holds".into(), Tone::Dim)].spacing(6).align_y(iced::alignment::Vertical::Center);
+    if t.holds.is_empty() {
+        holds = holds.push(k.text("none".into(), Tone::Faint));
+    }
+    for h in &t.holds {
+        let sql = format!("ALTER LEDGER TABLE {name} RELEASE LEGAL HOLD {}", q(h));
+        holds = holds.push(k.pill(h.to_uppercase(), Tone::Warn));
+        holds = holds.push(k.row_button(
+            "RELEASE",
+            Some((a.confirm)(
+                format!("Release legal hold {h}?"),
+                format!("Rows of {name} past their retention can then be deleted again."),
+                sql,
+            )),
+            true,
         ));
     }
-
-    body = body.push(section("CHAIN AND TABLES".to_string(), column(page.show.iter().map(|l| line(l))).spacing(2).into()));
-    if let Some(v) = &page.verify {
-        let title = if page.verified_intact() == Some(true) { "VERIFY: INTACT" } else { "VERIFY: PROBLEMS FOUND" };
-        body = body.push(section(title.to_string(), column(v.iter().map(|l| line(l))).spacing(2).into()));
-    }
-
-    // Each ledger table's actions.
-    for t in LedgerPage::ledger_names(&page.show) {
-        let k = |f: &str| format!("ledger:{t}:{f}");
-        let retention = page.input(&k("retention")).to_string();
-        let hold = page.input(&k("hold")).to_string();
-        let anchor = page.input(&k("anchor")).to_string();
-        let stamp = page.input(&k("stamp")).to_string();
-        let tt = t.clone();
-        let c = column![
-            row![
-                act("VERIFY", Some((a.run)(format!("VERIFY LEDGER {t}")))),
-                field(page, &a, k("retention"), "e.g. 10 YEARS", false),
-                act("RAISE RETENTION", when(&a, !retention.trim().is_empty(), || format!("ALTER LEDGER TABLE {tt} SET RETENTION {retention}"))),
-            ]
-            .spacing(6),
-            row![
-                field(page, &a, k("hold"), "hold name", false),
-                act("PLACE HOLD", when(&a, !hold.is_empty(), || format!("ALTER LEDGER TABLE {t} SET LEGAL HOLD {}", q(&hold)))),
-                act("RELEASE HOLD", when(&a, !hold.is_empty(), || format!("ALTER LEDGER TABLE {t} RELEASE LEGAL HOLD {}", q(&hold)))),
-            ]
-            .spacing(6),
-            row![
-                field(page, &a, k("anchor"), "dir:/path or s3://bucket/prefix", false),
-                act("ADD ANCHOR", when(&a, !anchor.is_empty(), || format!("ALTER LEDGER TABLE {t} ADD ANCHOR {}", q(&anchor)))),
-            ]
-            .spacing(6),
-            row![
-                field(page, &a, k("stamp"), "row __ledger_ts", false),
-                act("RECEIPT", when(&a, stamp.trim().parse::<i64>().is_ok(), || format!("SHOW LEDGER RECEIPT {t} {}", stamp.trim()))),
-            ]
-            .spacing(6),
-        ]
-        .spacing(6);
-        body = body.push(section(format!("LEDGER TABLE {t}"), c.into()));
-    }
-
-    // Each vault.
-    for vault in &page.vaults {
-        let v = vault.name.clone();
-        let k = |f: &str| format!("vault:{v}:{f}");
-        let mut c = column![].spacing(4);
-        if vault.secrets.is_empty() {
-            c = c.push(text("no secrets").size(12));
-        }
-        for s in &vault.secrets {
-            let name = s.split_whitespace().next().unwrap_or("").to_string();
-            let is_key = name.starts_with("key:");
-            let mut r = row![line(s)].spacing(6);
-            if !is_key {
-                r = r.push(act("REVEAL", Some((a.run)(format!("VAULT {v} GET SECRET {}", q(&name))))));
-                r = r.push(act("VERSIONS", Some((a.run)(format!("VAULT {v} VERSIONS SECRET {}", q(&name))))));
-            }
-            for verb in ["DISABLE", "ENABLE", "DELETE", "RECOVER", "PURGE"] {
-                r = r.push(act(verb, Some((a.run)(format!("VAULT {v} {verb} SECRET {}", q(&name))))));
-            }
-            c = c.push(r);
-        }
-        // Set a secret.
-        let (sn, sv, se, st) = (page.input(&k("name")).to_string(), page.input(&k("value")).to_string(), page.input(&k("expires")).to_string(), page.input(&k("type")).to_string());
-        let vv = v.clone();
-        c = c.push(
-            row![
-                field(page, &a, k("name"), "secret name", false),
-                field(page, &a, k("value"), "value", true),
-                field(page, &a, k("expires"), "expires (YYYY-MM-DD)", false),
-                field(page, &a, k("type"), "content type", false),
-                act("SET", when(&a, !sn.is_empty() && !sv.is_empty(), move || {
-                    let mut sql = format!("VAULT {vv} SET SECRET {} = {}", q(&sn), q(&sv));
-                    if !se.is_empty() {
-                        sql.push_str(&format!(" EXPIRES {}", q(&se)));
-                    }
-                    if !st.is_empty() {
-                        sql.push_str(&format!(" CONTENT TYPE {}", q(&st)));
-                    }
+    let body = column![
+        holds,
+        row![
+            field(k, a, page, key("hold"), "New legal hold (case name)", false, 220.0),
+            lowered(k.small_button(
+                "PLACE HOLD",
+                place.map(|sql| (a.confirm)(
+                    format!("Place legal hold {hold} on {name}?"),
+                    "No row of the table can be deleted while the hold stands, retention or not.".into(),
                     sql
-                })),
-            ]
-            .spacing(6),
-        );
-        // Keys used in place.
-        let (kn, kt, kp, ks) = (page.input(&k("key")).to_string(), page.input(&k("keytype")).to_string(), page.input(&k("plain")).to_string(), page.input(&k("sig")).to_string());
-        let kind = if kt.is_empty() { "aes256-gcm".to_string() } else { kt.clone() };
-        c = c.push(
+                ))
+            )),
+            Space::new().width(24),
+            field(k, a, page, key("retention"), "Raise retention to", false, 90.0),
+            units(k, a, page, &key("retention_unit"), "YEARS", &["DAYS", "MONTHS", "YEARS"]),
+            lowered(k.small_button(
+                "SET RETENTION",
+                retention_sql.map(|sql| (a.confirm)(
+                    format!("Raise the retention of {name}?"),
+                    format!("Retention is {} now. It can be raised, never lowered.", span(t.retention_s)),
+                    sql
+                ))
+            )),
+        ]
+        .spacing(8)
+        .align_y(iced::alignment::Vertical::Bottom),
+        row![
+            field(k, a, page, key("stamp"), "Row (__ledger_ts)", false, 200.0),
+            lowered(k.small_button("HISTORY", stamp_ok.then(|| (a.run)(format!("SHOW LEDGER HISTORY {name} {stamp}"))))),
+            lowered(k.small_button("RECEIPT", stamp_ok.then(|| (a.run)(format!("SHOW LEDGER RECEIPT {name} {stamp}"))))),
+            Space::new().width(24),
+            field(k, a, page, key("anchor"), "Add an anchor (dir:/path, s3://bucket/prefix)", false, 300.0),
+            lowered(k.small_button("ADD ANCHOR", (!anchor.is_empty()).then(|| (a.run)(format!("ALTER LEDGER TABLE {name} ADD ANCHOR {}", q(&anchor)))))),
+        ]
+        .spacing(8)
+        .align_y(iced::alignment::Vertical::Bottom),
+        k.text(
+            format!(
+                "{} · hash {} · {}. Find a row's __ledger_ts with SELECT __ledger_ts, * FROM {name}.",
+                if t.versioned { "VERSIONED: rows can be updated, every version is kept and chained" } else { "Append-only" },
+                t.hash,
+                if t.drop_idle_s > 0 { format!("cannot be dropped until idle for {}", span(t.drop_idle_s)) } else { "no drop protection".to_string() }
+            ),
+            Tone::Faint
+        ),
+    ]
+    .spacing(8);
+    k.section(format!("MANAGE {}", t.name.to_uppercase()), None, body.into())
+}
+
+fn create_ledger_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage) -> Element<'a, M> {
+    let sql = page.create_ledger_sql();
+    let input = a.input;
+    let mut cols = column![k.text("Columns".into(), Tone::Dim)].spacing(4);
+    let n = page.columns();
+    for i in 0..n {
+        let (kn, kt) = (format!("new:ledger:col:{i}:name"), format!("new:ledger:col:{i}:type"));
+        let (vn, vt) = (page.inputs.get(&kn).map(String::as_str).unwrap_or(""), page.inputs.get(&kt).map(String::as_str).unwrap_or(""));
+        let (kn2, kt2) = (kn.clone(), kt.clone());
+        cols = cols.push(
             row![
-                field(page, &a, k("key"), "key name", false),
-                field(page, &a, k("keytype"), "aes256-gcm | mldsa65", false),
-                act("CREATE KEY", when(&a, !kn.is_empty(), || format!("VAULT {v} CREATE KEY {} TYPE {}", q(&kn), q(&kind)))),
-                act("PUBLIC KEY", when(&a, !kn.is_empty(), || format!("VAULT {v} PUBLIC KEY {}", q(&kn)))),
+                k.field(String::new(), vn, false, 160.0, Box::new(move |v| input(kn2.clone(), v))),
+                k.field(String::new(), vt, false, 160.0, Box::new(move |v| input(kt2.clone(), v))),
+                k.row_button("REMOVE", (n > 1).then(|| input(DROP_COLUMN.into(), i.to_string())), false),
             ]
-            .spacing(6),
+            .spacing(6)
+            .align_y(iced::alignment::Vertical::Center),
         );
-        c = c.push(
+    }
+    cols = cols.push(row![k.row_button("ADD COLUMN", Some(input(ADD_COLUMN.into(), String::new())), false), k.text("name, then type (BIGINT, TEXT, NUMERIC(12,2), TIMESTAMP …; empty: TEXT)".into(), Tone::Faint)].spacing(8).align_y(iced::alignment::Vertical::Center));
+    let versioned = page.get("new:ledger:versioned") == "true";
+    let body = column![
+        row![
+            field(k, a, page, "new:ledger:name".into(), "Name", false, 200.0),
+            field(k, a, page, "new:ledger:keep".into(), "No delete until (after insert)", false, 120.0),
+            units(k, a, page, "new:ledger:keep_unit", "YEARS", &["HOURS", "DAYS", "MONTHS", "YEARS"]),
+            lowered(k.toggle("Versioned (rows may be updated, every version kept)".into(), versioned, Box::new(move |on| input("new:ledger:versioned".into(), on.to_string())))),
+        ]
+        .spacing(10)
+        .align_y(iced::alignment::Vertical::Bottom),
+        cols,
+        row![
+            field(k, a, page, "new:ledger:idle".into(), "No drop until idle for (optional)", false, 120.0),
+            units(k, a, page, "new:ledger:idle_unit", "DAYS", &["DAYS", "MONTHS", "YEARS"]),
+            field(k, a, page, "new:ledger:anchor".into(), "Anchor to (optional: dir:/path, s3://bucket/prefix)", false, 300.0),
+            lowered(k.primary_button("CREATE LEDGER TABLE", sql.as_ref().ok().map(|s| (a.run)(s.clone())))),
+        ]
+        .spacing(10)
+        .align_y(iced::alignment::Vertical::Bottom),
+        preview(k, &sql),
+    ]
+    .spacing(8);
+    k.form("NEW LEDGER TABLE".into(), body.into())
+}
+
+fn rollback_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage) -> Element<'a, M> {
+    let reason = page.get("ack:reason").trim().to_string();
+    let sql = (!reason.is_empty()).then(|| format!("ACKNOWLEDGE LEDGER ROLLBACK {}", q(&reason)));
+    k.form(
+        "AFTER A RESTORE".into(),
+        column![
             row![
-                field(page, &a, k("plain"), "text / ciphertext / message", true),
-                field(page, &a, k("sig"), "signature (VERIFY)", false),
-                act("ENCRYPT", when(&a, !kn.is_empty() && !kp.is_empty(), || format!("VAULT {v} ENCRYPT KEY {} VALUE {}", q(&kn), q(&kp)))),
-                act("DECRYPT", when(&a, !kn.is_empty() && !kp.is_empty(), || format!("VAULT {v} DECRYPT KEY {} VALUE {}", q(&kn), q(&kp)))),
-                act("SIGN", when(&a, !kn.is_empty() && !kp.is_empty(), || format!("VAULT {v} SIGN KEY {} VALUE {}", q(&kn), q(&kp)))),
-                act("VERIFY", when(&a, !kn.is_empty() && !kp.is_empty() && !ks.is_empty(), || {
-                    format!("VAULT {v} VERIFY KEY {} VALUE {} SIGNATURE {}", q(&kn), q(&kp), q(&ks))
-                })),
+                field(k, a, page, "ack:reason".into(), "Why the ledger is behind its anchors", false, 360.0),
+                lowered(k.small_button(
+                    "ACKNOWLEDGE ROLLBACK",
+                    sql.map(|s| (a.confirm)(
+                        "Acknowledge the rollback?".into(),
+                        "Ledger writes resume from the restored chain. The acknowledgement is chained, with this reason.".into(),
+                        s
+                    ))
+                )),
             ]
-            .spacing(6),
-        );
-        // Key rotation and the audit.
-        let to = page.input(&k("rotate")).to_string();
-        c = c.push(
-            row![
-                field(page, &a, k("rotate"), "new provider (empty: same)", false),
-                act("ROTATE KEY", Some((a.run)(if to.is_empty() { format!("VAULT {v} ROTATE KEY") } else { format!("VAULT {v} ROTATE KEY TO {}", q(&to)) }))),
-                act("AUDIT TRAIL", Some((a.audit)(v.clone()))),
-            ]
-            .spacing(6),
-        );
-        if let Some(audit) = &vault.audit {
-            for l in audit {
-                c = c.push(line(l));
-            }
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Bottom),
+            k.text("Only after restoring a backup older than the anchors: until then ledger writes are refused.".into(), Tone::Faint),
+        ]
+        .spacing(6)
+        .into(),
+    )
+}
+
+fn vaults<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, shown: &Shown) -> Element<'a, M> {
+    let mut col = column![].spacing(10);
+    let current = page.current_vault();
+    if page.vaults.len() > 1 {
+        let mut pick = row![k.text("Vault".into(), Tone::Dim)].spacing(4).align_y(iced::alignment::Vertical::Center);
+        for v in &page.vaults {
+            pick = pick.push(k.choice(&v.name, current.is_some_and(|c| c.name == v.name), (a.input)(VAULT.into(), v.name.clone())));
         }
-        body = body.push(section(format!("VAULT {}", vault.name), c.into()));
+        col = col.push(pick);
+    }
+    match current {
+        None => col = col.push(k.section("VAULTS".into(), None, k.text("No vaults. Make one below.".into(), Tone::Faint))),
+        Some(v) => {
+            let special = shown.specials.iter().find(|s| s.vault && s.name == v.name);
+            col = col.push(vault(k, a, page, v, special));
+        }
+    }
+    col = col.push(create_vault_form(k, a, page));
+    col.into()
+}
+
+fn vault<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, v: &'a VaultView, special: Option<&Special>) -> Element<'a, M> {
+    let name = v.name.clone();
+    let secrets: Vec<Secret> = v.secrets.iter().filter_map(|l| Secret::parse(l)).collect();
+    let unread: Vec<&String> = v.secrets.iter().filter(|l| Secret::parse(l).is_none()).collect();
+    let count = |state: &str| secrets.iter().filter(|s| !s.is_key() && s.state == state).count();
+    let keys = secrets.iter().filter(|s| s.is_key()).count();
+    let tiles = row![
+        k.tile("SECRETS".into(), (secrets.len() - keys).to_string(), Some(format!("{} active · {} disabled · {} deleted", count("active"), count("disabled"), count("deleted")))),
+        k.tile("KEYS".into(), keys.to_string(), Some("used in place, never revealed".into())),
+        k.tile("KEY PROVIDER".into(), special.and_then(|s| s.key_provider.clone()).map_or("—".into(), |p| elide_middle(&p, 10)), special.and_then(|s| s.key_provider.clone())),
+        k.tile("DELETED KEPT FOR".into(), special.map_or("—".into(), |s| span(s.retention_s)), Some("then PURGE may erase them".into())),
+    ]
+    .spacing(8);
+
+    let mut col = column![tiles].spacing(10);
+    if let Some((rv, rn, value)) = &page.revealed {
+        if *rv == name {
+            col = col.push(k.alert(
+                column![
+                    row![
+                        k.pill("REVEALED".into(), Tone::Warn),
+                        k.mono(rn.clone(), Tone::Normal),
+                        Space::new().width(Fill),
+                        k.small_button("HIDE", Some((a.input)(HIDE.into(), String::new()))),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::alignment::Vertical::Center),
+                    k.mono(value.clone(), Tone::Normal),
+                    k.text("This read is in the vault's audit trail. Hidden on HIDE, on reload, and when you leave the tab or vault.".into(), Tone::Faint),
+                ]
+                .spacing(6)
+                .into(),
+            ));
+        }
     }
 
-    // Creating ledger tables and vaults; acknowledging a rollback.
-    let (ln, lc, lr) = (page.input("new:ledger:name").to_string(), page.input("new:ledger:columns").to_string(), page.input("new:ledger:retention").to_string());
-    let (vn, vp, vr) = (page.input("new:vault:name").to_string(), page.input("new:vault:provider").to_string(), page.input("new:vault:retain").to_string());
-    let reason = page.input("ack:reason").to_string();
-    let create = column![
-        row![
-            field(page, &a, "new:ledger:name".into(), "table name", false),
-            field(page, &a, "new:ledger:columns".into(), "id BIGINT, amount BIGINT", false),
-            field(page, &a, "new:ledger:retention".into(), "7 YEARS", false),
-            act("CREATE LEDGER TABLE", when(&a, !ln.is_empty() && !lc.is_empty() && !lr.is_empty(), || {
-                format!("CREATE LEDGER TABLE {ln} ({lc}) NO DELETE UNTIL {lr} AFTER INSERT")
-            })),
-        ]
-        .spacing(6),
-        row![
-            field(page, &a, "new:vault:name".into(), "vault name", false),
-            field(page, &a, "new:vault:provider".into(), "pkcs11:… | mlkem:… | file:…", false),
-            field(page, &a, "new:vault:retain".into(), "90 DAYS", false),
-            act("CREATE VAULT", when(&a, !vn.is_empty() && !vp.is_empty(), || {
-                let retain = if vr.is_empty() { String::new() } else { format!(" RETAIN DELETED {vr}") };
-                format!("CREATE VAULT {vn} KEY PROVIDER {}{retain}", q(&vp))
-            })),
-        ]
-        .spacing(6),
-        row![
-            field(page, &a, "ack:reason".into(), "why the ledger was rolled back", false),
-            act("ACKNOWLEDGE ROLLBACK", when(&a, !reason.trim().is_empty(), || format!("ACKNOWLEDGE LEDGER ROLLBACK {}", q(&reason)))),
-        ]
-        .spacing(6),
+    // The secrets.
+    let filter_key = format!("vault:{name}:filter");
+    let filter = page.get(&filter_key).trim().to_ascii_lowercase();
+    let shown: Vec<&Secret> = secrets.iter().filter(|s| filter.is_empty() || s.name.to_ascii_lowercase().contains(&filter)).collect();
+    let cols = vec![
+        Col::new("name", "NAME", 240.0),
+        Col::new("actions", "", 250.0).unsortable(),
+        Col::new("version", "VERSION", 70.0).right(),
+        Col::new("state", "STATE", 90.0),
+        Col::new("type", "TYPE", 120.0),
+        Col::new("updated", "UPDATED (UTC)", 160.0),
+        Col::new("expires", "EXPIRES (UTC)", 160.0),
+    ];
+    let rows: Vec<GridRow<'a, M>> = shown
+        .iter()
+        .map(|s| {
+            let sn = q(&s.name);
+            let run = |sql: String| Some((a.run)(sql));
+            let mut actions = row![].spacing(4);
+            if s.is_key() {
+                let key = q(s.name.trim_start_matches("key:"));
+                actions = actions.push(k.row_button("PUBLIC KEY", run(format!("VAULT {name} PUBLIC KEY {key}")), false));
+            } else {
+                let live = s.state == "active";
+                actions = actions.push(k.row_button("REVEAL", live.then(|| (a.run)(format!("VAULT {name} GET SECRET {sn}"))), false));
+                actions = actions.push(k.row_button("VERSIONS", run(format!("VAULT {name} VERSIONS SECRET {sn}")), false));
+                match s.state.as_str() {
+                    "active" => actions = actions.push(k.row_button("DISABLE", run(format!("VAULT {name} DISABLE SECRET {sn}")), false)),
+                    "disabled" => actions = actions.push(k.row_button("ENABLE", run(format!("VAULT {name} ENABLE SECRET {sn}")), false)),
+                    _ => {}
+                }
+                if s.state == "deleted" {
+                    actions = actions.push(k.row_button("RECOVER", run(format!("VAULT {name} RECOVER SECRET {sn}")), false));
+                    actions = actions.push(k.row_button(
+                        "PURGE",
+                        Some((a.confirm)(
+                            format!("Purge {}?", s.name),
+                            "Every version is erased and its data key destroyed: it cannot be recovered. Refused while the vault's retention for deleted secrets runs."
+                                .into(),
+                            format!("VAULT {name} PURGE SECRET {sn}"),
+                        )),
+                        true,
+                    ));
+                } else {
+                    actions = actions.push(k.row_button(
+                        "DELETE",
+                        Some((a.confirm)(
+                            format!("Delete {}?", s.name),
+                            format!(
+                                "A soft delete: RECOVER brings it back until it is purged{}.",
+                                special.map_or(String::new(), |sp| format!(", which is refused for {}", span(sp.retention_s)))
+                            ),
+                            format!("VAULT {name} DELETE SECRET {sn}"),
+                        )),
+                        true,
+                    ));
+                }
+            }
+            let state_tone = match s.state.as_str() {
+                "active" => Tone::Good,
+                "disabled" => Tone::Warn,
+                "deleted" => Tone::Bad,
+                _ => Tone::Dim,
+            };
+            GridRow {
+                cells: vec![
+                    Cell::Text(s.name.clone(), if s.is_key() { Tone::Dim } else { Tone::Normal }),
+                    Cell::Widget(actions.into()),
+                    Cell::Text(format!("v{}", s.version), Tone::Dim),
+                    Cell::Widget(k.pill(s.state.to_uppercase(), state_tone)),
+                    Cell::Text(if s.content_type.is_empty() { "—".into() } else { s.content_type.clone() }, Tone::Dim),
+                    Cell::Text(when(s.updated_us), Tone::Dim),
+                    Cell::Text(when(s.expires_us), if s.expires_us > 0 { Tone::Normal } else { Tone::Faint }),
+                ],
+                keys: vec![
+                    SortVal::Text(s.name.clone()),
+                    SortVal::Text(String::new()),
+                    SortVal::Num(s.version as f64),
+                    SortVal::Text(s.state.clone()),
+                    SortVal::Text(s.content_type.clone()),
+                    SortVal::Num(s.updated_us as f64),
+                    SortVal::Num(s.expires_us as f64),
+                ],
+            }
+        })
+        .collect();
+    let header = row![
+        field(k, a, page, filter_key.clone(), "Filter by name", false, 260.0),
+        lowered(k.text(format!("{} of {}", shown.len(), secrets.len()), Tone::Faint)),
     ]
-    .spacing(6);
-    body = body.push(section("CREATE / RESTORE".to_string(), create.into()));
+    .spacing(8)
+    .align_y(iced::alignment::Vertical::Bottom);
+    let mut list = column![header].spacing(6);
+    if secrets.is_empty() {
+        list = list.push(k.text("No secrets yet. Set one below.".into(), Tone::Faint));
+    } else {
+        list = list.push(k.grid(&format!("ledger-secrets-{name}"), cols, rows, 460.0));
+    }
+    for u in unread {
+        list = list.push(k.mono(u.clone(), Tone::Bad));
+    }
+    col = col.push(k.section(format!("SECRETS IN {}", name.to_uppercase()), None, list.into()));
 
-    scrollable(body).height(Fill).into()
+    col = col.push(set_secret_form(k, a, page, &name));
+    col = col.push(keys_form(k, a, page, &name));
+    col = col.push(audit(k, a, v));
+    k.section(format!("VAULT {}", name.to_uppercase()), None, col.into())
+}
+
+fn set_secret_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, vault: &str) -> Element<'a, M> {
+    let key = |f: &str| format!("vault:{vault}:{f}");
+    let sql = page.set_secret_sql(vault);
+    k.form(
+        "SET A SECRET".into(),
+        column![
+            row![
+                field(k, a, page, key("name"), "Name", false, 220.0),
+                field(k, a, page, key("value"), "Value", true, 260.0),
+                field(k, a, page, key("type"), "Content type (optional)", false, 160.0),
+                field(k, a, page, key("expires"), "Expires (optional, YYYY-MM-DD)", false, 170.0),
+                lowered(k.primary_button("SET SECRET", sql.as_ref().ok().map(|s| (a.run)(s.clone())))),
+            ]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Bottom),
+            preview(k, &page.set_secret_preview(vault)),
+            k.text("An existing name gets a new version; the old ones stay readable by VERSION n until purged.".into(), Tone::Faint),
+        ]
+        .spacing(6)
+        .into(),
+    )
+}
+
+fn keys_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, vault: &str) -> Element<'a, M> {
+    let key = |f: &str| format!("vault:{vault}:{f}");
+    let (kn, kp, ks, to) = (
+        page.get(&key("key")).trim().to_string(),
+        page.get(&key("plain")).to_string(),
+        page.get(&key("sig")).trim().to_string(),
+        page.get(&key("rotate")).trim().to_string(),
+    );
+    let kind = match page.get(&key("keytype")) {
+        "" => "aes256-gcm".to_string(),
+        t => t.to_string(),
+    };
+    let input = a.input;
+    let mut kinds = row![].spacing(2);
+    for t in ["aes256-gcm", "mldsa65", "hsm-aes256-gcm", "hsm-ecdsa-p256"] {
+        kinds = kinds.push(k.choice(t, kind == t, input(key("keytype"), t.to_string())));
+    }
+    let v = vault.to_string();
+    let with = |verb: &str| (!kn.is_empty() && !kp.is_empty()).then(|| (a.run)(format!("VAULT {v} {verb} KEY {} VALUE {}", q(&kn), q(&kp))));
+    let rotate_sql = if to.is_empty() { format!("VAULT {v} ROTATE KEY") } else { format!("VAULT {v} ROTATE KEY TO {}", q(&to)) };
+    k.form(
+        "KEYS USED IN PLACE".into(),
+        column![
+            row![
+                field(k, a, page, key("key"), "Key name", false, 180.0),
+                column![k.text("Type".into(), Tone::Dim), kinds].spacing(4),
+                lowered(k.small_button("CREATE KEY", (!kn.is_empty()).then(|| (a.run)(format!("VAULT {v} CREATE KEY {} TYPE {}", q(&kn), q(&kind)))))),
+            ]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Bottom),
+            row![
+                field(k, a, page, key("plain"), "Text, ciphertext or message", true, 260.0),
+                field(k, a, page, key("sig"), "Signature (for VERIFY)", false, 200.0),
+                lowered(row![
+                    k.small_button("ENCRYPT", with("ENCRYPT")),
+                    k.small_button("DECRYPT", with("DECRYPT")),
+                    k.small_button("SIGN", with("SIGN")),
+                    k.small_button(
+                        "VERIFY",
+                        (!kn.is_empty() && !kp.is_empty() && !ks.is_empty())
+                            .then(|| (a.run)(format!("VAULT {v} VERIFY KEY {} VALUE {} SIGNATURE {}", q(&kn), q(&kp), q(&ks))))
+                    ),
+                ]
+                .spacing(4)
+                .into()),
+            ]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Bottom),
+            row![
+                field(k, a, page, key("rotate"), "Rotate the vault key to (empty: a new key, same provider)", false, 360.0),
+                lowered(k.small_button(
+                    "ROTATE KEY",
+                    Some((a.confirm)(
+                        format!("Rotate the key of {v}?"),
+                        "Every data key is re-wrapped under the new key-encryption key. Values are not re-encrypted.".into(),
+                        rotate_sql
+                    ))
+                )),
+            ]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Bottom),
+        ]
+        .spacing(8)
+        .into(),
+    )
+}
+
+fn audit<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, v: &'a VaultView) -> Element<'a, M> {
+    let load = k.small_button(if v.audit.is_some() { "REFRESH" } else { "LOAD" }, Some((a.audit)(v.name.clone())));
+    let Some(lines) = &v.audit else {
+        return k.section("AUDIT TRAIL".into(), Some(load), k.text("Every read and change of this vault, chained before it was answered. LOAD to read it.".into(), Tone::Faint));
+    };
+    let cols = vec![Col::new("status", "CHAIN", 90.0), Col::new("time", "TIME (UTC)", 170.0), Col::new("event", "EVENT", 520.0)];
+    let rows: Vec<GridRow<'a, M>> = lines
+        .iter()
+        .rev()
+        .map(|l| {
+            let (status, rest) = status_of(l);
+            let (us, event) = rest.split_once(' ').unwrap_or(("", rest));
+            let us: i64 = us.parse().unwrap_or(0);
+            GridRow {
+                cells: vec![
+                    Cell::Widget(k.pill(if status.is_empty() { "—".into() } else { status.to_uppercase() }, status_tone(status))),
+                    Cell::Text(when(us), Tone::Dim),
+                    Cell::Text(event.to_string(), Tone::Normal),
+                ],
+                keys: vec![SortVal::Text(status.to_string()), SortVal::Num(us as f64), SortVal::Text(event.to_string())],
+            }
+        })
+        .collect();
+    k.section(format!("AUDIT TRAIL · {} EVENTS, NEWEST FIRST", lines.len()), Some(load), k.grid(&format!("ledger-audit-{}", v.name), cols, rows, 360.0))
+}
+
+fn create_vault_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage) -> Element<'a, M> {
+    let sql = page.create_vault_sql();
+    k.form(
+        "NEW VAULT".into(),
+        column![
+            row![
+                field(k, a, page, "new:vault:name".into(), "Name", false, 180.0),
+                field(k, a, page, "new:vault:provider".into(), "Key provider", false, 380.0),
+                field(k, a, page, "new:vault:retain".into(), "Keep deleted secrets for", false, 90.0),
+                units(k, a, page, "new:vault:retain_unit", "DAYS", &["DAYS", "MONTHS", "YEARS"]),
+                lowered(k.primary_button("CREATE VAULT", sql.as_ref().ok().map(|s| (a.run)(s.clone())))),
+            ]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Bottom),
+            preview(k, &sql),
+            k.text(
+                "pkcs11:module=<lib>;token=<label>;key=<label>;pin-env=VAR (an HSM; the key never leaves it) · \
+                 tpm:/path/vault.tpmkey;create (sealed by this machine's TPM) · mlkem:/path (post-quantum) · \
+                 file:/path (development only; the server must run with RDB_VAULT_ALLOW_FILE_KEY=1)"
+                    .into(),
+                Tone::Faint
+            ),
+        ]
+        .spacing(6)
+        .into(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn tables_and_vaults_are_read_from_show_ledger() {
-        let show = vec![
-            "chain: 3 entries, head ab, at /x".to_string(),
-            "payments: ledger id 01, retention 1 s".to_string(),
-            "app_secrets: vault id 02, retention 7776000 s".to_string(),
-        ];
-        assert_eq!(LedgerPage::vault_names(&show), vec!["app_secrets".to_string()]);
-        assert_eq!(LedgerPage::ledger_names(&show), vec!["payments".to_string()]);
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
     }
 
     #[test]
-    fn a_get_is_revealed_not_kept_and_set_values_are_forgotten() {
+    fn show_ledger_is_read_into_structure() {
+        let shown = Shown::parse(&s(&[
+            "chain: 321 entries, head edbb21ed30, at /x/rdb_ledger/chain.log",
+            "WARNING: the chain is on the same device as the data",
+            "anchors: dir:/a (async), unanchored: none",
+            "pay: ledger id b62b, retention 86400 s, drop after 0 s idle, hash sha256, holds case-1",
+            "acct: ledger id 560e, retention 86400 s, drop after 0 s idle, hash sha256, versioned",
+            "sec: vault id 0e6e, retention 604800 s, drop after 0 s idle, hash sha256, key provider file:/k",
+        ]));
+        assert_eq!(shown.chain.as_ref().unwrap().entries, 321);
+        assert_eq!(shown.chain.as_ref().unwrap().location, "/x/rdb_ledger/chain.log");
+        assert_eq!(shown.warnings, ["the chain is on the same device as the data"]);
+        assert_eq!(shown.anchors, ["dir:/a"]);
+        assert_eq!((shown.anchor_mode.as_str(), shown.unanchored.as_str()), ("async", "none"));
+        assert_eq!(shown.specials.len(), 3);
+        assert_eq!(shown.specials[0].holds, ["case-1"]);
+        assert!(shown.specials[1].versioned && !shown.specials[0].versioned);
+        assert_eq!(shown.specials[2].key_provider.as_deref(), Some("file:/k"));
+        assert!(shown.other.is_empty());
+        assert_eq!(LedgerPage::vault_names(&s(&["sec: vault id 0e6e, retention 1 s"])), ["sec"]);
+    }
+
+    #[test]
+    fn list_lines_are_read() {
+        let x = Secret::parse("app/url v3 active type=text/plain expires_us=1814313600000000 updated_us=1795729719719161").unwrap();
+        assert_eq!((x.version, x.state.as_str(), x.content_type.as_str()), (3, "active", "text/plain"));
+        assert_eq!(when(x.expires_us), "2027-06-30 00:00:00");
+        assert!(Secret::parse("key:k v1 active type=aes256-gcm").unwrap().is_key());
+    }
+
+    #[test]
+    fn a_reveal_and_a_decrypt_go_to_the_box_and_set_values_are_forgotten() {
         let mut p = LedgerPage::default();
         p.inputs.insert("vault:v:value".into(), "hunter2".into());
         p.ran("VAULT v SET SECRET 'db' = 'hunter2'", Ok(vec!["db version 1".into()]));
@@ -413,13 +1448,75 @@ mod tests {
         p.ran("VAULT v GET SECRET 'db'", Ok(vec!["hunter2".into()]));
         assert_eq!(p.revealed.as_ref().unwrap().2, "hunter2");
         assert!(!format!("{:?}", p.last).contains("hunter2"));
+        p.ran("VAULT v DECRYPT KEY 'k' VALUE 'ct'", Ok(vec!["plain".into()]));
+        assert_eq!(p.revealed.as_ref().unwrap().2, "plain");
+        // A vault switch, a reload and HIDE each hide it.
+        p.input(VAULT.into(), "w".into());
+        assert!(p.revealed.is_none());
+        p.ran("VAULT v GET SECRET 'db'", Ok(vec!["hunter2".into()]));
         let mut reloaded = LedgerPage::default();
         reloaded.carry_over(p);
         assert!(reloaded.revealed.is_none());
     }
 
     #[test]
-    fn quoting() {
+    fn versions_and_history_go_to_the_detail_panel() {
+        let mut p = LedgerPage::default();
+        p.ran("VAULT v VERSIONS SECRET 'db'", Ok(vec!["v1 set by a at 1795729719719161".into()]));
+        assert_eq!(p.detail.as_ref().unwrap().0, "VERSIONS OF db");
+        assert_eq!(versions_line(&p.detail.as_ref().unwrap().1[0]), "v1 set by a at 2026-11-26 21:48:39");
+        p.ran("SHOW LEDGER HISTORY acct 17", Ok(vec!["v1 chained   id=1".into()]));
+        assert!(p.detail.as_ref().unwrap().0.starts_with("HISTORY acct 17"));
+        p.ran("VERIFY LEDGER pay", Ok(vec!["OK        pay: 3 row(s) match the chain".into()]));
+        assert_eq!(p.verified_intact(), Some(true));
+    }
+
+    #[test]
+    fn the_create_forms_build_their_statements() {
+        let mut p = LedgerPage::default();
+        assert!(p.create_ledger_sql().is_err());
+        for (k, v) in [
+            ("new:ledger:name", "payments"),
+            ("new:ledger:col:0:name", "id"),
+            ("new:ledger:col:0:type", "BIGINT"),
+            ("new:ledger:col:1:name", "amount"),
+            ("new:ledger:col:1:type", "NUMERIC(12,2)"),
+            ("new:ledger:keep", "7"),
+            ("new:ledger:versioned", "true"),
+        ] {
+            p.input(k.into(), v.into());
+        }
+        assert_eq!(
+            p.create_ledger_sql().unwrap(),
+            "CREATE LEDGER TABLE payments (id BIGINT, amount NUMERIC(12,2)) NO DELETE UNTIL 7 YEARS AFTER INSERT VERSIONED"
+        );
+        p.input(ADD_COLUMN.into(), String::new());
+        p.input("new:ledger:col:2:name".into(), "memo".into());
+        p.input(DROP_COLUMN.into(), "0".into());
+        assert_eq!(p.columns(), 2);
+        assert!(p.create_ledger_sql().unwrap().contains("(amount NUMERIC(12,2), memo TEXT)"));
+        p.input("new:ledger:col:0:type".into(), "INT); DROP TABLE x; --".into());
+        assert!(p.create_ledger_sql().is_err());
+
+        for (k, v) in [("new:vault:name", "app"), ("new:vault:provider", "tpm:/k;create"), ("new:vault:retain", "90")] {
+            p.input(k.into(), v.into());
+        }
+        assert_eq!(p.create_vault_sql().unwrap(), "CREATE VAULT app KEY PROVIDER 'tpm:/k;create' RETAIN DELETED 90 DAYS");
+
+        p.input("vault:app:name".into(), "db/pw".into());
+        p.input("vault:app:value".into(), "s3cr'et".into());
+        assert_eq!(p.set_secret_sql("app").unwrap(), "VAULT app SET SECRET 'db/pw' = 's3cr''et'");
+        assert!(!p.set_secret_preview("app").unwrap().contains("s3cr"), "the preview never shows the value");
+    }
+
+    #[test]
+    fn small_formats() {
         assert_eq!(q("it's"), "'it''s'");
+        assert_eq!(span(86_400), "1 day");
+        assert_eq!(span(604_800), "7 days");
+        assert_eq!(span(366 * 86_400 * 7), "7 years");
+        assert_eq!(elide_middle("abcdefghijklmnop", 3), "abc…nop");
+        assert_eq!(status_of("OK        chain: 3"), ("OK", "chain: 3"));
+        assert_eq!(status_of("v1 chained"), ("", "v1 chained"));
     }
 }

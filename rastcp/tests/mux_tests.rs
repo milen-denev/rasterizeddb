@@ -656,11 +656,11 @@ async fn handlers_that_compute_before_they_wait_run_side_by_side() {
             peak >= 2,
             "eight requests on one connection never overlapped"
         );
-        // One after another they take 480 ms.
-        assert!(
-            took < Duration::from_millis(400),
-            "eight requests took {took:?}"
-        );
+        // One after another they take 480 ms; overlapping, well under. Not
+        // asserted on the clock: a loaded Windows runner took 634 ms with the
+        // requests overlapping (`peak` above is what proves it), and a
+        // wall-clock bound there only measures the runner.
+        let _ = took;
 
         running.task.abort();
     })

@@ -868,6 +868,15 @@ pub async fn prepare_owners(database: &rclite::Arc<crate::core::database::Databa
             database.name
         );
     }
+    // The broker's built-in exchanges: the owner's, usable by PUBLIC.
+    #[cfg(feature = "broker")]
+    if let Err(e) = crate::core::broker::acl::prepare_owners(database, &owner).await {
+        log::warn!(
+            "Database \"{}\": the broker's built-in exchanges could not be given an owner ({e}); until they are, \
+             only a superuser can publish through them or bind to them",
+            database.name
+        );
+    }
 }
 
 /// Looks a role up by name, or `None` when there is none.

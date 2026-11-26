@@ -237,6 +237,24 @@ impl NoFrom {
             .collect()
     }
 
+    /// Makes the waits of the items that are `pg_sleep`, `pg_sleep_for` or
+    /// `pg_sleep_until` calls, in order, before [`Self::rows`] is read: async,
+    /// so no runtime worker is held, and cut short with the statement's error
+    /// when it is cancelled or its `statement_timeout` passes. Nothing waits
+    /// when there is no row (`WHERE false`, `LIMIT 0`), as in PostgreSQL.
+    pub(crate) async fn wait(&self) -> Result<(), String> {
+        if !self.emits {
+            return Ok(());
+        }
+        for item in &self.items {
+            let Some((func, arg)) = sleep_call(&item.expr) else { continue };
+            let value = expr::eval_output_planned(arg, expr::output_is_wide(arg), &Row::default(), &[])?;
+            let span = crate::core::rql::pg_functions::sleep_span(func, &value).expect("a sleep call")?;
+            crate::core::cancel::sleep(span).await.map_err(|e| e.as_str().to_string())?;
+        }
+        Ok(())
+    }
+
     /// The one row (none when the `WHERE`, `LIMIT` or `OFFSET` says so), each
     /// value as a row expression's slot holds it: evaluated, coerced to the
     /// described type, at its display scale. A failed evaluation fails the
@@ -248,9 +266,15 @@ impl NoFrom {
         let empty = Row::default();
         let mut row = Row::default();
         for (position, item) in self.items.iter().enumerate() {
-            let value = expr::eval_output_planned(&item.expr, expr::output_is_wide(&item.expr), &empty, &[])
+            // A sleep's wait was made by `wait`; its value is `void`, which
+            // PostgreSQL sends as an empty text.
+            let value = if sleep_call(&item.expr).is_some() {
+                Ok(Value::Data { bytes: Vec::new(), db_type: DbType::STRING })
+            } else {
+                expr::eval_output_planned(&item.expr, expr::output_is_wide(&item.expr), &empty, &[])
                 .map(|v| expr::coerce_to_public(v, &item.db_type))
-                .and_then(|v| expr::at_display_scale(v, item.scale))?;
+                .and_then(|v| expr::at_display_scale(v, item.scale))
+            }?;
             let (bytes, column_type) = match value {
                 Value::Data { bytes, .. } if item.db_type == DbType::TIMESTAMP => (bytes, DbType::TIMESTAMP),
                 Value::Data { bytes, db_type } => (bytes, db_type),
@@ -267,5 +291,17 @@ impl NoFrom {
             });
         }
         Ok(vec![row])
+    }
+}
+
+/// An item that is a call of the `pg_sleep` family: the function and its
+/// argument.
+fn sleep_call(e: &Expr) -> Option<(crate::core::rql::pg_functions::PgFunc, &Expr)> {
+    use crate::core::rql::pg_functions::PgFunc;
+    match e {
+        Expr::Call(expr::TextFunc::Pg(f @ (PgFunc::PgSleep | PgFunc::PgSleepFor | PgFunc::PgSleepUntil)), args) => {
+            args.first().map(|a| (*f, a))
+        }
+        _ => None,
     }
 }
