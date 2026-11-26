@@ -49,8 +49,9 @@ async fn grants_decide_what_a_role_may_do_with_a_relation_it_does_not_own() {
         )
         .await
         .expect("roles");
-    // A table from before owners were recorded has no owner row.
-    admin.batch_execute("DELETE FROM __rdb_acl WHERE relation = 'legacy_free'").await.expect("make it legacy");
+    // A relation from before owners were recorded can no longer be made
+    // over SQL (user SQL does not write `__rdb_acl`): what it keeps is
+    // tested where one is made, `privileges::legacy_owner_tests`.
     let owner = as_user(&server, "owner_role", "o").await;
     let app = as_user(&server, "app", "a").await;
     let other = as_user(&server, "other", "x").await;
@@ -61,8 +62,8 @@ async fn grants_decide_what_a_role_may_do_with_a_relation_it_does_not_own() {
     for sql in ["SELECT * FROM t", "INSERT INTO t VALUES (2, 'b')", "UPDATE t SET v = 'z'", "DELETE FROM t", "TRUNCATE t", "DROP TABLE t", "ALTER TABLE t ADD COLUMN z INT"] {
         assert_eq!(code(&app, sql).await, "42501", "{sql}");
     }
-    // A relation from before owners were recorded is open, as it was.
-    app.batch_execute("INSERT INTO legacy_free VALUES (1)").await.expect("legacy open");
+    // The admin's own new table is not the app's.
+    assert_eq!(code(&app, "INSERT INTO legacy_free VALUES (1)").await, "42501");
 
     owner.batch_execute("GRANT SELECT, INSERT ON t TO app").await.expect("grant");
     assert_eq!(rows(&app, "SELECT v FROM t").await, ["a"]);
