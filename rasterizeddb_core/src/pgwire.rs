@@ -77,6 +77,8 @@ mod engine_bug_tests;
 #[cfg(test)]
 mod correlated_subquery_tests;
 #[cfg(test)]
+mod derived_pushdown_tests;
+#[cfg(test)]
 mod vacuum_snapshot_tests;
 #[cfg(test)]
 mod shape_repair_tests;
@@ -112,7 +114,7 @@ pub(crate) use native_session::{
     parse_simple as native_parse_simple,
 };
 pub(crate) use native_session::{
-    DATABASE_PREFIX as NATIVE_DATABASE_PREFIX, MARK as NATIVE_MARK,
+    DATABASE_PREFIX as NATIVE_DATABASE_PREFIX, MARK as NATIVE_MARK, ROLE_PREFIX as NATIVE_ROLE_PREFIX,
     NOTICES_PREFIX as NATIVE_NOTICES_PREFIX, answer_marked as native_answer_marked,
     simple_complete as native_simple_complete, simple_error as native_simple_error,
     engine_notices_answer as native_engine_notices_answer, with_notices as native_with_notices,
@@ -5310,6 +5312,14 @@ fn relation_column_names(database: &Database, name: &str) -> Option<Vec<String>>
     )
 }
 
+/// [`relation_column_names`] and the hidden columns a copy of the relation
+/// carries (`cte::carried_hidden_columns`): what `join_on` copies.
+fn relation_column_names_carried(database: &Database, name: &str) -> Option<Vec<String>> {
+    let mut names = relation_column_names(database, name)?;
+    names.extend(crate::core::rql::cte::carried_hidden_columns(name, database));
+    Some(names)
+}
+
 pub(crate) async fn describe_query(
     database: &Arc<Database>,
     query: &str,
@@ -5466,7 +5476,7 @@ pub(crate) async fn describe_query(
     let stmt = grouping_sets.as_deref().unwrap_or(stmt);
     let window_join = crate::core::rql::window_join::rewrite_statement(stmt, &|name| relation_column_names(database, name));
     let stmt = window_join.as_deref().unwrap_or(stmt);
-    let join_on = crate::core::rql::join_on::rewrite_statement(stmt, &|name| relation_column_names(database, name));
+    let join_on = crate::core::rql::join_on::rewrite_statement(stmt, &|name| relation_column_names_carried(database, name));
     let stmt = join_on.as_deref().unwrap_or(stmt);
     let distinct_on = crate::core::rql::distinct_on::rewrite_statement(stmt);
     let stmt = distinct_on.as_deref().unwrap_or(stmt);
@@ -5985,7 +5995,7 @@ fn describe_aggregate_over_derived(stmt: &str) -> Option<Vec<(String, DbType)>> 
 /// was something else and the caller should not pretend otherwise.
 /// `sql` without its top-level WHERE clause, the rest kept (GROUP BY,
 /// HAVING, ORDER BY, LIMIT): what a description reads is the same.
-fn without_where(sql: &str) -> Option<String> {
+pub(crate) fn without_where(sql: &str) -> Option<String> {
     use crate::core::rql::join::find_keyword;
     let at = find_keyword(sql, "WHERE", 0)?;
     let end = ["GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR"]
@@ -6591,7 +6601,12 @@ where
         "42704"
     } else if (message.ends_with(" not found in schema")
         || message.contains("is neither a column nor a value")
-        || (message.starts_with("column \"") && message.ends_with("\" does not exist")))
+        || (message.starts_with("column \"") && message.ends_with("\" does not exist"))
+        // A join's item naming a column its relation does not have
+        // ("column 'name' not found in relation 'c'"): the same, where it
+        // was a syntax error (42601; SQL Server's 207 is what an
+        // application tells a missing column by).
+        || (message.starts_with("column '") && message.contains("' not found in relation '")))
         && names_one_identifier(message)
     {
         // A name in the select list, ORDER BY or GROUP BY that is no column
@@ -8637,7 +8652,7 @@ pub(crate) fn rewrite_statement_text<'a>(
     // A join operand that is an expression (`ON a.g = b.id::text`), computed
     // by a derived table standing in for its relation (`core::rql::join_on`).
     // After the window rewrite, whose inner query may hold the join.
-    let join_on = crate::core::rql::join_on::rewrite_statement(&stmt, &|name| relation_column_names(database, name));
+    let join_on = crate::core::rql::join_on::rewrite_statement(&stmt, &|name| relation_column_names_carried(database, name));
     take(&mut stmt, join_on);
     // `DISTINCT ON` over a join or with an aggregate or a window: the same
     // statement over a derived table, before anything reads its table set

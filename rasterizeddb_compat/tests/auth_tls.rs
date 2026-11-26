@@ -244,12 +244,22 @@ async fn the_catalogue_stores_a_verifier_not_the_password() {
         .await
         .expect("create user");
 
-    use sqlx::Row;
-    let row = sqlx::query("SELECT password FROM rdb_roles WHERE name = 'carol'")
+    // User SQL never reads the verifier (roles plan R0): `rdb_roles` reads
+    // as PostgreSQL's `pg_roles`, every column but it.
+    let hidden = sqlx::query("SELECT password FROM rdb_roles WHERE name = 'carol'")
         .fetch_one(&pool)
         .await
-        .expect("read back");
-    let stored: String = row.try_get("password").expect("password column");
+        .expect_err("the verifier column is not readable over SQL");
+    assert_eq!(
+        hidden.as_database_error().and_then(|d| d.code()).as_deref(),
+        Some("42703"),
+        "{hidden}"
+    );
+    // What the catalogue stores, read where the engine reads it.
+    let role = rasterizeddb_core::auth::lookup_role(server.database(), "carol")
+        .await
+        .expect("carol is in the catalogue");
+    let stored = role.verifier.expect("carol has a verifier").to_stored();
 
     assert!(
         stored.starts_with("SCRAM-SHA-256$"),

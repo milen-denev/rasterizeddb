@@ -456,7 +456,7 @@ pub(crate) async fn qualify_outer_columns(sql: &str, item: &Item, database: &Arc
 
 /// The `FROM` items before `upto`: each alias (or bare relation name) and the
 /// relation text it names.
-fn items_before(sql: &str, upto: usize) -> Vec<(String, String)> {
+pub(crate) fn items_before(sql: &str, upto: usize) -> Vec<(String, String)> {
     let Some(from) = find_keyword(&sql[..upto], "FROM", 0) else {
         return Vec::new();
     };
@@ -845,7 +845,7 @@ fn binds_name(body: &str, name: &str) -> bool {
 }
 
 /// Where the body's top-level `FROM` list ends.
-fn clause_end_of_from(body: &str) -> usize {
+pub(crate) fn clause_end_of_from(body: &str) -> usize {
     let mut end = body.len();
     for word in ["WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "UNION", "INTERSECT", "EXCEPT", "WINDOW", "FETCH"] {
         if let Some(at) = find_keyword(body, word, 0) {
@@ -1142,6 +1142,9 @@ pub(crate) async fn materialize(
     // table d", every correlated scalar subquery an ORM sends).
     let mut current = unquote_plain_qualified(sql);
     let mut found = false;
+    // Whether the outer rows were cut to the statement's LIMIT already
+    // (`limited_outer`): once.
+    let mut limited = false;
     for index in 0..16usize {
         let Some(item) = next_item(&current) else { break };
         let item = qualify_outer_columns(&current, &item?, database).await?;
@@ -1184,19 +1187,52 @@ pub(crate) async fn materialize(
                     "SELECT DISTINCT {} FROM {relation} {alias}",
                     columns.iter().map(|c| format!("{alias}.{c}::text")).collect::<Vec<_>>().join(", ")
                 );
+                // A statement whose filter holds a subquery (an EXISTS) is
+                // cut to the rows it keeps before anything is probed
+                // (`limited_outer`): the probe would run the filter, each
+                // item's copy of the outer rows again, and the statement
+                // once more.
+                if !limited {
+                    if let Some(cut) = limited_outer(&current, alias, relation, usize::MAX).filter(|cut| cut.subquery) {
+                        limited = true;
+                        current = cut_outer(cut, &current, alias, relation, database, temps, tx).await?;
+                        continue;
+                    }
+                }
                 // Only the outer rows the statement can keep need a run. The
                 // item ran for every row of the outer relation: one customer
                 // of a thousand cost a thousand runs, and an outer table past
                 // `MAX_TUPLES` was refused whatever its WHERE kept.
+                // The filter the probe ran with, when it did: the outer
+                // item's copy below takes it too.
+                let mut pushed: Option<String> = None;
                 let tuples = match outer_only_filter(&current, &item, alias) {
                     Some(filter) => match text_rows(&format!("{key_query} WHERE {filter}"), columns.len(), database, tx).await {
-                        Ok(tuples) => tuples,
+                        Ok(tuples) => {
+                            pushed = Some(filter);
+                            tuples
+                        }
                         // Read as written it failed; every outer row is
                         // still a superset of what the statement keeps.
-                        Err(_) => text_rows(&key_query, columns.len(), database, tx).await?,
+                        Err(e) => {
+                            // Worth a line: the statement then runs its item
+                            // for every outer row.
+                            log::debug!("LATERAL item {}: the narrowed probe failed ({e}); running for every outer value", item.alias);
+                            text_rows(&key_query, columns.len(), database, tx).await?
+                        }
                     },
                     None => text_rows(&key_query, columns.len(), database, tx).await?,
                 };
+                // More outer values than the statement's LIMIT keeps rows:
+                // the rows it keeps first, the items for those (the item is
+                // read again, over them).
+                if !limited {
+                    if let Some(cut) = limited_outer(&current, alias, relation, tuples.len()) {
+                        limited = true;
+                        current = cut_outer(cut, &current, alias, relation, database, temps, tx).await?;
+                        continue;
+                    }
+                }
                 #[cfg(test)]
                 test_hooks::record_runs(relation, tuples.len());
                 if tuples.len() > MAX_TUPLES {
@@ -1208,6 +1244,54 @@ pub(crate) async fn materialize(
                     ));
                 }
                 let types = column_types(database, alias, relation, columns).await?;
+                // One distinct tuple of the outer values it reads: every
+                // outer row the statement can keep has it, so the item is
+                // the same rows for each: a constant, built once and joined
+                // as an item that reads nothing outside is. No keyed
+                // relation, no key expression to join on, and so no copy of
+                // the outer item to carry one: a point lookup with a
+                // select-list subquery paid 4 ms for those, where the
+                // lookup and the subquery take 0.14 ms each.
+                if let [tuple] = tuples.as_slice() {
+                    let constants: Vec<String> = tuple
+                        .iter()
+                        .zip(&types)
+                        .map(|(v, t)| match v {
+                            Some(v) => format!("CAST({} AS {t})", quote(v)),
+                            None => format!("CAST(NULL AS {t})"),
+                        })
+                        .collect();
+                    let constant = Item { body: substitute(&item.body, alias, columns, &constants), ..item.clone() };
+                    let built =
+                        crate::core::rql::cte::materialize_query(&constant.body, &constant.alias, &current, database, tx).await?;
+                    temps.push(built.clone());
+                    let renamed = rename_columns(&constant, &built, database, tx).await?;
+                    if renamed != built {
+                        temps.push(renamed.clone());
+                    }
+                    let scalar = item.alias.starts_with(crate::core::rql::correlated::ALIAS_PREFIX);
+                    let cross = as_cross_join(&constant);
+                    // Its rows counted once, for both: a correlated scalar
+                    // subquery's item is one row at most (PostgreSQL's
+                    // 21000), and a `LEFT … ON true` over none keeps the
+                    // outer rows with NULLs.
+                    if scalar || (cross.is_some() && item.form == Form::Left) {
+                        let rows = row_count(&renamed, database, tx).await?;
+                        if scalar && rows > 1 {
+                            return Err("more than one row returned by a subquery used as an expression".to_string());
+                        }
+                        if rows == 0 && cross.is_some() && item.form == Form::Left {
+                            insert_null_row(&renamed, database, tx).await?;
+                        }
+                    }
+                    #[cfg(test)]
+                    test_hooks::record_constant(alias);
+                    current = match cross {
+                        Some(cross) => rewrite(&current, &cross, &renamed, None, &[]),
+                        None => rewrite(&current, &constant, &renamed, None, &[]),
+                    };
+                    continue;
+                }
                 let described = null_body(database, &item, outer).await?;
                 let mut runs = Vec::with_capacity(tuples.len());
                 for tuple in &tuples {
@@ -1257,7 +1341,9 @@ pub(crate) async fn materialize(
                 // The keys are expressions over the outer item, which a join
                 // takes as a derived column (`join_on`). The executor's own
                 // pass ran before this relation existed.
-                let columns_of = |name: &str| crate::core::rql::cte::relation_labels(name, database);
+                // (With the hidden columns a copy carries: a time column's
+                // 100 ns digit, read by name beside it.)
+                let columns_of = |name: &str| crate::core::rql::cte::relation_labels_carried(name, database);
                 if let Some(joined) = crate::core::rql::join_on::rewrite_statement(&current, &columns_of) {
                     current = joined;
                 }
@@ -1267,6 +1353,32 @@ pub(crate) async fn materialize(
                     let Some((start, end, inner, derived)) = crate::core::rql::cte::next_derived_table(&current) else {
                         break;
                     };
+                    // The outer item, copied to carry its join key: only the
+                    // rows the statement can keep, by the filter its probe
+                    // ran with. Every row was copied: with one product in
+                    // four kept of 10,900 (59 columns each) the copy was
+                    // 4.7 s an item, where the probe took 29 ms.
+                    // And only the columns the statement reads: a table of
+                    // 59 columns was copied whole to answer four of them,
+                    // once an item, and typing and filling that copy was a
+                    // third of the statement's time.
+                    let copy = copies_only(&inner, &derived, alias);
+                    let inner = match copy.then(|| pruned_copy(&inner, alias, &current[..start], &current[end..])).flatten() {
+                        Some(pruned) => {
+                            #[cfg(test)]
+                            test_hooks::record_pruned_copy(alias);
+                            pruned
+                        }
+                        None => inner,
+                    };
+                    let inner = match &pushed {
+                        Some(filter) if copy => {
+                            #[cfg(test)]
+                            test_hooks::record_narrowed_copy(alias);
+                            format!("{inner} WHERE {filter}")
+                        }
+                        _ => inner,
+                    };
                     let built = crate::core::rql::cte::materialize_query(&inner, &derived, &current, database, tx).await?;
                     temps.push(built.clone());
                     current = format!("{}{} {}{}", &current[..start], built, derived, &current[end..]);
@@ -1275,6 +1387,433 @@ pub(crate) async fn materialize(
         }
     }
     Ok(found.then_some(current))
+}
+
+/// The statement `current` with its outer item replaced by a copy of the
+/// rows `cut` keeps, built here and named in `temps`.
+async fn cut_outer(
+    cut: LimitedOuter,
+    current: &str,
+    alias: &str,
+    relation: &str,
+    database: &Arc<Database>,
+    temps: &mut Vec<String>,
+    tx: TxId,
+) -> Result<String, String> {
+    // The columns the statement goes on to read, where that can be told;
+    // whole rows otherwise. (Without the alias the copy is given, which is
+    // not a read of it.)
+    let after = cut.after.trim_start();
+    let outside = format!("{} {}", cut.before, after.strip_prefix(cut.written.as_str()).unwrap_or(after));
+    let body = match needed_columns(relation, alias, &outside, database) {
+        Some(list) => cut.body.replacen(&format!("SELECT {}.*", cut.written), &format!("SELECT {list}"), 1),
+        None => crate::core::rql::cte::whole_rows_with_hidden(&cut.body, database).unwrap_or(cut.body),
+    };
+    let built = crate::core::rql::cte::materialize_query(&body, alias, current, database, tx).await?;
+    temps.push(built.clone());
+    #[cfg(test)]
+    test_hooks::record_limited(alias);
+    Ok(format!("{}{built}{}", cut.before, cut.after))
+}
+
+/// A statement cut to the rows its `LIMIT` keeps ([`limited_outer`]): the
+/// query of those rows, and the statement around the relation they are
+/// copied to (`before`, the relation's name, `after`).
+struct LimitedOuter {
+    /// `SELECT <written>.* FROM …`.
+    body: String,
+    /// The outer item's alias as the statement spells it.
+    written: String,
+    /// Whether the statement's `WHERE` holds a subquery.
+    subquery: bool,
+    before: String,
+    after: String,
+}
+
+/// `sql`, whose select-list subqueries are `LATERAL` items over the outer
+/// item `alias` (`relation`), as the same statement over the rows its
+/// `LIMIT` keeps, when its items would run for more outer values (`tuples`)
+/// than that:
+///
+/// ```text
+/// SELECT a.x, __cs0.__v FROM t a LEFT JOIN LATERAL (…) __cs0 ON true WHERE w ORDER BY a.x LIMIT 10
+/// SELECT a.x, __cs0.__v FROM <copy> a LEFT JOIN LATERAL (…) __cs0 ON true ORDER BY a.x
+///     <copy>: SELECT a.* FROM t a WHERE w ORDER BY a.x LIMIT 10
+/// ```
+///
+/// A correlated scalar subquery's item is a value per outer row: it
+/// neither adds a row nor drops one (one row at most, 21000 otherwise), so
+/// which rows the limit keeps is the outer item's, its `WHERE`'s and its
+/// `ORDER BY`'s to decide. Read as written, the items ran for every outer
+/// value the `WHERE` kept before the limit dropped all but ten: EF Core's
+/// related-items query with a tag most products carry ran its two
+/// subqueries hundreds of times for ten rows (330 ms against SQL Server's
+/// 7). Decided here, by the count, so a lookup of one row pays for no copy.
+///
+/// `None` unless all of this holds:
+/// - the `FROM` is the outer item followed by correlated scalar items only
+///   (`LEFT JOIN LATERAL (…) __csN ON true`): any other join decides rows;
+/// - the select list has no `DISTINCT`, aggregate or window, and the
+///   statement no `GROUP BY`, `HAVING`, `WINDOW`, `FETCH`, locking clause or
+///   set operation: their rows are not the outer item's;
+/// - the `WHERE` reads no item's value (a subquery of its own was made one)
+///   and holds no parameter;
+/// - the `ORDER BY` is the outer item's own qualified columns: an output
+///   name or an ordinal may be an item's value;
+/// - `LIMIT` and `OFFSET` are integers, and `tuples` is more than their sum;
+///   or the `WHERE` holds a subquery, with a `LIMIT` or without: an
+///   `EXISTS` there was run by each item's probe and again by each item's
+///   copy of the outer rows, where the copy made here runs it once and
+///   everything after reads the rows it kept.
+fn limited_outer(sql: &str, alias: &str, relation: &str, tuples: usize) -> Option<LimitedOuter> {
+    use crate::core::rql::correlated::ALIAS_PREFIX;
+    let lead = sql.len() - sql.trim_start().len();
+    if !word_at(sql, lead, "SELECT") {
+        return None;
+    }
+    if ["GROUP", "HAVING", "WINDOW", "FETCH", "FOR", "UNION", "INTERSECT", "EXCEPT"].iter().any(|w| find_keyword(sql, w, 0).is_some()) {
+        return None;
+    }
+    let from = find_keyword(sql, "FROM", 0)?;
+    let list = sql[lead + "SELECT".len()..from].trim_start();
+    if ["DISTINCT", "ALL"].iter().any(|w| word_at(list, 0, w) && list.as_bytes().get(w.len()).is_some_and(|b| !is_word(*b))) {
+        return None;
+    }
+    if find_keyword(list, "OVER", 0).is_some() || crate::core::rql::distinct_on::calls_an_aggregate(list) {
+        return None;
+    }
+    let from_end = clause_end_of_from(sql);
+    if from_end <= from {
+        return None;
+    }
+    // The outer item, then scalar items only.
+    let source_at = from + "FROM".len();
+    let source = &sql[source_at..from_end];
+    let outer_end = find_keyword(source, "LEFT", 0)?;
+    let head = source[..outer_end].trim();
+    let words: Vec<&str> = head.split_whitespace().filter(|w| !w.eq_ignore_ascii_case("AS")).collect();
+    let written = match words.as_slice() {
+        [name] if same_name(name.trim_matches('"'), relation) && same_name(name.trim_matches('"'), alias) => *name,
+        [name, written] if same_name(name.trim_matches('"'), relation) && same_name(written.trim_matches('"'), alias) => *written,
+        _ => return None,
+    };
+    let mut at = outer_end;
+    while at < source.len() {
+        for word in ["LEFT", "JOIN", "LATERAL"] {
+            at = skip_ws(source, at);
+            if !word_at(source, at, word) {
+                return None;
+            }
+            at += word.len();
+        }
+        at = skip_ws(source, at);
+        if source.as_bytes().get(at) != Some(&b'(') {
+            return None;
+        }
+        at = skip_ws(source, matching_paren(source, at)? + 1);
+        let (name, after) = identifier_at(source, at)?;
+        if !name.starts_with(ALIAS_PREFIX) || !name[ALIAS_PREFIX.len()..].bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        at = after;
+        for word in ["ON", "true"] {
+            at = skip_ws(source, at);
+            if !word_at(source, at, word) || source.as_bytes().get(at + word.len()).is_some_and(|b| is_word(*b)) {
+                return None;
+            }
+            at += word.len();
+        }
+        at = skip_ws(source, at);
+    }
+    // WHERE, ORDER BY, LIMIT / OFFSET: in that order, nothing else.
+    let rest = &sql[from_end..];
+    let rest = rest.trim().trim_end_matches(';').trim_end();
+    if rest.contains('$') {
+        return None;
+    }
+    let tail_at = ["LIMIT", "OFFSET"].iter().filter_map(|w| find_keyword(rest, w, 0)).min().unwrap_or(rest.len());
+    let order_at = find_keyword(rest, "ORDER", 0);
+    if order_at.is_some_and(|o| o > tail_at) {
+        return None;
+    }
+    let filter = rest[..order_at.unwrap_or(tail_at)].trim();
+    if !(filter.is_empty() || (word_at(filter, 0, "WHERE") && !filter.contains(ALIAS_PREFIX))) {
+        return None;
+    }
+    let order = order_at.map(|o| rest[o..tail_at].trim()).unwrap_or_default();
+    if !order.is_empty() {
+        let keys = order["ORDER".len()..].trim_start();
+        if !word_at(keys, 0, "BY") {
+            return None;
+        }
+        for key in crate::core::sql_scan::split_top_level(&keys["BY".len()..], b',') {
+            let mut key = key.trim();
+            for suffix in [" NULLS FIRST", " NULLS LAST", " ASC", " DESC"] {
+                if key.len() > suffix.len() && key.is_char_boundary(key.len() - suffix.len()) {
+                    let (head, tail) = key.split_at(key.len() - suffix.len());
+                    if tail.eq_ignore_ascii_case(suffix) {
+                        key = head.trim_end();
+                    }
+                }
+            }
+            let (qualifier, column) = key.split_once('.')?;
+            let plain = |name: &str| {
+                let name = name.trim();
+                let inner = name.strip_prefix('"').and_then(|n| n.strip_suffix('"')).unwrap_or(name);
+                !inner.is_empty() && !inner.contains('"') && (name.starts_with('"') || inner.bytes().all(is_word))
+            };
+            if !same_name(qualifier.trim().trim_matches('"'), alias) || !plain(qualifier) || !plain(column) {
+                return None;
+            }
+        }
+    }
+    // `LIMIT n [OFFSET m]` or `OFFSET m LIMIT n`, integers; or neither.
+    let tail = rest[tail_at..].trim();
+    let words: Vec<&str> = tail.split_whitespace().collect();
+    let kept: Option<usize> = match words.as_slice() {
+        [] => None,
+        [l, n] if l.eq_ignore_ascii_case("LIMIT") => Some(n.parse::<usize>().ok()?),
+        [l, n, o, m] if l.eq_ignore_ascii_case("LIMIT") && o.eq_ignore_ascii_case("OFFSET") => {
+            Some(n.parse::<usize>().ok()?.checked_add(m.parse::<usize>().ok()?)?)
+        }
+        [o, m, l, n] if l.eq_ignore_ascii_case("LIMIT") && o.eq_ignore_ascii_case("OFFSET") => {
+            Some(n.parse::<usize>().ok()?.checked_add(m.parse::<usize>().ok()?)?)
+        }
+        _ => return None,
+    };
+    // A filter holding a subquery is run once for the copy, where each
+    // item's probe and each item's copy of the outer rows ran it again.
+    let subquery = names_word(filter, "SELECT");
+    if !subquery && kept.is_none_or(|kept| tuples <= kept) {
+        return None;
+    }
+    let mut body = format!("SELECT {written}.* FROM {head}");
+    for part in [filter, order, tail] {
+        if !part.is_empty() {
+            body.push(' ');
+            body.push_str(part);
+        }
+    }
+    // The statement around the copy: its relation's name in place of the
+    // outer item's, the items after it, and the order its rows come in.
+    let head_at = source_at + (source.len() - source.trim_start().len());
+    let after_head = source_at + outer_end;
+    let mut after = format!(" {written} {}", sql[after_head..from_end].trim());
+    if !order.is_empty() {
+        after.push(' ');
+        after.push_str(order);
+    }
+    Some(LimitedOuter { body, written: written.to_string(), before: sql[..head_at].to_string(), after, subquery })
+}
+
+/// Whether `text` (a statement, or the parts of one) could read a column of
+/// the item `alias` without naming it: a `*`, the item named whole (`alias`
+/// not followed by `.`: a whole-row reference, or a second item of the same
+/// name), or a `NATURAL` join, whose columns are not written. A string
+/// holding one of them reads as it would outside: said to be so, a column is
+/// kept that was not needed, never dropped that was.
+fn may_read_unnamed(text: &str, alias: &str) -> bool {
+    // (At any depth: a subquery's NATURAL join may be to the item.)
+    if star_reads(text, alias) || names_word(text, "NATURAL") {
+        return true;
+    }
+    let (bytes, name) = (text.as_bytes(), alias.as_bytes());
+    if name.is_empty() {
+        return true;
+    }
+    let mut at = 0usize;
+    while at + name.len() <= bytes.len() {
+        let here = bytes[at..at + name.len()].eq_ignore_ascii_case(name)
+            && (at == 0 || !(is_word(bytes[at - 1]) || bytes[at - 1] >= 0x80))
+            && bytes.get(at + name.len()).is_none_or(|b| !(is_word(*b) || *b >= 0x80));
+        if here {
+            // `alias.`, `"alias".`: a column of it. Anything else names it
+            // whole.
+            let mut next = at + name.len();
+            if bytes.get(next) == Some(&b'"') {
+                next += 1;
+            }
+            if bytes.get(next) != Some(&b'.') {
+                return true;
+            }
+            at = next;
+        } else {
+            at += 1;
+        }
+    }
+    false
+}
+
+/// Whether a `*` of `text` could stand for columns of `alias`: `alias.*`,
+/// or a bare `*` in a select list (after `SELECT`, `DISTINCT`, `ALL` or a
+/// comma), wherever it is. Not `count(*)`, another item's `x.*`, or a
+/// multiplication; anything this cannot tell apart is said to be one.
+fn star_reads(text: &str, alias: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            q @ (b'\'' | b'"') => {
+                at = crate::core::sql_scan::quoted_end(bytes, at, q);
+                continue;
+            }
+            b'*' => {
+                let before = text[..at].trim_end();
+                let after = text[at + 1..].trim_start();
+                let last = before.as_bytes().last().copied();
+                match last {
+                    Some(b'(') if after.starts_with(')') => {}
+                    Some(b'.') => {
+                        let qualifier = before[..before.len() - 1].trim_end();
+                        let start = qualifier
+                            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '"' || !c.is_ascii()))
+                            .map_or(0, |p| p + 1);
+                        if same_name(&qualifier[start..], alias) || qualifier[start..].is_empty() {
+                            return true;
+                        }
+                    }
+                    Some(b) if is_word(b) => {
+                        let start = before.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |p| p + 1);
+                        if ["SELECT", "DISTINCT", "ALL"].iter().any(|w| before[start..].eq_ignore_ascii_case(w)) {
+                            return true;
+                        }
+                    }
+                    // An operand before it: a multiplication.
+                    Some(b')' | b'\'' | b'"') => {}
+                    _ => return true,
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    false
+}
+
+/// Whether `text` holds `name` as a word, in any case: a column the text
+/// may read. A name that is not a plain word is looked for as it is.
+fn names_word(text: &str, name: &str) -> bool {
+    let (bytes, word) = (text.as_bytes(), name.as_bytes());
+    if word.is_empty() || !word.iter().all(|b| is_word(*b)) {
+        return text.contains(name);
+    }
+    let mut at = 0usize;
+    while at + word.len() <= bytes.len() {
+        if bytes[at..at + word.len()].eq_ignore_ascii_case(word)
+            && (at == 0 || !is_word(bytes[at - 1]))
+            && bytes.get(at + word.len()).is_none_or(|b| !is_word(*b))
+        {
+            return true;
+        }
+        at += 1;
+    }
+    false
+}
+
+/// The select list of a copy of `relation` (the outer item `alias`) holding
+/// only the columns `outside`, the statement around it, names: each as
+/// `alias."column"`, a hidden one the copy carries read as a value
+/// (`cte::carried_hidden_columns`). `None` when the statement could read a
+/// column without naming it ([`may_read_unnamed`]), the relation is not
+/// known, or it names every column.
+fn needed_columns(relation: &str, alias: &str, outside: &str, database: &Arc<Database>) -> Option<String> {
+    if may_read_unnamed(outside, alias) {
+        return None;
+    }
+    let all = crate::core::rql::cte::relation_labels_carried(relation, database)?;
+    let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let kept: Vec<String> = all
+        .iter()
+        .filter(|c| names_word(outside, c))
+        .map(|c| {
+            if crate::core::rql::nullable::is_hidden(c) {
+                format!("CAST({}.{} AS smallint) AS {}", quoted(alias), quoted(c), quoted(c))
+            } else {
+                format!("{}.{}", quoted(alias), quoted(c))
+            }
+        })
+        .collect();
+    (!kept.is_empty() && kept.len() < all.len()).then(|| kept.join(", "))
+}
+
+/// `inner`, the copy `join_on` makes of the outer item `alias` to carry a
+/// join key ([`copies_only`]), without the columns the statement around it
+/// (`before`, `after`) does not name: its plain columns (`"c"`) and the
+/// hidden ones it carries (`CAST(… AS smallint) AS "__t7_c"`). The key and
+/// anything else stays. `None` when nothing can be left out
+/// ([`may_read_unnamed`]) or nothing is.
+fn pruned_copy(inner: &str, alias: &str, before: &str, after: &str) -> Option<String> {
+    let outside = format!("{before} {after}");
+    if may_read_unnamed(&outside, alias) {
+        return None;
+    }
+    let from = find_keyword(inner, "FROM", 0)?;
+    let lead = inner.len() - inner.trim_start().len();
+    if !word_at(inner, lead, "SELECT") {
+        return None;
+    }
+    let list = &inner[lead + "SELECT".len()..from];
+    let items = crate::core::sql_scan::split_top_level(list, b',');
+    let plain = |item: &str| -> Option<String> {
+        let name = item.strip_prefix('"')?.strip_suffix('"')?;
+        (!name.contains('"')).then(|| name.to_string())
+    };
+    let carried = |item: &str| -> Option<String> {
+        let rest = item.strip_prefix("CAST(")?;
+        let (_, name) = rest.rsplit_once(" AS smallint) AS ")?;
+        let name = plain(name.trim())?;
+        crate::core::rql::nullable::is_hidden(&name).then_some(name)
+    };
+    let kept: Vec<&str> = items
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| match plain(item).or_else(|| carried(item)) {
+            Some(name) => names_word(&outside, &name),
+            None => true,
+        })
+        .collect();
+    (kept.len() < items.len() && !kept.is_empty()).then(|| format!("{}SELECT {} {}", &inner[..lead], kept.join(", "), &inner[from..]))
+}
+
+/// Whether `inner` (a derived table's body, aliased `derived`) is the plain
+/// copy `join_on` makes of the outer item `alias` to carry a join key:
+/// `SELECT … FROM <relation> [AS] alias`, nothing after it. Only such a
+/// copy takes the outer item's filter.
+fn copies_only(inner: &str, derived: &str, alias: &str) -> bool {
+    if !same_name(derived, alias) {
+        return false;
+    }
+    let Some(from) = find_keyword(inner, "FROM", 0) else { return false };
+    let tail = inner[from + "FROM".len()..].trim();
+    if ["WHERE", "JOIN", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "UNION", "INTERSECT", "EXCEPT", "WINDOW"]
+        .iter()
+        .any(|w| find_keyword(tail, w, 0).is_some())
+        || tail.contains(',')
+        || tail.contains('(')
+    {
+        return false;
+    }
+    // `<relation> [AS] <alias>`.
+    let words: Vec<&str> = tail.split_whitespace().collect();
+    match words.as_slice() {
+        [_, a] => same_name(a, alias),
+        [_, kw, a] => kw.eq_ignore_ascii_case("AS") && same_name(a, alias),
+        _ => false,
+    }
+}
+
+/// Whether two spellings name one thing: equal ignoring ASCII case, or one
+/// quoted and the other its plain lower-case name (`"d0"` and `d0`).
+fn same_name(a: &str, b: &str) -> bool {
+    let plain = |n: &str| -> String {
+        let t = n.trim();
+        match t.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+            Some(inner) if inner.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_') => inner.to_string(),
+            Some(_) => t.to_string(),
+            None => t.to_ascii_lowercase(),
+        }
+    };
+    plain(a) == plain(b)
 }
 
 /// The statement's own top-level `WHERE` conjuncts that read nothing but the
@@ -1294,7 +1833,9 @@ pub(crate) async fn materialize(
 /// left out is still decided by the statement's own `WHERE`.
 fn outer_only_filter(sql: &str, item: &Item, alias: &str) -> Option<String> {
     let first = items_before(sql, item.start).into_iter().next()?;
-    if !first.0.eq_ignore_ascii_case(alias) {
+    // `AS "d"` and `d` are one alias (a plain lower-case name quoted): an
+    // ORM's quoted aliases left every correlated subquery unnarrowed.
+    if !same_name(&first.0, alias) {
         return None;
     }
     let from = find_keyword(sql, "FROM", 0)?;
@@ -1344,6 +1885,19 @@ fn conjuncts(clause: &str) -> Vec<String> {
         open = between.is_some_and(|b| find_keyword(last, "AND", b).is_none());
     }
     out
+}
+
+/// [`limited_outer`] for tests: the copy's query, and the statement around
+/// `<copy>`.
+#[cfg(test)]
+pub(crate) fn limited_outer_for_tests(sql: &str, alias: &str, relation: &str, tuples: usize) -> Option<(String, String)> {
+    limited_outer(sql, alias, relation, tuples).map(|cut| (cut.body, format!("{}<copy>{}", cut.before, cut.after)))
+}
+
+/// [`pruned_copy`] for tests.
+#[cfg(test)]
+pub(crate) fn pruned_copy_for_tests(inner: &str, alias: &str, before: &str, after: &str) -> Option<String> {
+    pruned_copy(inner, alias, before, after)
 }
 
 #[cfg(test)]
@@ -1431,7 +1985,7 @@ fn exists_reads_only(term: &str, alias: &str) -> bool {
     }
     let binds = |name: &str| {
         let n = name.trim_matches('"').to_ascii_lowercase();
-        n == alias.to_ascii_lowercase() || bound.contains(&n)
+        same_name(name, alias) || bound.contains(&n)
     };
     for (word, quoted, end) in &tokens {
         let next = body[*end..].trim_start();
@@ -1507,7 +2061,7 @@ fn reads_only(term: &str, alias: &str) -> bool {
                 }
                 let word = &term[start..i];
                 if bytes.get(i) == Some(&b'.') {
-                    if !word.eq_ignore_ascii_case(alias) {
+                    if !same_name(word, alias) {
                         return false;
                     }
                     i += 1;
@@ -1536,15 +2090,24 @@ fn reads_only(term: &str, alias: &str) -> bool {
 
 /// A row of NULLs in `relation` when it has no rows.
 async fn fill_one_null_row(relation: &str, database: &Arc<Database>, tx: TxId) -> Result<(), String> {
-    let (rows, _) = crate::core::rql::executor::run_query_rows_scaled(&format!("SELECT count(*) FROM {relation}"), database, tx).await?;
-    let empty = rows
-        .first()
-        .and_then(|r| r.columns.first())
-        .and_then(|c| <[u8; 8]>::try_from(c.data.into_slice()).ok())
-        .is_some_and(|b| i64::from_le_bytes(b) == 0);
-    if !empty {
+    if row_count(relation, database, tx).await? != 0 {
         return Ok(());
     }
+    insert_null_row(relation, database, tx).await
+}
+
+/// The rows `relation` holds.
+async fn row_count(relation: &str, database: &Arc<Database>, tx: TxId) -> Result<i64, String> {
+    let (rows, _) = crate::core::rql::executor::run_query_rows_scaled(&format!("SELECT count(*) FROM {relation}"), database, tx).await?;
+    rows.first()
+        .and_then(|r| r.columns.first())
+        .and_then(|c| <[u8; 8]>::try_from(c.data.into_slice()).ok())
+        .map(i64::from_le_bytes)
+        .ok_or_else(|| format!("LATERAL: {relation} cannot be counted"))
+}
+
+/// One row of NULLs into `relation`.
+async fn insert_null_row(relation: &str, database: &Arc<Database>, tx: TxId) -> Result<(), String> {
     let labels = crate::core::rql::cte::relation_labels(relation, database)
         .ok_or_else(|| format!("LATERAL: {relation} cannot be read"))?;
     let nulls = vec!["NULL"; labels.len()].join(", ");
@@ -1558,7 +2121,7 @@ async fn fill_one_null_row(relation: &str, database: &Arc<Database>, tx: TxId) -
 
 /// The first `width` cells of each row `query` returns, as text: it selects
 /// `::text` values only. `None` for a NULL.
-async fn text_rows(query: &str, width: usize, database: &Arc<Database>, tx: TxId) -> Result<Vec<Vec<Option<String>>>, String> {
+pub(crate) async fn text_rows(query: &str, width: usize, database: &Arc<Database>, tx: TxId) -> Result<Vec<Vec<Option<String>>>, String> {
     let (rows, _) = crate::core::rql::executor::run_query_rows_scaled(query, database, tx).await?;
     Ok(rows
         .iter()
@@ -1757,6 +2320,56 @@ pub(crate) mod test_hooks {
     /// The runs each outer relation's `LATERAL` items took, by relation name.
     static RUNS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 
+    /// The outer-item copies narrowed by the statement's filter, by alias.
+    static NARROWED: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    pub(crate) fn record_narrowed_copy(alias: &str) {
+        *NARROWED.lock().unwrap().get_or_insert_with(HashMap::new).entry(alias.to_string()).or_default() += 1;
+    }
+
+    /// The narrowed copies recorded for `alias`, forgotten.
+    pub(crate) fn take_narrowed_copies(alias: &str) -> usize {
+        NARROWED.lock().unwrap().as_mut().and_then(|m| m.remove(alias)).unwrap_or(0)
+    }
+
+    /// The items built as a constant (one outer tuple), by outer alias.
+    static CONSTANTS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    pub(crate) fn record_constant(alias: &str) {
+        *CONSTANTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(alias.to_string()).or_default() += 1;
+    }
+
+    /// The constant items recorded for `alias`, forgotten.
+    pub(crate) fn take_constants(alias: &str) -> usize {
+        CONSTANTS.lock().unwrap().as_mut().and_then(|m| m.remove(alias)).unwrap_or(0)
+    }
+
+    /// The statements whose outer rows were cut to their LIMIT first
+    /// (`limited_outer`), by outer alias.
+    static LIMITED: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    pub(crate) fn record_limited(alias: &str) {
+        *LIMITED.lock().unwrap().get_or_insert_with(HashMap::new).entry(alias.to_string()).or_default() += 1;
+    }
+
+    /// The cuts recorded for `alias`, forgotten.
+    pub(crate) fn take_limited(alias: &str) -> usize {
+        LIMITED.lock().unwrap().as_mut().and_then(|m| m.remove(alias)).unwrap_or(0)
+    }
+
+    /// The outer-item copies made of the columns the statement names only
+    /// (`pruned_copy`), by alias.
+    static PRUNED: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    pub(crate) fn record_pruned_copy(alias: &str) {
+        *PRUNED.lock().unwrap().get_or_insert_with(HashMap::new).entry(alias.to_string()).or_default() += 1;
+    }
+
+    /// The pruned copies recorded for `alias`, forgotten.
+    pub(crate) fn take_pruned_copies(alias: &str) -> usize {
+        PRUNED.lock().unwrap().as_mut().and_then(|m| m.remove(alias)).unwrap_or(0)
+    }
+
     pub(crate) fn record_runs(relation: &str, runs: usize) {
         *RUNS.lock().unwrap().get_or_insert_with(HashMap::new).entry(relation.to_string()).or_default() += runs;
     }
@@ -1825,6 +2438,14 @@ mod exists_filter_tests {
                    WHERE d.id = d0.productsid AND d1.content = 'Realme C53')";
         assert!(exists_reads_only(tag, "d"));
         assert!(exists_reads_only("NOT EXISTS (SELECT 1 FROM t x WHERE x.k = d.id AND x.v = '1'::uuid)", "d"));
+        // As it reaches the check after `unquote_plain_qualified`: quoted
+        // relation names (U+2024 dots) and quoted lone aliases.
+        assert!(exists_reads_only(
+            "EXISTS (SELECT 1 FROM \"denevcloud\u{2024}erp\u{2024}producttags\" AS \"d0\" INNER JOIN \"denevcloud\u{2024}erp\u{2024}tags\" AS \"d1\" \
+             ON d0.tagsid = d1.id WHERE d.id = d0.productsid AND d1.content IN ('Samsung Galaxy A14', 'Samsung Galaxy A14 5G'))",
+            "d"
+        ));
+        assert!(exists_reads_only("EXISTS (SELECT 1 FROM t AS \"x\" WHERE x.k = d.id)", "\"d\""));
         // Its select list is not read: the SQL Server front end's `SELECT
         // CAST(1 AS integer)`.
         assert!(exists_reads_only(

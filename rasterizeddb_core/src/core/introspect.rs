@@ -3276,6 +3276,7 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             ("partition", "resident_budget") => crate::core::partition::budget::settings::resident_budget().to_string(),
             #[cfg(feature = "sharding")]
             ("shard", "schema_epoch") => crate::core::shard::rshard::SCHEMA_EPOCH.load(Ordering::Acquire).to_string(),
+            #[cfg(feature = "sharding")]
             ("shard", "ddl_fence") => crate::core::shard::ddl::fence(),
             ("index_snapshot", "idle_checkpoint_secs") => {
                 crate::core::index_store::seal::settings::idle_checkpoint_secs().to_string()

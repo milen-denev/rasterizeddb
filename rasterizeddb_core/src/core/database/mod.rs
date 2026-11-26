@@ -6436,6 +6436,9 @@ pub(crate) fn resolve_native_database(
 pub(crate) struct NativeConnection {
     context: NativeContext,
     principal: StdArc<rastcp::session::Principal>,
+    /// The role a trust connection named ([`crate::pgwire::NATIVE_ROLE_PREFIX`]):
+    /// who it runs as from then on, in place of the anonymous principal.
+    trust_principal: std::sync::OnceLock<StdArc<rastcp::session::Principal>>,
     multiplexed: bool,
     session: std::sync::OnceLock<crate::pgwire::NativeSession>,
     /// The connection asked for notices
@@ -6450,6 +6453,64 @@ pub(crate) struct NativeConnection {
 }
 
 impl NativeConnection {
+    /// Who the connection runs as: the role a trust connection named, or the
+    /// principal its login proved.
+    fn principal(&self) -> &StdArc<rastcp::session::Principal> {
+        self.trust_principal.get().unwrap_or(&self.principal)
+    }
+
+    /// Answers a [`crate::pgwire::NATIVE_ROLE_PREFIX`] request: `role`, and
+    /// optionally `\x1f` and a database to select with it.
+    async fn name_role(&self, rest: &[u8]) -> Vec<u8> {
+        use crate::pgwire::{native_simple_complete as complete, native_simple_error as refuse};
+
+        let Ok(rest) = std::str::from_utf8(rest) else {
+            return refuse("22021", "the role name is not valid UTF-8", b'I');
+        };
+        let (role, database) = match rest.split_once('\x1f') {
+            Some((role, database)) => (role, Some(database)),
+            None => (rest, None),
+        };
+        if role.is_empty() || database.is_some_and(str::is_empty) {
+            return refuse("08P01", "a role request names a role, and a database after \\x1f if any", b'I');
+        }
+        if self.context.authentication_required {
+            return refuse(
+                "28000",
+                "this listener authenticates: a login names its role, and a connection does not take another",
+                b'I',
+            );
+        }
+        if self.session.get().is_some() || self.trust_principal.get().is_some() {
+            return refuse(
+                "08P01",
+                "a connection names its role before its first statement, once",
+                b'I',
+            );
+        }
+        let name = database.unwrap_or_else(|| self.login_database());
+        let target = match resolve_native_database(self.context.catalog.as_deref(), &self.context.database, name) {
+            Ok(d) => d,
+            Err((code, message)) => return refuse(code, &message, b'I'),
+        };
+        // The role must be one of that database's, allowed to log in (a
+        // database with no roles at all admits any name, as a fresh one does).
+        if let Err(message) = crate::auth::trust_login(&target, role, None).await {
+            return refuse("28000", &message, b'I');
+        }
+        let principal = rastcp::session::Principal { user: role.to_string(), superuser: false, database: None };
+        if self.trust_principal.set(StdArc::new(principal)).is_err() {
+            return refuse("08P01", "a connection names its role once", b'I');
+        }
+        match database {
+            Some(db) => self.select(db.as_bytes()),
+            None => match self.session_in(name) {
+                Ok(_) => complete("SET"),
+                Err((code, message)) => refuse(code, &message, b'I'),
+            },
+        }
+    }
+
     /// The database the login named, or the listener's.
     fn login_database(&self) -> &str {
         self.principal
@@ -6473,7 +6534,7 @@ impl NativeConnection {
         }
         let database =
             resolve_native_database(self.context.catalog.as_deref(), &self.context.database, name)?;
-        let made = native_session_in(&self.context, database, &self.principal, self.multiplexed);
+        let made = native_session_in(&self.context, database, self.principal(), self.multiplexed);
         let _ = self.session.set(made);
         Ok(self.session.get().expect("set just above"))
     }
@@ -6549,6 +6610,7 @@ fn open_native_session(
     NativeConnection {
         context: context.clone(),
         principal: principal.clone(),
+        trust_principal: std::sync::OnceLock::new(),
         multiplexed: connection.multiplexed,
         session: std::sync::OnceLock::new(),
         notices: std::sync::atomic::AtomicBool::new(false),
@@ -6593,13 +6655,18 @@ fn native_session_in(
 /// the connection's session, in the connection's database.
 async fn serve_native_request(
     context: NativeContext,
-    principal: StdArc<rastcp::session::Principal>,
+    _login: StdArc<rastcp::session::Principal>,
     connection: StdArc<NativeConnection>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
+    if let Some(rest) = request_vec.strip_prefix(crate::pgwire::NATIVE_ROLE_PREFIX) {
+        return connection.name_role(rest).await;
+    }
     if let Some(name) = request_vec.strip_prefix(crate::pgwire::NATIVE_DATABASE_PREFIX) {
         return connection.select(name);
     }
+    // Everything below runs as the role a trust connection named, if any.
+    let principal = connection.principal().clone();
     // Ahead of the session, as the database selection is: a setup request,
     // which must not make the session in the default database before a
     // selection does.

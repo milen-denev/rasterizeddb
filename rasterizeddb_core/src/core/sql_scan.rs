@@ -644,12 +644,14 @@ pub fn row_assignments(sql: &str) -> Result<Option<String>, String> {
                             Some(at) => item[..at].trim(),
                             None => item.trim(),
                         };
-                        format!("{value} AS __rdb_row{}", n + 1)
+                        // (Not `__rdb_…`: the role guard would take the
+                        // name for a catalogue's.)
+                        format!("{value} AS __row_value{}", n + 1)
                     })
                     .collect();
                 for (n, column) in columns.iter().enumerate() {
                     out_items.push(format!(
-                        "{column} = (SELECT __rdb_row{} FROM (SELECT {} {tail}) AS __rdb_row)",
+                        "{column} = (SELECT __row_value{} FROM (SELECT {} {tail}) AS __row_values)",
                         n + 1,
                         named.join(", ")
                     ));
@@ -2283,7 +2285,11 @@ pub fn plain_branch_parentheses(sql: &str) -> std::borrow::Cow<'_, str> {
         } else if alone || own_tail {
             continue;
         } else if set_operation {
-            format!("SELECT * FROM ({inner}) __rdb_branch{number}")
+            // Named outside the catalogue's `__rdb_` namespace: the role
+            // guard reads every identifier of the statement it is given,
+            // this one included, and refused the client's query as a read
+            // of "a system catalog".
+            format!("SELECT * FROM ({inner}) __set_branch{number}")
         } else {
             inner.to_string()
         };
@@ -4541,8 +4547,8 @@ mod row_assignment_tests {
         assert_eq!(
             row_assignments("UPDATE d SET (a, b) = (SELECT max(n) AS m, 'z' FROM e WHERE e.k > d.id) WHERE id = 1").unwrap().as_deref(),
             Some(
-                "UPDATE d SET a = (SELECT __rdb_row1 FROM (SELECT max(n) AS __rdb_row1, 'z' AS __rdb_row2 FROM e WHERE e.k > d.id) AS __rdb_row), \
-                 b = (SELECT __rdb_row2 FROM (SELECT max(n) AS __rdb_row1, 'z' AS __rdb_row2 FROM e WHERE e.k > d.id) AS __rdb_row) WHERE id = 1"
+                "UPDATE d SET a = (SELECT __row_value1 FROM (SELECT max(n) AS __row_value1, 'z' AS __row_value2 FROM e WHERE e.k > d.id) AS __row_values), \
+                 b = (SELECT __row_value2 FROM (SELECT max(n) AS __row_value1, 'z' AS __row_value2 FROM e WHERE e.k > d.id) AS __row_values) WHERE id = 1"
             )
         );
         assert!(super::contains_aggregate_call("COUNT (*) + 1") && !super::contains_aggregate_call("'max(x)'") && !super::contains_aggregate_call("maxim(x)"));
@@ -4710,16 +4716,28 @@ mod branch_parentheses_tests {
         // A group decides the order of evaluation: a derived table.
         assert_eq!(
             plain("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 2"),
-            "SELECT * FROM (SELECT 1 UNION SELECT 2) __rdb_branch0 INTERSECT SELECT 2"
+            "SELECT * FROM (SELECT 1 UNION SELECT 2) __set_branch0 INTERSECT SELECT 2"
         );
         assert_eq!(
             plain("((SELECT 1) UNION (SELECT 2)) INTERSECT (SELECT 2)"),
-            "SELECT * FROM (SELECT 1 UNION SELECT 2) __rdb_branch0 INTERSECT SELECT 2"
+            "SELECT * FROM (SELECT 1 UNION SELECT 2) __set_branch0 INTERSECT SELECT 2"
         );
         assert_eq!(
             plain("SELECT 1 EXCEPT ALL (SELECT 1 UNION SELECT 2)"),
-            "SELECT 1 EXCEPT ALL SELECT * FROM (SELECT 1 UNION SELECT 2) __rdb_branch1"
+            "SELECT 1 EXCEPT ALL SELECT * FROM (SELECT 1 UNION SELECT 2) __set_branch1"
         );
+        // The names these rewrites make are not a catalogue's to the role
+        // guard, which reads the rewritten statement: it refused a client's
+        // `(SELECT 1 UNION SELECT 2) INTERSECT SELECT 2` as a read of "a
+        // system catalog" when the alias began `__rdb_`.
+        for sql in [
+            plain("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 2"),
+            plain("SELECT 1 EXCEPT ALL (SELECT 1 UNION SELECT 2)"),
+            row_assignments("UPDATE d SET (a, b) = (SELECT max(n) AS m, 'z' FROM e WHERE e.k > d.id) WHERE id = 1").unwrap().unwrap(),
+        ] {
+            assert!(!crate::core::rql::privileges::may_name_catalog(&sql), "{sql}");
+            assert_eq!(crate::core::rql::privileges::catalog_refusal(&sql), None, "{sql}");
+        }
     }
 
     #[test]
@@ -4758,7 +4776,7 @@ mod branch_parentheses_tests {
         // A group inside a group.
         assert_eq!(
             nested("SELECT a FROM t WHERE a IN ((SELECT 1) EXCEPT ((SELECT 2) UNION (SELECT 3)))"),
-            "SELECT a FROM t WHERE a IN (SELECT 1 EXCEPT SELECT * FROM (SELECT 2 UNION SELECT 3) __rdb_branch1)"
+            "SELECT a FROM t WHERE a IN (SELECT 1 EXCEPT SELECT * FROM (SELECT 2 UNION SELECT 3) __set_branch1)"
         );
         for sql in [
             "SELECT a FROM t WHERE (a = 1) AND ((b = 2) OR (c = 3))",

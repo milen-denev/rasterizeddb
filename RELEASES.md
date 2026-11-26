@@ -51,10 +51,12 @@
 - **Over the SQL Server protocol, text columns are case-insensitive by default**, as under SQL Server's default `SQL_Latin1_General_CP1_CI_AS`: a `CREATE TABLE` or `ADD COLUMN` without a `COLLATE` gives a text column `rdb_ci`. `--mssql-collation bin` keeps the old byte comparison. Tables made over PostgreSQL, MySQL or the native protocol are unchanged.
 - `tinyint` (the engine's unsigned byte) is sent over the SQL Server protocol as TDS `INTN(1)`, and its PostgreSQL row description gives a type modifier of 1, not -1.
 - A `CREATE UNIQUE INDEX … WHERE …` over the SQL Server protocol ignored its filter and refused rows the filter leaves out; the filter is honoured now.
+- **A native trust connection that names no role is no longer an administrator** (roles plan R0: `trust` authenticates as the named role, never as an administrator by itself). In a database with roles, a `Login::Trust` connection on a `--rdb-socket-auth trust` socket now runs as nobody: role statements (`CREATE`/`ALTER USER`…), the server's administration (`BACKUP`, `STORAGE`, `CREATE DATABASE`…) and every table another role owns are refused; it keeps the tables it created itself and whatever PUBLIC is granted. Before, it was a superuser. A database with no roles at all is unchanged.
 - `STORAGE MOVE … TO 'kv:…'` said the table was no longer covered by backups. A backup copies it as of each snapshot, with no point-in-time replay, and the message now says so.
 
 ### Upgrade notes
 
+- **A native client on a trust socket names its role:** `Client::connect_as_role(addr, options, "rasterized")` (rasterizeddb_client 1.1.0, with `options.login` left at `Login::Trust`) in place of `Client::connect`, with the role the application should run as; the server checks it exists and may log in, in the database the connection selects. Under plain `Login::Trust` an application keeps reading and writing the tables of a database opened by an earlier version (the first start gives each unowned table the bootstrap superuser as owner and grants PUBLIC every table privilege), but loses what needs a superuser or the table's owner: role statements, `CREATE DATABASE`, `ALTER`/`DROP TABLE` and `GRANT` on those tables (a migration's DDL, for one), and any table made since by another role.
 - **No downgrade after a compressed value:** the first one adds `compressed_values_v1` to the directory's `incompat_features`, and an older build refuses to open that directory.
 
 ## 1.0.1 (2026-11-24: server, `rasterizeddb_core`, `rasterizeddb_client`) and `rasterizeddb_embedded` 1.1.0

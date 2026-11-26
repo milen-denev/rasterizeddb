@@ -188,6 +188,12 @@ pub enum RouteTemplate {
     /// one): the gateway gathers `tables`' rows from every shard onto the
     /// home shard and runs the statement there (B4.5).
     Gather { tables: Vec<String> },
+    /// A read joining one sharded table with global tables (inner joins
+    /// only): the gateway copies `small` from the home shard into temporary
+    /// tables on every shard and fans the read out with `merge`, each shard
+    /// joining its own rows; when they are larger than it copies, it gathers
+    /// `gather` instead, as [`RouteTemplate::Gather`].
+    Broadcast { small: Vec<String>, merge: Merge, gather: Vec<String> },
 }
 
 /// How a fan-out's parts are combined (B1b tier 1, B1c).
@@ -569,6 +575,17 @@ impl RouteTemplate {
                     w.str(t);
                 }
             }
+            RouteTemplate::Broadcast { small, merge, gather } => {
+                w.u8(7).u32(small.len() as u32);
+                for t in small {
+                    w.str(t);
+                }
+                merge.encode(w);
+                w.u32(gather.len() as u32);
+                for t in gather {
+                    w.str(t);
+                }
+            }
         }
     }
     pub fn decode(r: &mut Reader) -> Result<RouteTemplate, String> {
@@ -589,6 +606,19 @@ impl RouteTemplate {
                     tables.push(r.str()?);
                 }
                 RouteTemplate::Gather { tables }
+            }
+            7 => {
+                let names = |r: &mut Reader| -> Result<Vec<String>, String> {
+                    let n = r.u32()? as usize;
+                    if n > 256 {
+                        return Err("rshard: a broadcast of more than 256 tables".into());
+                    }
+                    (0..n).map(|_| r.str()).collect()
+                };
+                let small = names(r)?;
+                let merge = Merge::decode(r)?;
+                let gather = names(r)?;
+                RouteTemplate::Broadcast { small, merge, gather }
             }
             b => return Err(format!("rshard route template {b} is unknown")),
         })
@@ -1091,5 +1121,13 @@ mod compression_tests {
         let f = compressed_frame(CODEC_ZSTD, 5000, b"xyz");
         assert_eq!(split_compressed(&f), Some((CODEC_ZSTD, 5000, &b"xyz"[..])));
         assert_eq!(split_compressed(&r.encode()), None);
+    }
+
+    #[test]
+    fn a_broadcast_template_round_trips() {
+        let t = RouteTemplate::Broadcast { small: vec!["stores".into(), "kinds".into()], merge: Merge::CountSum, gather: vec!["orders".into()] };
+        let mut w = Writer::default();
+        t.encode(&mut w);
+        assert_eq!(RouteTemplate::decode(&mut Reader::new(&w.buf)).unwrap(), t);
     }
 }

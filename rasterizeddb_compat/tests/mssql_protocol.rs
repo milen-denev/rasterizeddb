@@ -1485,18 +1485,25 @@ BEGIN
 END;
 GO";
     // The database as an older build left it: made, its names not kept.
-    batch(
-        &mut c,
-        "CREATE TABLE [DenevCloud.ERP.Units] ([Id] int NOT NULL IDENTITY, [ShortName] nvarchar(10) NOT NULL, [Old] int NULL, \
-         CONSTRAINT [PK_DenevCloud.ERP.Units] PRIMARY KEY ([Id])); \
-         EXEC sp_rename N'[DenevCloud.ERP.Units].[Old]', N'Factor', 'COLUMN'; \
-         ALTER TABLE [DenevCloud.ERP.Units] ADD [Code] nvarchar(5) NULL; \
-         CREATE UNIQUE INDEX [IX_DenevCloud.ERP.Units_Code] ON [DenevCloud.ERP.Units] ([Code]) WHERE [Code] IS NOT NULL; \
-         INSERT INTO [DenevCloud.ERP.Units] ([ShortName], [Code]) VALUES (N'kg', N'K'); \
-         DELETE FROM __rdb_tds_names",
+    // Made over PostgreSQL, which records none (the names catalogue is the
+    // front end's own: a client cannot empty it).
+    let (pg, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=rasterized password={PASSWORD} dbname=postgres", s.pg_port),
+        tokio_postgres::NoTls,
     )
     .await
     .unwrap();
+    tokio::spawn(conn);
+    pg.batch_execute(
+        "CREATE TABLE \"denevcloud\u{2024}erp\u{2024}units\" (id serial NOT NULL, shortname varchar(10) COLLATE rdb_ci NOT NULL, factor integer NULL, \
+         code varchar(5) COLLATE rdb_ci NULL, CONSTRAINT \"pk_denevcloud\u{2024}erp\u{2024}units\" PRIMARY KEY (id)); \
+         CREATE UNIQUE INDEX \"denevcloud\u{2024}erp\u{2024}units__ix_denevcloud\u{2024}erp\u{2024}units_code\" ON \"denevcloud\u{2024}erp\u{2024}units\" (code); \
+         INSERT INTO \"denevcloud\u{2024}erp\u{2024}units\" (shortname, code) VALUES ('kg', 'K')",
+    )
+    .await
+    .unwrap();
+    // A client reads and writes no catalogue of the front end's.
+    assert!(batch(&mut c, "DELETE FROM __rdb_tds_names").await.is_err());
     async fn names(c: &mut Client<Compat<tokio::net::TcpStream>>) -> Vec<String> {
         let mut q = c.simple_query("SELECT * FROM [DenevCloud.ERP.Units]").await.unwrap();
         let got = q.columns().await.unwrap().unwrap_or_default().iter().map(|c| c.name().to_string()).collect();
@@ -1893,6 +1900,254 @@ async fn tiberius_guid_order_grouped() {
     let grouped: Vec<(String, i32)> = r[0].iter().map(|r| (r.get::<uuid::Uuid, _>(0).unwrap().to_string(), r.get::<i32, _>(1).unwrap())).collect();
     assert_eq!(grouped, [(b.to_string(), 7), (a.to_string(), 8)]);
     assert_eq!(g(&r[1]), [Some(a.to_string()), Some(b.to_string())]);
+}
+
+/// EF Core's split query: the parent (a derived table with select-list
+/// subqueries, LEFT JOINed to each product's first image) and its child (the
+/// same products INNER JOINed to their images) come in the same
+/// uniqueidentifier order, SQL Server's. EF Core pairs the two by position.
+/// The parent's derived table lost the column's order in its copy (its
+/// subqueries make its body a join) and came sorted by the bytes: the
+/// children went to the wrong parents, with no error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_split_query_parent_and_child_agree_on_guid_order() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    // SQL Server's order is ascending `k`; the bytes' is descending.
+    let id = |k: u32| format!("{:08x}-0000-0000-0000-{k:012}", 0xff00 - k);
+    batch(
+        &mut c,
+        "CREATE TABLE [P] ([Id] uniqueidentifier NOT NULL PRIMARY KEY, [Name] nvarchar(50) NOT NULL, [N] int NOT NULL); \
+         CREATE TABLE [Price] ([Id] int PRIMARY KEY, [ProductId] uniqueidentifier NOT NULL, [Price] int NOT NULL); \
+         CREATE TABLE [Image] ([Id] int PRIMARY KEY, [ProductId] uniqueidentifier NOT NULL, [ListingOrder] int NOT NULL, [Url] nvarchar(50) NOT NULL)",
+    )
+    .await
+    .unwrap();
+    const N: u32 = 8;
+    let products: Vec<String> = (1..=N).map(|k| format!("('{}', N'Name{k}', {k})", id(k))).collect();
+    let prices: Vec<String> = (1..=N).map(|k| format!("({k}, '{}', {})", id(k), k * 10)).collect();
+    let images: Vec<String> = (1..=N * 2).map(|i| format!("({i}, '{}', {}, N'u{i}')", id((i + 1) / 2), i % 2)).collect();
+    batch(
+        &mut c,
+        &format!(
+            "INSERT INTO [P] VALUES {}; INSERT INTO [Price] VALUES {}; INSERT INTO [Image] VALUES {}",
+            products.join(", "),
+            prices.join(", "),
+            images.join(", ")
+        ),
+    )
+    .await
+    .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT [d6].[Id], [d6].[N], [d6].[c], [d8].[Url] FROM (\
+             SELECT TOP(10) [d].[Id], [d].[N], (SELECT TOP(1) [d3].[Price] FROM [Price] AS [d3] WHERE [d].[Id] = [d3].[ProductId]) AS [c], \
+             (SELECT COUNT(*) FROM [Image] AS [d4] WHERE [d].[Id] = [d4].[ProductId]) AS [c0] FROM [P] AS [d] WHERE [d].[N] > 2) AS [d6] \
+         LEFT JOIN (SELECT [d7].[Url], [d7].[ProductId] FROM (SELECT [d2].[Url], [d2].[ProductId], \
+             ROW_NUMBER() OVER(PARTITION BY [d2].[ProductId] ORDER BY [d2].[ListingOrder]) AS [row] FROM [Image] AS [d2]) AS [d7] \
+             WHERE [d7].[row] <= 1) AS [d8] ON [d6].[Id] = [d8].[ProductId] ORDER BY [d6].[Id]; \
+         SELECT [d14].[Url], [d11].[Id], [d14].[Id] FROM (SELECT TOP(10) [d].[Id] FROM [P] AS [d] WHERE [d].[N] > 2) AS [d11] \
+         INNER JOIN (SELECT [d10].[Url], [d10].[Id], [d10].[ListingOrder], [d10].[ProductId] FROM [Image] AS [d10]) AS [d14] \
+             ON [d11].[Id] = [d14].[ProductId] ORDER BY [d11].[Id], [d14].[ListingOrder]; \
+         SELECT [q].[N] FROM (SELECT [d].[N], [d].[Name], (SELECT TOP(1) [d3].[Price] FROM [Price] AS [d3] WHERE [d].[Id] = [d3].[ProductId]) AS [c] \
+             FROM [P] AS [d]) AS [q] WHERE [q].[Name] = N'NAME5'",
+    )
+    .await
+    .unwrap();
+    let want: Vec<String> = (3..=N).map(id).collect();
+    let parents: Vec<String> = r[0].iter().map(|r| r.get::<uuid::Uuid, _>(0).unwrap().to_string()).collect();
+    assert_eq!(parents, want);
+    for (row, k) in r[0].iter().zip(3..=N) {
+        assert_eq!(row.get::<i32, _>(1), Some(k as i32));
+        assert_eq!(row.get::<i32, _>(2), Some(k as i32 * 10));
+        assert_eq!(row.get::<&str, _>(3), Some(format!("u{}", k * 2).as_str()));
+    }
+    // The child's parents, in the order they come: the parent's.
+    let mut of_children: Vec<String> = r[1].iter().map(|r| r.get::<uuid::Uuid, _>(1).unwrap().to_string()).collect();
+    assert_eq!(of_children.len(), 2 * want.len());
+    of_children.dedup();
+    assert_eq!(of_children, parents);
+    // And a text column of such a derived table compares as its table's
+    // does (case-insensitively here).
+    assert_eq!(r[2].iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>(), [5]);
+}
+
+/// A set operation's branch in parentheses, and a row assignment mixing an
+/// aggregate with a plain value: the engine rewrites both through a derived
+/// table it names itself. Named `__rdb_…`, the role guard took the alias
+/// for a catalogue and refused the client's statement ("permission denied:
+/// "__rdb_branch0" is a system catalog").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_engine_named_aliases_pass_the_catalogue_guard() {
+    let s = start();
+    let mut c = connect(&s).await;
+    let r = batch(&mut c, "(SELECT 1 UNION SELECT 2) INTERSECT SELECT 2; SELECT 2 INTERSECT (SELECT 1 UNION SELECT 2)").await.unwrap();
+    for rows in &r {
+        assert_eq!(rows.iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>(), [2]);
+    }
+    batch(&mut c, "CREATE TABLE [G] ([Id] int PRIMARY KEY, [N] int NULL, [V] nvarchar(20) NULL); INSERT INTO [G] VALUES (1, 5, N'a'), (2, 9, N'b')")
+        .await
+        .unwrap();
+    let r = batch(&mut c, "UPDATE [G] SET [N] = (SELECT MAX([x].[N]) FROM [G] AS [x]) WHERE [Id] = 1; SELECT [N] FROM [G] ORDER BY [Id]").await.unwrap();
+    assert_eq!(r.last().unwrap().iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>(), [9, 9]);
+}
+
+/// A `datetime2(7)` selected beside a correlated subquery over several
+/// rows keeps its seventh digit. The subquery is joined to a copy of the
+/// outer rows, and the copy was made of the visible columns alone: the
+/// statement failed with `column d.__t7_at does not exist`. With TOP, where
+/// the rows the limit keeps are copied first, and without; and through a
+/// join whose operand is computed, which copies its relation the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_datetime2_beside_a_correlated_subquery() {
+    let s = start();
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [Ev] ([Id] int PRIMARY KEY, [At] datetime2(7) NOT NULL, [Until] datetime2(7) NULL, [Name] nvarchar(20) NOT NULL); \
+         CREATE TABLE [Hit] ([Id] int PRIMARY KEY, [EvId] int NOT NULL, [N] int NOT NULL); \
+         INSERT INTO [Ev] VALUES (1, '2026-01-02 03:04:05.1234567', '2026-02-02 00:00:00.0000001', N'a'), \
+             (2, '2026-01-02 03:04:05.7654321', NULL, N'b'), (3, '2026-01-02 03:04:05.0000009', '2026-03-03 00:00:00.9999999', N'c'); \
+         INSERT INTO [Hit] VALUES (1, 1, 10), (2, 1, 5), (3, 3, 7)",
+    )
+    .await
+    .unwrap();
+    let text = |r: &tiberius::Row, at: usize| r.get::<chrono::NaiveDateTime, _>(at).map(|t| {
+        use chrono::Timelike;
+        format!("{}.{:07}", t.format("%Y-%m-%d %H:%M:%S"), t.nanosecond() / 100)
+    });
+    let want = [
+        (1, Some("2026-01-02 03:04:05.1234567"), Some("2026-02-02 00:00:00.0000001"), Some(15), 2),
+        (2, Some("2026-01-02 03:04:05.7654321"), None, None, 0),
+        (3, Some("2026-01-02 03:04:05.0000009"), Some("2026-03-03 00:00:00.9999999"), Some(7), 1),
+    ];
+    for sql in [
+        "SELECT [d].[Id], [d].[At], [d].[Until], (SELECT SUM([h].[N]) FROM [Hit] AS [h] WHERE [h].[EvId] = [d].[Id]) AS [Total], \
+             (SELECT COUNT(*) FROM [Hit] AS [h] WHERE [h].[EvId] = [d].[Id]) AS [Hits] FROM [Ev] AS [d] ORDER BY [d].[Id]",
+        "SELECT TOP(3) [d].[Id], [d].[At], [d].[Until], (SELECT SUM([h].[N]) FROM [Hit] AS [h] WHERE [h].[EvId] = [d].[Id]) AS [Total], \
+             (SELECT COUNT(*) FROM [Hit] AS [h] WHERE [h].[EvId] = [d].[Id]) AS [Hits] FROM [Ev] AS [d] WHERE [d].[Id] > 0 ORDER BY [d].[Id]",
+    ] {
+        let r = batch(&mut c, sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let got: Vec<_> = r[0]
+            .iter()
+            .map(|r| (r.get::<i32, _>(0).unwrap(), text(r, 1), text(r, 2), r.get::<i32, _>(3), r.get::<i32, _>(4).unwrap()))
+            .collect();
+        let want: Vec<_> = want.iter().map(|(id, at, until, total, hits)| (*id, at.map(str::to_string), until.map(str::to_string), *total, *hits)).collect();
+        assert_eq!(got, want, "{sql}");
+    }
+    // TOP keeps the first two by the time, seventh digit and all.
+    let r = batch(
+        &mut c,
+        "SELECT TOP(2) [d].[Id], [d].[At], (SELECT COUNT(*) FROM [Hit] AS [h] WHERE [h].[EvId] = [d].[Id]) AS [Hits] FROM [Ev] AS [d] ORDER BY [d].[At]",
+    )
+    .await
+    .unwrap();
+    let got: Vec<_> = r[0].iter().map(|r| (r.get::<i32, _>(0).unwrap(), text(r, 1), r.get::<i32, _>(2).unwrap())).collect();
+    assert_eq!(got, [(3, Some("2026-01-02 03:04:05.0000009".to_string()), 1), (1, Some("2026-01-02 03:04:05.1234567".to_string()), 2)]);
+    // A join on a computed operand copies its relation too.
+    let r = batch(
+        &mut c,
+        "SELECT [d].[Id], [d].[At], [h].[N] FROM [Ev] AS [d] INNER JOIN [Hit] AS [h] ON [d].[Id] + 0 = [h].[EvId] ORDER BY [h].[Id]",
+    )
+    .await
+    .unwrap();
+    let got: Vec<_> = r[0].iter().map(|r| (r.get::<i32, _>(0).unwrap(), text(r, 1), r.get::<i32, _>(2).unwrap())).collect();
+    assert_eq!(
+        got,
+        [
+            (1, Some("2026-01-02 03:04:05.1234567".to_string()), 10),
+            (1, Some("2026-01-02 03:04:05.1234567".to_string()), 5),
+            (3, Some("2026-01-02 03:04:05.0000009".to_string()), 7)
+        ]
+    );
+}
+
+/// What the ERP application's pages and writes sent that a query pass had
+/// not: a string `+` in a WHERE (every such WHERE failed with "unexpected
+/// character '|'", the tables all having case-insensitive and
+/// uniqueidentifier columns), EF Core's date-part equality written as
+/// `~CAST(a ^ b AS bit)` (SQL Server's XOR and the NOT of a bit), a
+/// ROW_NUMBER over joined tables inside a derived table, and an unknown
+/// column, which is error 207.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_application_findings() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [Co] ([Id] uniqueidentifier NOT NULL PRIMARY KEY, [Name] nvarchar(50) NOT NULL, [Users] nvarchar(max) NULL, [Placed] datetime2(7) NULL); \
+         INSERT INTO [Co] VALUES ('00000000-0000-0000-0000-000000000001', N'Acme', NULL, '2026-03-05 10:00:00.1234567'), \
+             ('00000000-0000-0000-0000-000000000002', N'Bolt', N'u1', '2026-04-05 10:00:00'), \
+             ('00000000-0000-0000-0000-000000000003', N'Core', N'U9;u2', NULL)",
+    )
+    .await
+    .unwrap();
+    // The application's own UPDATE: append a user once, with parameters.
+    let append = "UPDATE [Co] SET [Users] = COALESCE([Users] + N';', N'') + @P1 WHERE [Id] = @P2 AND (COALESCE([Users], N'') NOT LIKE N'%' + @P1 + N'%')";
+    for (id, times) in [("00000000-0000-0000-0000-000000000001", 2), ("00000000-0000-0000-0000-000000000003", 1)] {
+        for _ in 0..times {
+            c.execute(append, &[&"u9", &uuid::Uuid::parse_str(id).unwrap()]).await.unwrap();
+        }
+    }
+    let r = batch(&mut c, "SELECT [Users] FROM [Co] ORDER BY [Name]").await.unwrap();
+    let users: Vec<Option<String>> = r[0].iter().map(|r| r.get::<&str, _>(0).map(str::to_string)).collect();
+    // Core already holds 'U9' (case-insensitively): not appended again.
+    assert_eq!(users, [Some("u9".to_string()), Some("u1".to_string()), Some("U9;u2".to_string())]);
+    let r = batch(
+        &mut c,
+        "SELECT [Name] FROM [Co] WHERE [Name] = N'AC' + N'ME'; \
+         SELECT [Name] FROM [Co] WHERE [Name] + N'!' = N'bolt!'; \
+         SELECT [Name] FROM [Co] WHERE [Users] LIKE N'%' + N'U' + N'%' ORDER BY [Name]",
+    )
+    .await
+    .unwrap();
+    let names = |rows: &[tiberius::Row]| -> Vec<String> { rows.iter().map(|r| r.get::<&str, _>(0).unwrap().to_string()).collect() };
+    assert_eq!(names(&r[0]), ["Acme"]);
+    assert_eq!(names(&r[1]), ["Bolt"]);
+    assert_eq!(names(&r[2]), ["Acme", "Bolt", "Core"]);
+    // EF Core's `x.Placed.Value.Month == 3`, and `^`, `&`, `|`, `~` over
+    // integers.
+    let r = batch(
+        &mut c,
+        "SELECT COUNT(*) FROM [Co] AS [d] WHERE CASE WHEN [d].[Placed] IS NOT NULL THEN ~CAST(DATEPART(month, CONVERT(date, [d].[Placed])) ^ 3 AS bit) ELSE CAST(0 AS bit) END = CAST(1 AS bit) \
+             AND CASE WHEN [d].[Placed] IS NOT NULL THEN ~CAST(DATEPART(year, CONVERT(date, [d].[Placed])) ^ DATEPART(year, CONVERT(date, [d].[Placed])) AS bit) ELSE CAST(0 AS bit) END = CAST(1 AS bit); \
+         SELECT 6 ^ 3, 6 & 3, 6 | 3, ~6, CAST(6 ^ 6 AS bit), CAST(6 ^ 5 AS bit); \
+         SELECT [d].[Name] FROM [Co] AS [d] WHERE DATEPART(month, [d].[Placed]) ^ 4 = 0",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0][0].get::<i32, _>(0), Some(1));
+    assert_eq!((0..4).map(|i| r[1][0].get::<i32, _>(i).unwrap()).collect::<Vec<_>>(), [5, 2, 7, -7]);
+    assert_eq!((r[1][0].get::<bool, _>(4), r[1][0].get::<bool, _>(5)), (Some(false), Some(true)));
+    assert_eq!(names(&r[2]), ["Bolt"]);
+    // ROW_NUMBER over joined tables inside a derived table, ordered by the
+    // uniqueidentifier keys of both.
+    batch(
+        &mut c,
+        "CREATE TABLE [Li] ([Id] uniqueidentifier NOT NULL PRIMARY KEY, [CoId] uniqueidentifier NOT NULL, [N] int NOT NULL); \
+         INSERT INTO [Li] VALUES ('00000000-0000-0000-0000-00000000000b', '00000000-0000-0000-0000-000000000001', 20), \
+             ('00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-000000000001', 10), \
+             ('00000000-0000-0000-0000-00000000000c', '00000000-0000-0000-0000-000000000002', 30)",
+    )
+    .await
+    .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT [s].[Name], [s].[N] FROM (SELECT [d7].[Name], [d8].[N], ROW_NUMBER() OVER(PARTITION BY [d7].[Id] ORDER BY [d7].[Id], [d8].[Id]) AS [row] \
+             FROM [Co] AS [d7] INNER JOIN [Li] AS [d8] ON [d7].[Id] = [d8].[CoId]) AS [s] WHERE [s].[row] <= 1 ORDER BY [s].[Name]",
+    )
+    .await
+    .unwrap();
+    let got: Vec<(String, i32)> = r[0].iter().map(|r| (r.get::<&str, _>(0).unwrap().to_string(), r.get::<i32, _>(1).unwrap())).collect();
+    assert_eq!(got, [("Acme".to_string(), 10), ("Bolt".to_string(), 30)]);
+    // An unknown column is SQL Server's 207, alone and in a join.
+    for sql in [
+        "SELECT [c].[Nope] FROM [Co] AS [c]",
+        "SELECT [c].[Id], [c].[Nope] FROM [Co] AS [c] INNER JOIN [Li] AS [l] ON [c].[Id] = [l].[CoId]",
+    ] {
+        let e = batch(&mut c, sql).await.err().unwrap_or_else(|| panic!("{sql} was answered"));
+        assert_eq!(number(&e), Some(207), "{sql}: {e}");
+    }
 }
 
 /// NULLs sort first ascending and last descending, as SQL Server's (NULL is

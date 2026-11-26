@@ -33,7 +33,7 @@ async fn disk_db(dir: &std::path::Path, name: &str) -> Arc<Database> {
 }
 
 /// A statement's rows over pgwire, each cell as text.
-async fn pg_rows(db: &Arc<Database>, s: &mut Session, sql: &str) -> Vec<Vec<Option<String>>> {
+pub(super) async fn pg_rows(db: &Arc<Database>, s: &mut Session, sql: &str) -> Vec<Vec<Option<String>>> {
     Box::pin(execute_recorded(db, &mut s.state, &mut s.server, sql, &[], false, None))
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -304,10 +304,447 @@ async fn an_exists_over_the_outer_item_narrows_its_runs() {
         ),
         // As the SQL Server front end writes EF Core's `SELECT 1`.
         format!("EXISTS (SELECT CAST(1 AS integer) FROM {orders} AS t WHERE {ALIAS_EXISTS}.id = t.customer_id AND t.amount = 7)"),
+        // An ORM's quoted names and aliases.
+        format!(
+            "EXISTS (SELECT 1 FROM \"{orders}\" AS \"t\" INNER JOIN \"cex_tags\" AS \"g\" ON \"g\".\"id\" = 1 \
+             WHERE \"{ALIAS_EXISTS}\".\"id\" = \"t\".\"customer_id\" AND \"t\".\"amount\" = 7)"
+        ),
     ] {
         let sql = q(&filter);
         let (got, runs) = answers(&db, &mut s, &sql, customers, ALIAS_EXISTS).await;
         assert_eq!(got, want(tagged.iter().copied()), "{sql}");
         assert_eq!(runs, 2 * tagged.len(), "{sql}");
     }
+    // The outer item's alias quoted too (`FROM t AS "oex"`).
+    let sql = format!(
+        "SELECT \"{ALIAS_EXISTS}\".\"id\", (SELECT COUNT(*) FROM {orders} o WHERE o.customer_id = \"{ALIAS_EXISTS}\".\"id\"), \
+         (SELECT SUM(amount) FROM {orders} o WHERE o.customer_id = \"{ALIAS_EXISTS}\".\"id\") FROM \"{customers}\" AS \"{ALIAS_EXISTS}\" \
+         WHERE EXISTS (SELECT 1 FROM \"{orders}\" AS \"t\" WHERE \"{ALIAS_EXISTS}\".\"id\" = \"t\".\"customer_id\" AND \"t\".\"amount\" = 7)"
+    );
+    let (got, runs) = answers(&db, &mut s, &sql, customers, ALIAS_EXISTS).await;
+    assert_eq!(got, want(tagged.iter().copied()), "{sql}");
+    assert_eq!(runs, 2 * tagged.len(), "{sql}");
 }
+
+
+/// EF Core's related-items statement as the SQL Server front end sends it
+/// (the pilot's ERP #13): uniqueidentifier keys in SQL Server's order, a
+/// case-insensitive tag, dotted quoted names, two select-list subqueries
+/// (one over a join), a tag EXISTS, ORDER BY and a limit. Its subqueries
+/// run for the products the EXISTS keeps, not for every product.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_related_items_statement_runs_its_subqueries_for_the_tagged() {
+    const ALIAS_RI: &str = "dri";
+    let db = db().await;
+    let mut s = session(&db);
+    let (p, pr, pt, t) = ("\"ri\u{2024}erp\u{2024}products\"", "\"ri\u{2024}erp\u{2024}prices\"", "\"ri\u{2024}erp\u{2024}producttags\"", "\"ri\u{2024}erp\u{2024}tags\"");
+    ok(&db, &mut s, &format!("CREATE TABLE {p} (id uuid COLLATE rdb_guid_order NOT NULL PRIMARY KEY, companyid uuid COLLATE rdb_guid_order NOT NULL, state integer NOT NULL, status integer NOT NULL, processed boolean NULL, name text COLLATE rdb_ci NULL, n integer NOT NULL)")).await;
+    ok(&db, &mut s, &format!("CREATE TABLE {pr} (id integer NOT NULL PRIMARY KEY, productid uuid COLLATE rdb_guid_order NOT NULL, pricetype integer NOT NULL, countryid text COLLATE rdb_ci NULL, price numeric(19,6) NOT NULL)")).await;
+    ok(&db, &mut s, &format!("CREATE TABLE {pt} (id integer NOT NULL PRIMARY KEY, productsid uuid COLLATE rdb_guid_order NOT NULL, tagsid uuid COLLATE rdb_guid_order NOT NULL)")).await;
+    ok(&db, &mut s, &format!("CREATE TABLE {t} (id uuid COLLATE rdb_guid_order NOT NULL PRIMARY KEY, content text COLLATE rdb_ci NOT NULL)")).await;
+    let company = "4f914341-68b3-40a3-3ad8-08da6c2740bf";
+    let pid = |k: i64| format!("00000000-0000-0000-0000-{k:012}");
+    const PRODUCTS: i64 = 200;
+    let rows: Vec<String> = (1..=PRODUCTS).map(|k| format!("('{}', '{company}', 100, 1, true, 'P{k}', {k})", pid(k))).collect();
+    ok(&db, &mut s, &format!("INSERT INTO {p} (id, companyid, state, status, processed, name, n) VALUES {}", rows.join(", "))).await;
+    let rows: Vec<String> = (1..=PRODUCTS).map(|k| format!("({k}, '{}', 100, NULL, {k}.5)", pid(k))).collect();
+    ok(&db, &mut s, &format!("INSERT INTO {pr} (id, productid, pricetype, countryid, price) VALUES {}", rows.join(", "))).await;
+    ok(&db, &mut s, &format!("INSERT INTO {t} (id, content) VALUES ('11111111-0000-0000-0000-000000000001', 'Realme C53'), ('11111111-0000-0000-0000-000000000002', 'Other')")).await;
+    // Products 3, 77 and 150 carry the tag; every product carries 'Other'.
+    let mut rows: Vec<String> = (1..=PRODUCTS).map(|k| format!("({k}, '{}', '11111111-0000-0000-0000-000000000002')", pid(k))).collect();
+    for (n, k) in [3i64, 77, 150].iter().enumerate() {
+        rows.push(format!("({}, '{}', '11111111-0000-0000-0000-000000000001')", 1000 + n, pid(*k)));
+    }
+    ok(&db, &mut s, &format!("INSERT INTO {pt} (id, productsid, tagsid) VALUES {}", rows.join(", "))).await;
+    let sql = format!(
+        "SELECT {ALIAS_RI}.n AS \"N\", (SELECT d2.price FROM {pr} AS d2 WHERE {ALIAS_RI}.id = d2.productid AND d2.pricetype = 100 \
+         ORDER BY CASE WHEN d2.countryid IS NULL THEN CAST(1 AS boolean) ELSE CAST(0 AS boolean) END DESC NULLS LAST LIMIT 1) AS \"Price\", \
+         (SELECT d4.content FROM {pt} AS d3 INNER JOIN {t} AS d4 ON d3.tagsid = d4.id WHERE {ALIAS_RI}.id = d3.productsid \
+         ORDER BY d4.id LIMIT 1) AS \"Tag\" \
+         FROM {p} AS {ALIAS_RI} WHERE {ALIAS_RI}.companyid = '{company}' AND {ALIAS_RI}.state NOT IN (140, 160) AND {ALIAS_RI}.status = 1 \
+         AND COALESCE({ALIAS_RI}.processed, CAST(0 AS boolean)) = CAST(1 AS boolean) AND {ALIAS_RI}.id <> '{}' \
+         AND EXISTS (SELECT CAST(1 AS integer) FROM {pt} AS d0 INNER JOIN {t} AS d1 ON d0.tagsid = d1.id \
+         WHERE {ALIAS_RI}.id = d0.productsid AND d1.content IN ('realme c53', 'nothing')) ORDER BY {ALIAS_RI}.id LIMIT 10",
+        pid(77)
+    );
+    use crate::core::rql::lateral::test_hooks::{take_limited, take_narrowed_copies};
+    take_runs("ri\u{2024}erp\u{2024}products", ALIAS_RI);
+    take_narrowed_copies(ALIAS_RI);
+    take_limited(ALIAS_RI);
+    let rows = pg_rows(&db, &mut s, &sql).await;
+    let runs = take_runs("ri\u{2024}erp\u{2024}products", ALIAS_RI);
+    let ns: Vec<String> = rows.iter().map(|r| r[0].clone().unwrap_or_default()).collect();
+    assert_eq!(ns, ["3", "150"], "{rows:?}");
+    assert_eq!(rows[0][1].as_deref(), Some("3.500000"));
+    assert!(rows.iter().all(|r| r[2].is_some()), "{rows:?}");
+    // Two items, each for the two products kept (not for all 200).
+    assert_eq!(runs, 2 * 2, "the subqueries ran {runs} times");
+    // The filter holds a subquery (the EXISTS): the outer rows it keeps are
+    // copied once, before anything is probed, and nothing after runs it
+    // again: no copy needs narrowing.
+    assert_eq!(take_limited(ALIAS_RI), 1);
+    assert_eq!(take_narrowed_copies(ALIAS_RI), 0);
+    // Native answers the same, the same way.
+    let native = native_rows(&db, &sql).await;
+    assert_eq!(native.iter().map(|r| r[0].clone().unwrap_or_default()).collect::<Vec<_>>(), ["3", "150"]);
+    assert_eq!(take_limited(ALIAS_RI), 1);
+    assert_eq!(take_narrowed_copies(ALIAS_RI), 0);
+    assert_eq!(take_runs("ri\u{2024}erp\u{2024}products", ALIAS_RI), 2 * 2);
+    // Without the LIMIT the same cut is made: the EXISTS is still run once.
+    let unlimited = sql.strip_suffix(" LIMIT 10").expect("the limit").to_string();
+    let rows = pg_rows(&db, &mut s, &unlimited).await;
+    assert_eq!(rows.iter().map(|r| r[0].clone().unwrap_or_default()).collect::<Vec<_>>(), ["3", "150"]);
+    assert_eq!(take_limited(ALIAS_RI), 1);
+    assert_eq!(take_runs("ri\u{2024}erp\u{2024}products", ALIAS_RI), 2 * 2);
+
+    // A filter of the outer item's own columns, no subquery and no LIMIT:
+    // probed, and each item's copy of the outer rows (made to carry its
+    // join key) holds the kept products only: both copies took the filter.
+    let plain = format!(
+        "SELECT {ALIAS_RI}.n, (SELECT d2.price FROM {pr} AS d2 WHERE {ALIAS_RI}.id = d2.productid LIMIT 1), \
+         (SELECT COUNT(*) FROM {pt} AS d3 WHERE {ALIAS_RI}.id = d3.productsid) FROM {p} AS {ALIAS_RI} \
+         WHERE {ALIAS_RI}.companyid = '{company}' AND {ALIAS_RI}.n IN (3, 150) ORDER BY {ALIAS_RI}.id"
+    );
+    let rows = pg_rows(&db, &mut s, &plain).await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("3".to_string()), Some("3.500000".to_string()), Some("2".to_string())],
+            vec![Some("150".to_string()), Some("150.500000".to_string()), Some("2".to_string())]
+        ]
+    );
+    assert_eq!(take_limited(ALIAS_RI), 0);
+    assert_eq!(take_narrowed_copies(ALIAS_RI), 2);
+    assert_eq!(take_runs("ri\u{2024}erp\u{2024}products", ALIAS_RI), 2 * 2);
+
+    // A statement whose WHERE keeps an outer row the filter alone would
+    // not decide (an OR with another item is left to the statement): the
+    // copy is whole, the answer the same as without the subqueries.
+    let all = format!(
+        "SELECT {ALIAS_RI}.n, (SELECT d2.price FROM {pr} AS d2 WHERE {ALIAS_RI}.id = d2.productid LIMIT 1) FROM {p} AS {ALIAS_RI} \
+         WHERE abs({ALIAS_RI}.n) < 4 ORDER BY {ALIAS_RI}.n"
+    );
+    let rows = pg_rows(&db, &mut s, &all).await;
+    assert_eq!(rows.iter().map(|r| r[0].clone().unwrap_or_default()).collect::<Vec<_>>(), ["1", "2", "3"]);
+    assert_eq!(rows[2][1].as_deref(), Some("3.500000"));
+    assert_eq!(take_narrowed_copies(ALIAS_RI), 0);
+}
+
+/// One distinct tuple of outer values (a point lookup, or several outer
+/// rows sharing the value the item reads): the item is a constant, built
+/// once and joined as an item that reads nothing outside is, with no keyed
+/// relation and no copy of the outer item. A product page's base query paid
+/// 4 ms an item for those. The answers are the general path's.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_outer_tuple_is_a_constant_item() {
+    use crate::core::rql::lateral::test_hooks::take_constants;
+    const ALIAS_ONE: &str = "oone";
+    let db = db().await;
+    let mut s = session(&db);
+    let (customers, orders) = ("con_customers", "con_orders");
+    fill(&db, &mut s, customers, orders, false).await;
+    let q = |rest: &str| {
+        format!(
+            "SELECT {ALIAS_ONE}.id, (SELECT COUNT(*) FROM {orders} o WHERE o.customer_id = {ALIAS_ONE}.id), \
+             (SELECT SUM(amount) FROM {orders} o WHERE o.customer_id = {ALIAS_ONE}.id) FROM {customers} {ALIAS_ONE} {rest}"
+        )
+    };
+    // A customer with orders, and one with none (a count of 0, a NULL sum:
+    // the row is kept).
+    for id in [5i64, 299] {
+        let sql = q(&format!("WHERE {ALIAS_ONE}.id = {id}"));
+        take_constants(ALIAS_ONE);
+        let pg = parsed(pg_rows(&db, &mut s, &sql).await);
+        assert_eq!(take_constants(ALIAS_ONE), 2, "{sql}");
+        let native = parsed(native_rows(&db, &sql).await);
+        assert_eq!(take_constants(ALIAS_ONE), 2, "{sql}");
+        assert_eq!(pg, want(std::iter::once(id)), "{sql}");
+        assert_eq!(native, pg, "{sql}");
+    }
+    // Two tuples: the general path, as before.
+    let sql = q(&format!("WHERE {ALIAS_ONE}.id IN (5, 6)"));
+    take_constants(ALIAS_ONE);
+    assert_eq!(parsed(pg_rows(&db, &mut s, &sql).await), want([5i64, 6].into_iter()));
+    assert_eq!(take_constants(ALIAS_ONE), 0);
+
+    // Several outer rows, one value read: each row gets the item's row; a
+    // LIMIT 1 item without one (NULL), and with a select list of its own.
+    let orders_of_5: Vec<i64> = (1..=ORDERS).filter(|o| owner(*o) == 5).collect();
+    let sql = format!(
+        "SELECT {ALIAS_ONE}.id, (SELECT c.name FROM {customers} c WHERE c.id = {ALIAS_ONE}.customer_id LIMIT 1), \
+         (SELECT c.name FROM {customers} c WHERE c.id = {ALIAS_ONE}.customer_id AND c.id > 1000 LIMIT 1) \
+         FROM {orders} {ALIAS_ONE} WHERE {ALIAS_ONE}.customer_id = 5 ORDER BY {ALIAS_ONE}.id"
+    );
+    take_constants(ALIAS_ONE);
+    let rows = pg_rows(&db, &mut s, &sql).await;
+    assert_eq!(take_constants(ALIAS_ONE), 2);
+    assert_eq!(rows.len(), orders_of_5.len());
+    for (row, id) in rows.iter().zip(&orders_of_5) {
+        assert_eq!(row, &vec![Some(id.to_string()), Some("c5".to_string()), None], "{sql}");
+    }
+
+    // A scalar subquery of more than one row is still PostgreSQL's 21000.
+    let sql = format!(
+        "SELECT {ALIAS_ONE}.id, (SELECT o.amount FROM {orders} o WHERE o.customer_id = {ALIAS_ONE}.id) FROM {customers} {ALIAS_ONE} \
+         WHERE {ALIAS_ONE}.id = 5"
+    );
+    let e = super::owner_tests::send(&db, &mut s, &sql).await.expect_err("more than one row");
+    assert!(e.contains("more than one row returned by a subquery used as an expression"), "{e}");
+}
+
+/// A LIMIT is taken before the select list's subqueries when they would run
+/// for more outer values than it keeps rows: they are a value per row, so
+/// the rows the limit keeps are the relation's, its WHERE's and its ORDER
+/// BY's to decide (`lateral::limited_outer`). EF Core's related-items query
+/// with a tag most products carry ran its two subqueries for every product
+/// the tag kept, then kept ten. The answers are the ones written, where the
+/// limit goes first, where it must not, and where there is nothing to cut.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_limit_is_taken_before_the_select_list_subqueries() {
+    use crate::core::rql::lateral::test_hooks::take_limited;
+    const ALIAS_LIM: &str = "olim";
+    let db = db().await;
+    let mut s = session(&db);
+    let (customers, orders) = ("lim_customers", "lim_orders");
+    fill(&db, &mut s, customers, orders, false).await;
+    let q = |list_tail: &str, rest: &str| {
+        format!(
+            "SELECT {ALIAS_LIM}.id, (SELECT COUNT(*) FROM {orders} o WHERE o.customer_id = {ALIAS_LIM}.id) AS n, \
+             (SELECT SUM(amount) FROM {orders} o WHERE o.customer_id = {ALIAS_LIM}.id) AS total{list_tail} FROM {customers} {ALIAS_LIM} {rest}"
+        )
+    };
+    let all = expected();
+    let answer = |id: i64| (id, all[&id].0, all[&id].1);
+    let in_order = |rows: Vec<Vec<Option<String>>>| -> Vec<Answer> {
+        let int = |c: &Option<String>| c.as_deref().map(|t| t.parse::<i64>().unwrap());
+        rows.iter().map(|r| (int(&r[0]).unwrap(), int(&r[1]).unwrap_or(0), int(&r[2]))).collect()
+    };
+    // Each: the rows wanted, in order; every customer past 20 passes the
+    // WHERE (280 of them), ten are kept.
+    let cases: Vec<(String, Vec<i64>)> = vec![
+        (format!("WHERE {ALIAS_LIM}.id > 20 ORDER BY {ALIAS_LIM}.id LIMIT 10"), (21..=30).collect()),
+        (format!("WHERE {ALIAS_LIM}.id > 20 ORDER BY {ALIAS_LIM}.id DESC LIMIT 10"), (291..=300).rev().collect()),
+        (format!("WHERE {ALIAS_LIM}.id > 20 ORDER BY {ALIAS_LIM}.id LIMIT 10 OFFSET 5"), (26..=35).collect()),
+        (format!("WHERE {ALIAS_LIM}.name LIKE 'c29%' ORDER BY {ALIAS_LIM}.name DESC NULLS LAST, {ALIAS_LIM}.id LIMIT 3"), vec![299, 298, 297]),
+        (format!("ORDER BY {ALIAS_LIM}.id LIMIT 4"), vec![1, 2, 3, 4]),
+    ];
+    for (rest, ids) in &cases {
+        let sql = q("", rest);
+        take_runs(customers, ALIAS_LIM);
+        take_limited(ALIAS_LIM);
+        let got = in_order(pg_rows(&db, &mut s, &sql).await);
+        assert_eq!(take_limited(ALIAS_LIM), 1, "{sql}");
+        assert_eq!(got, ids.iter().map(|id| answer(*id)).collect::<Vec<_>>(), "{sql}");
+        // Two items, each run for the rows kept.
+        assert_eq!(take_runs(customers, ALIAS_LIM), 2 * ids.len(), "{sql}");
+        // Native answers the same, the same way.
+        assert_eq!(in_order(native_rows(&db, &sql).await), got, "{sql}");
+        assert_eq!(take_limited(ALIAS_LIM), 1, "{sql}");
+        assert_eq!(take_runs(customers, ALIAS_LIM), 2 * ids.len(), "{sql}");
+    }
+    // No ORDER BY: any ten of the rows the WHERE keeps, each with its own
+    // values.
+    let sql = q("", &format!("WHERE {ALIAS_LIM}.id > 20 LIMIT 10"));
+    take_runs(customers, ALIAS_LIM);
+    let got = in_order(pg_rows(&db, &mut s, &sql).await);
+    assert_eq!(got.len(), 10);
+    assert!(got.iter().all(|row| row.0 > 20 && *row == answer(row.0)), "{got:?}");
+    assert_eq!(take_runs(customers, ALIAS_LIM), 2 * 10, "{sql}");
+    assert_eq!(take_limited(ALIAS_LIM), 1, "{sql}");
+
+    // Nothing to cut: no more outer values than the limit keeps (a lookup
+    // of one row, which is a constant item; three rows of ten). No copy.
+    for (rest, ids) in [
+        (format!("WHERE {ALIAS_LIM}.id = 5 ORDER BY {ALIAS_LIM}.id LIMIT 1"), vec![5i64]),
+        (format!("WHERE {ALIAS_LIM}.id BETWEEN 7 AND 9 ORDER BY {ALIAS_LIM}.id LIMIT 10"), vec![7, 8, 9]),
+    ] {
+        let sql = q("", &rest);
+        take_runs(customers, ALIAS_LIM);
+        let got = in_order(pg_rows(&db, &mut s, &sql).await);
+        assert_eq!(got, ids.iter().map(|id| answer(*id)).collect::<Vec<_>>(), "{sql}");
+        assert_eq!(take_limited(ALIAS_LIM), 0, "{sql}");
+        assert_eq!(take_runs(customers, ALIAS_LIM), 2 * ids.len(), "{sql}");
+    }
+
+    // Where the limit does not go first: the rows are ordered by a
+    // subquery's value (an output name, an ordinal), or are not the
+    // relation's (DISTINCT). Every row the WHERE keeps is run, as before.
+    let by_count: Vec<i64> = {
+        let mut ids: Vec<i64> = (281..=300).collect();
+        ids.sort_by_key(|id| (std::cmp::Reverse(all[id].0), *id));
+        ids.truncate(3);
+        ids
+    };
+    for order in ["n DESC", "2 DESC"] {
+        let sql = q("", &format!("WHERE {ALIAS_LIM}.id > 280 ORDER BY {order}, {ALIAS_LIM}.id LIMIT 3"));
+        take_runs(customers, ALIAS_LIM);
+        let got = in_order(pg_rows(&db, &mut s, &sql).await);
+        assert_eq!(got, by_count.iter().map(|id| answer(*id)).collect::<Vec<_>>(), "{sql}");
+        assert_eq!(take_runs(customers, ALIAS_LIM), 2 * 20, "{sql}");
+        assert_eq!(take_limited(ALIAS_LIM), 0, "{sql}");
+    }
+    // The last ten customers have no orders: one distinct (count, sum).
+    let sql = format!(
+        "SELECT DISTINCT (SELECT COUNT(*) FROM {orders} o WHERE o.customer_id = {ALIAS_LIM}.id) AS n FROM {customers} {ALIAS_LIM} \
+         WHERE {ALIAS_LIM}.id > 290 LIMIT 5"
+    );
+    assert_eq!(pg_rows(&db, &mut s, &sql).await, vec![vec![Some("0".to_string())]], "{sql}");
+    assert_eq!(take_limited(ALIAS_LIM), 0, "{sql}");
+}
+
+/// [`a_limit_is_taken_before_the_select_list_subqueries`], the statement
+/// and its cut as text: what moves into the copy, what stays, and what is
+/// left as written.
+#[test]
+fn the_rows_a_limit_keeps_are_the_outer_item_s_to_decide() {
+    use crate::core::rql::lateral::limited_outer_for_tests as cut;
+    let item = "LEFT JOIN LATERAL (SELECT count(*) AS __v FROM u WHERE u.k = a.id) __cs0 ON true";
+    let two = format!("{item} LEFT JOIN LATERAL (SELECT max(v) AS __v FROM u WHERE u.k = a.id) __cs1 ON true");
+    let sql = format!("SELECT a.x, __cs0.__v AS \"n\" FROM t a {two} WHERE a.g = 1 AND a.h IN (2, 3) ORDER BY a.x DESC NULLS LAST, a.id LIMIT 10 OFFSET 5");
+    assert_eq!(
+        cut(&sql, "a", "t", 16),
+        Some((
+            "SELECT a.* FROM t a WHERE a.g = 1 AND a.h IN (2, 3) ORDER BY a.x DESC NULLS LAST, a.id LIMIT 10 OFFSET 5".to_string(),
+            format!("SELECT a.x, __cs0.__v AS \"n\" FROM <copy> a {two} ORDER BY a.x DESC NULLS LAST, a.id"),
+        ))
+    );
+    // No more outer values than rows kept: as written.
+    assert_eq!(cut(&sql, "a", "t", 15), None);
+    // Unless the WHERE holds a subquery: cut whatever the count, with a
+    // LIMIT or without.
+    let exists = "WHERE a.g = 1 AND EXISTS (SELECT 1 FROM w WHERE w.k = a.id)";
+    assert_eq!(
+        cut(&format!("SELECT a.x, __cs0.__v FROM t a {item} {exists} ORDER BY a.x LIMIT 10"), "a", "t", 1),
+        Some((format!("SELECT a.* FROM t a {exists} ORDER BY a.x LIMIT 10"), format!("SELECT a.x, __cs0.__v FROM <copy> a {item} ORDER BY a.x")))
+    );
+    assert_eq!(
+        cut(&format!("SELECT a.x, __cs0.__v FROM t a {item} {exists}"), "a", "t", 1),
+        Some((format!("SELECT a.* FROM t a {exists}"), format!("SELECT a.x, __cs0.__v FROM <copy> a {item}")))
+    );
+    // No WHERE, no ORDER BY, `AS`.
+    assert_eq!(
+        cut(&format!("SELECT a.x, __cs0.__v FROM t AS a {item} LIMIT 3"), "a", "t", 4),
+        Some(("SELECT a.* FROM t AS a LIMIT 3".to_string(), format!("SELECT a.x, __cs0.__v FROM <copy> a {item}")))
+    );
+    for left in [
+        // Ordered by an item's value: an output name, an ordinal, the item.
+        format!("SELECT a.x, __cs0.__v AS n FROM t a {item} ORDER BY n LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v AS n FROM t a {item} ORDER BY 2 LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v AS n FROM t a {item} ORDER BY __cs0.__v LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v AS n FROM t a {item} ORDER BY a.x + 1 LIMIT 3"),
+        // Rows that are not the outer item's.
+        format!("SELECT DISTINCT a.x, __cs0.__v FROM t a {item} LIMIT 3"),
+        format!("SELECT count(*), max(__cs0.__v) FROM t a {item} LIMIT 3"),
+        format!("SELECT a.x, row_number() OVER (ORDER BY a.x), __cs0.__v FROM t a {item} LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v FROM t a {item} GROUP BY a.x, __cs0.__v LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v FROM t a JOIN w ON w.id = a.id {item} LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v FROM t a LEFT JOIN LATERAL (SELECT v FROM u WHERE u.k = a.id) r ON true {item} LIMIT 3"),
+        // A WHERE that reads an item, a parameter, a limit that is not a number.
+        format!("SELECT a.x, __cs0.__v FROM t a {two} WHERE __cs1.__v > 0 LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v FROM t a {item} WHERE a.g = $1 LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v FROM t a {item} LIMIT ALL"),
+        format!("SELECT a.x, __cs0.__v FROM t a {item} WHERE a.g = 1"),
+        format!("SELECT a.x, __cs0.__v FROM t a {item} ORDER BY a.x LIMIT 3 FOR UPDATE"),
+    ] {
+        assert_eq!(cut(&left, "a", "t", 1000), None, "{left}");
+    }
+}
+
+/// The copy of the outer item made to carry an item's join key holds the
+/// columns the statement names, not every column: EF Core's related-items
+/// query read four columns of a table of 59, and typing and filling a copy
+/// of all of them, once an item, was a third of its time. The answers are
+/// the same, pruned or not.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_outer_copy_holds_the_columns_the_statement_names() {
+    use crate::core::rql::lateral::test_hooks::take_pruned_copies;
+    const ALIAS_PRN: &str = "oprn";
+    let db = db().await;
+    let mut s = session(&db);
+    let (wide, orders) = ("prn_wide", "prn_orders");
+    ok(&db, &mut s, &format!("CREATE TABLE {wide} (id INT NOT NULL PRIMARY KEY, name TEXT COLLATE rdb_ci, qty INT, note TEXT, price NUMERIC(10,2), seen TIMESTAMP, flag BOOLEAN)"))
+        .await;
+    ok(&db, &mut s, &format!("CREATE TABLE {orders} (id INT NOT NULL PRIMARY KEY, customer_id INT NOT NULL, amount INT)")).await;
+    let values: Vec<String> = (1..=40).map(|c| format!("({c}, 'Name{c}', {}, 'b{c}', {c}.25, '2026-01-01 00:00:00', {})", c * 2, c % 2 == 0)).collect();
+    ok(&db, &mut s, &format!("INSERT INTO {wide} (id, name, qty, note, price, seen, flag) VALUES {}", values.join(", "))).await;
+    let values: Vec<String> = (1..=120).map(|o| format!("({o}, {}, {})", o % 30 + 1, o % 7)).collect();
+    ok(&db, &mut s, &format!("INSERT INTO {orders} (id, customer_id, amount) VALUES {}", values.join(", "))).await;
+    let count = |c: i64| (1..=120).filter(|o| o % 30 + 1 == c).count() as i64;
+    let sum = |c: i64| -> Option<i64> {
+        let amounts: Vec<i64> = (1..=120).filter(|o| o % 30 + 1 == c).map(|o| o % 7).collect();
+        (!amounts.is_empty()).then(|| amounts.iter().sum())
+    };
+    let items = format!(
+        "(SELECT COUNT(*) FROM {orders} o WHERE o.customer_id = {ALIAS_PRN}.id) AS n, \
+         (SELECT SUM(o.amount) FROM {orders} o WHERE o.customer_id = {ALIAS_PRN}.id) AS total"
+    );
+    let cell = |v: i64| Some(v.to_string());
+    // Two columns named of seven: the first item's copy is made of those
+    // (and its key), and the second item's is a copy of that one, with
+    // nothing more to leave out.
+    let sql = format!("SELECT {ALIAS_PRN}.id, {ALIAS_PRN}.price, {items} FROM {wide} {ALIAS_PRN} WHERE {ALIAS_PRN}.id IN (5, 29, 35) ORDER BY {ALIAS_PRN}.id");
+    take_pruned_copies(ALIAS_PRN);
+    let got = pg_rows(&db, &mut s, &sql).await;
+    assert_eq!(take_pruned_copies(ALIAS_PRN), 1, "{sql}");
+    let want: Vec<Vec<Option<String>>> =
+        [5i64, 29, 35].iter().map(|c| vec![cell(*c), Some(format!("{c}.25")), cell(count(*c)), sum(*c).map(|v| v.to_string())]).collect();
+    assert_eq!(got, want, "{sql}");
+    assert_eq!(native_rows(&db, &sql).await, want, "{sql}");
+    take_pruned_copies(ALIAS_PRN);
+    // A column read only by the WHERE and the ORDER BY is kept for them,
+    // with its collation: 'NAME5' finds 'Name5', and the names sort.
+    let sql = format!(
+        "SELECT {ALIAS_PRN}.id, {items} FROM {wide} {ALIAS_PRN} WHERE {ALIAS_PRN}.name IN ('NAME5', 'name29', 'Name36') ORDER BY {ALIAS_PRN}.name DESC"
+    );
+    let got = pg_rows(&db, &mut s, &sql).await;
+    assert_eq!(take_pruned_copies(ALIAS_PRN), 1, "{sql}");
+    let want: Vec<Vec<Option<String>>> = [5i64, 36, 29].iter().map(|c| vec![cell(*c), cell(count(*c)), sum(*c).map(|v| v.to_string())]).collect();
+    assert_eq!(got, want, "{sql}");
+    // Every column named: nothing to leave out.
+    let sql = format!(
+        "SELECT {ALIAS_PRN}.id, {ALIAS_PRN}.name, {ALIAS_PRN}.qty, {ALIAS_PRN}.note, {ALIAS_PRN}.price, {ALIAS_PRN}.seen, {ALIAS_PRN}.flag, {items} FROM {wide} {ALIAS_PRN} \
+         WHERE {ALIAS_PRN}.id IN (5, 29) ORDER BY {ALIAS_PRN}.id"
+    );
+    let got = pg_rows(&db, &mut s, &sql).await;
+    assert_eq!(take_pruned_copies(ALIAS_PRN), 0, "{sql}");
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[1][..5], [cell(29), Some("Name29".to_string()), cell(58), Some("b29".to_string()), Some("29.25".to_string())], "{sql}");
+    assert_eq!(got[1][7..], [cell(count(29)), sum(29).map(|v| v.to_string())], "{sql}");
+}
+
+/// [`the_outer_copy_holds_the_columns_the_statement_names`], as text: what
+/// a copy keeps, and the statements whose copy is left whole because they
+/// could read a column without naming it.
+#[test]
+fn a_copy_is_pruned_to_the_columns_named() {
+    use crate::core::rql::lateral::pruned_copy_for_tests as pruned;
+    let copy = "SELECT \"id\", \"name\", \"note\", \"at\", CAST(d.\"__t7_at\" AS smallint) AS \"__t7_at\", d.id::text AS __j0 FROM t d";
+    let after = " LEFT JOIN k __cs0 ON __cs0.__lat_k1 = d.__j0 LEFT JOIN LATERAL (SELECT count(*) AS __v FROM u WHERE u.k = d.id) __cs1 ON true WHERE d.id > 3";
+    // The key stays whatever names it; `note` and the time column go.
+    assert_eq!(
+        pruned(copy, "d", "SELECT d.id, d.Name * 2, __cs0.__v FROM ", after).as_deref(),
+        Some("SELECT \"id\", \"name\", d.id::text AS __j0 FROM t d")
+    );
+    // A time column named keeps its hidden digit only when that is named.
+    assert_eq!(
+        pruned(copy, "d", "SELECT \"d\".\"at\", __rdb_t7_text(d.at, d.__t7_at) FROM ", after).as_deref(),
+        Some("SELECT \"id\", \"at\", CAST(d.\"__t7_at\" AS smallint) AS \"__t7_at\", d.id::text AS __j0 FROM t d")
+    );
+    // Every column named: as it is.
+    assert_eq!(pruned(copy, "d", "SELECT d.id, d.name, d.note, d.at, d.__t7_at FROM ", after), None);
+    for before in [
+        // A star that could be the item's, the item whole, a NATURAL join.
+        "SELECT d.*, __cs0.__v FROM ",
+        "SELECT *, __cs0.__v FROM ",
+        "SELECT DISTINCT * FROM ",
+        "SELECT d.id, to_json(d) FROM ",
+        "SELECT d.id, (SELECT x.* FROM x NATURAL JOIN y) FROM ",
+        "SELECT d.id, (SELECT 1 FROM x d WHERE true) FROM ",
+    ] {
+        assert_eq!(pruned(copy, "d", before, after), None, "{before}");
+    }
+    // Another item's star, a string's and a multiplication are not the
+    // item's.
+    assert!(pruned(copy, "d", "SELECT d.id, x.*, 'a * b', d.id * 2 FROM ", after).is_some());
+}
+

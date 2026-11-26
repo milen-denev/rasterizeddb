@@ -243,9 +243,41 @@ impl Client {
     /// either way: its exchange is bound to the connection, and the server
     /// must prove it holds the password's verifier.
     pub async fn connect(addr: &str, options: Options) -> Result<Self> {
+        Self::open(addr, options, None).await
+    }
+
+    /// [`Client::connect`] to a server that asks for no login (a unix
+    /// socket under `--rdb-socket-auth trust`), running as `role`: every
+    /// connection the client opens names it first (with
+    /// [`Options::database`], if set), and the server checks it exists there
+    /// and may log in. `options.login` must be [`Login::Trust`].
+    ///
+    /// A trust connection that names no role ([`Client::connect`] with
+    /// [`Login::Trust`]) is no administrator in a database with roles, and
+    /// reaches only the tables it made itself and what PUBLIC is granted
+    /// (RasterizedDB 1.0.2 and later): name the role the application runs as
+    /// here instead.
+    pub async fn connect_as_role(addr: &str, options: Options, role: &str) -> Result<Self> {
+        if !matches!(options.login, Login::Trust) {
+            return Err(crate::Error::Param(
+                "connect_as_role names the role of a trust connection: set options.login to Login::Trust \
+                 (a password or peer login names its own role)"
+                    .to_string(),
+            ));
+        }
+        if role.is_empty() {
+            return Err(crate::Error::Param("connect_as_role needs a role name".to_string()));
+        }
+        Self::open(addr, options, Some(role)).await
+    }
+
+    async fn open(addr: &str, options: Options, role: Option<&str>) -> Result<Self> {
         let database = options.database.as_deref();
         let authenticator = options.login.authenticator(database)?;
-        let setup = options.login.database_setup(database);
+        let setup = match role {
+            Some(role) => Some(crate::login::role_setup(role, database)),
+            None => options.login.database_setup(database),
+        };
         let mut connections = Vec::with_capacity(options.connections.max(1));
         for _ in 0..options.connections.max(1) {
             let mut builder =

@@ -946,13 +946,15 @@ impl Session {
         } else {
             None
         };
+        // The front end's own statements on its catalogue (`NAMES_TABLE`),
+        // announced as such: a client's are refused there.
         for w in writes {
-            if let Err(e) = self.silent(w).await {
+            if let Err(e) = self.silent_as(w, true).await {
                 log::warn!("SQL Server session: recording a database's name failed: {}", e.message);
             }
         }
         let rows = match read {
-            Some(sql) => self.fetch(sql, &[]).await.ok().map(|(_, rows)| rows),
+            Some(sql) => self.query_bound_as(sql, &[], true).await.ok().map(|(_, rows, _)| rows),
             None => Some(Vec::new()),
         };
         if let Some(main) = main {
@@ -1763,6 +1765,17 @@ impl Session {
         }
         self.aliases.clear();
         self.ticks.clear();
+        // The DDL's record in this front end's catalogue (its declared
+        // names), once the DDL has run: the front end's own statements,
+        // past the session's catalogue guard.
+        if !forward.system.is_empty() && !matches!(last, Some(Outcome::Failed(..))) {
+            for sql in &forward.system {
+                if let Err(notice) = self.silent_as(sql, true).await {
+                    last = Some(Outcome::Failed(notice, false));
+                    break;
+                }
+            }
+        }
         let outcome = last.unwrap_or(Outcome::Done {
             tag: String::new(),
             identity: None,
@@ -2904,7 +2917,7 @@ impl Session {
                 for r in &record {
                     // A rename of a table this protocol did not record
                     // (no names table yet) records it now.
-                    let _ = self.silent(r).await;
+                    let _ = self.silent_as(r, true).await;
                 }
                 self.names.dirty = true;
                 self.statement_done(0, 0, 0);
@@ -2920,7 +2933,7 @@ impl Session {
                     .unwrap_or_default();
                 let statements = translate::names_from_script(&script, &Scope { s: self, params: None })?;
                 for sql in &statements {
-                    self.silent(sql).await.map_err(|e| self.engine_error(&e))?;
+                    self.silent_as(sql, true).await.map_err(|e| self.engine_error(&e))?;
                 }
                 self.names.dirty = true;
                 let recorded = statements.iter().filter(|s| s.starts_with("INSERT INTO")).count();
@@ -4637,7 +4650,7 @@ impl Session {
         let mut cache = NameCache { database, read: Some(std::time::Instant::now()), ..Default::default() };
         if has {
             // Not inside the client's transaction: a read of committed names.
-            if let Ok((_, rows)) = self.fetch(&format!("SELECT rel, col, shown FROM {}", translate::NAMES_TABLE), &[]).await {
+            if let Ok((_, rows, _)) = self.query_bound_as(&format!("SELECT rel, col, shown FROM {}", translate::NAMES_TABLE), &[], true).await {
                 for row in rows {
                     let [Some(rel), Some(col), Some(shown)] = [row.first().cloned().flatten(), row.get(1).cloned().flatten(), row.get(2).cloned().flatten()]
                     else {

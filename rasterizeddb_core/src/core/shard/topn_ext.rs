@@ -5,7 +5,7 @@
 //! A simple query's top-N keys each row by its key columns' text. A driver
 //! asks for its results in binary as often as not, so here the statement each
 //! shard runs is rewritten instead: every `ORDER BY` key is appended to the
-//! select list as one more column (`__rdb_k1`, …), and those columns alone
+//! select list as one more column (`__topn_k1`, …), and those columns alone
 //! are asked for as text. The sort keys come from them; the client's own
 //! columns keep the formats it asked for, and the appended ones are cut from
 //! every row and from the description before anything is sent on.
@@ -185,7 +185,7 @@ pub struct Plan {
 
 /// The name of the `i`-th appended key column.
 pub fn extra_name(i: usize) -> String {
-    format!("__rdb_k{}", i + 1)
+    format!("__topn_k{}", i + 1)
 }
 
 /// The plan for `st`, a top-N statement; `None` when it is not one (no
@@ -340,7 +340,7 @@ fn ident_name(s: &str) -> String {
 }
 
 /// The statement with each key appended to its select list (`, expr AS
-/// __rdb_kN`), and the keys over those columns.
+/// __topn_kN`), and the keys over those columns.
 fn append_keys(sql: &str, keys: &[Key]) -> Result<(String, Vec<Key>), String> {
     let words = topn::top_level_words(sql);
     let select = words.iter().find(|(w, _)| w == "SELECT").ok_or("0A000: a top-N without SELECT")?.1;
@@ -467,7 +467,7 @@ mod tests {
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(p.sql, "SELECT id, v * 2 AS dbl, v * 2 AS __rdb_k1, id AS __rdb_k2 FROM t WHERE store = $1 ORDER BY dbl DESC, id LIMIT 15");
+        assert_eq!(p.sql, "SELECT id, v * 2 AS dbl, v * 2 AS __topn_k1, id AS __topn_k2 FROM t WHERE store = $1 ORDER BY dbl DESC, id LIMIT 15");
         assert_eq!((p.limit, p.offset, p.extras), (10, 5, 2));
         assert_eq!(p.params, vec![(0, Some(b"4".to_vec()))]);
         assert_eq!(p.types, vec![23]);
@@ -479,16 +479,16 @@ mod tests {
         let p = plan(&st("SELECT * FROM t WHERE a > $2 AND b < $1 ORDER BY id LIMIT 3", vec![(0, Some(b"1".to_vec())), (0, Some(b"2".to_vec()))]))
             .unwrap()
             .unwrap();
-        assert_eq!(p.sql, "SELECT *, \"id\" AS __rdb_k1 FROM t WHERE a > $1 AND b < $2 ORDER BY id LIMIT 3");
+        assert_eq!(p.sql, "SELECT *, \"id\" AS __topn_k1 FROM t WHERE a > $1 AND b < $2 ORDER BY id LIMIT 3");
         assert_eq!(p.params, vec![(0, Some(b"2".to_vec())), (0, Some(b"1".to_vec()))]);
     }
 
     #[test]
     fn bare_aliases_and_ordinals_resolve() {
         let p = plan(&st("SELECT name n, count c FROM t ORDER BY 2, n LIMIT 1", vec![])).unwrap().unwrap();
-        assert_eq!(p.sql, "SELECT name n, count c, count AS __rdb_k1, name AS __rdb_k2 FROM t ORDER BY 2, n LIMIT 1");
+        assert_eq!(p.sql, "SELECT name n, count c, count AS __topn_k1, name AS __topn_k2 FROM t ORDER BY 2, n LIMIT 1");
         // A key the list does not show is fetched beside it.
-        assert_eq!(plan(&st("SELECT a FROM t ORDER BY b LIMIT 1", vec![])).unwrap().unwrap().sql, "SELECT a, \"b\" AS __rdb_k1 FROM t ORDER BY b LIMIT 1");
+        assert_eq!(plan(&st("SELECT a FROM t ORDER BY b LIMIT 1", vec![])).unwrap().unwrap().sql, "SELECT a, \"b\" AS __topn_k1 FROM t ORDER BY b LIMIT 1");
         assert!(plan(&st("SELECT a FROM t", vec![])).is_none());
         assert!(plan(&st("SELECT a FROM t ORDER BY a LIMIT $1", vec![(0, None)])).unwrap().is_err());
     }
@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn descriptions_and_rows_lose_the_appended_columns() {
         let mut t = 2i16.to_be_bytes().to_vec();
-        for name in ["a", "__rdb_k1"] {
+        for name in ["a", "__topn_k1"] {
             t.extend_from_slice(name.as_bytes());
             t.push(0);
             t.extend_from_slice(&[0; 18]);

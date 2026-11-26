@@ -76,6 +76,17 @@ const CANCEL_PREFIX: &[u8] = b"\x01CANCEL;";
 /// way never the default database by accident.
 pub(crate) const DATABASE_PREFIX: &[u8] = b"\x01DATABASE;";
 
+/// Names the role a connection runs as, on a listener that asks for no
+/// login (`--rdb-socket-auth trust`): `\x01ROLE;<role>`, optionally followed
+/// by `\x1f<database>` to select the database in the same request. A trust
+/// connection that names none runs as nobody: in a database with roles it is
+/// no administrator and has only what PUBLIC is granted (roles plan, R0:
+/// `trust` authenticates as the named role, never as an administrator by
+/// itself). The role must exist there and be allowed to log in. Sent before
+/// the connection's first statement, as a database selection is; refused on
+/// a listener that authenticates, whose login names the role.
+pub(crate) const ROLE_PREFIX: &[u8] = b"\x01ROLE;";
+
 /// Asks for notices: `\x01NOTICES;` makes every later answer on the
 /// connection that has notices carry them ([`with_notices`]). Sent by a
 /// client as a setup request of every connection it opens, after any

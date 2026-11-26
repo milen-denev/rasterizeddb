@@ -76,6 +76,10 @@ pub struct Config {
     pub max_message_bytes: usize,
     pub max_batch_bytes: usize,
     pub gather_max_bytes: usize,
+    /// The most a join's global tables may hold to be copied to every shard
+    /// (`RouteTemplate::Broadcast`) rather than its sharded table gathered
+    /// onto the home shard; 0 never copies.
+    pub broadcast_max_bytes: usize,
     /// Whether a read no one shard can answer is gathered onto the home
     /// shard (B4.5) rather than refused.
     pub gather: bool,
@@ -162,6 +166,7 @@ impl Default for Config {
             max_message_bytes: 64 << 20,
             max_batch_bytes: 16 << 20,
             gather_max_bytes: 256 << 20,
+            broadcast_max_bytes: 16 << 20,
             template_cache_per_core: 4096,
             template_cache_shared: 65_536,
             auth_cache_secs: 60,
@@ -333,6 +338,7 @@ impl Config {
             "max_message_bytes" => self.max_message_bytes = num(v)? as usize,
             "max_batch_bytes" => self.max_batch_bytes = num(v)? as usize,
             "gather_max_bytes" => self.gather_max_bytes = num(v)? as usize,
+            "broadcast_max_bytes" => self.broadcast_max_bytes = num(v)? as usize,
             "template_cache_per_core" => self.template_cache_per_core = num(v)?.max(16) as usize,
             "template_cache_shared" => self.template_cache_shared = num(v)?.max(16) as usize,
             "auth_cache_secs" => self.auth_cache_secs = num(v)?,

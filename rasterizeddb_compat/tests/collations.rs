@@ -373,3 +373,78 @@ async fn a_key_is_made_from_an_expressions_value() {
     exec(&pool, "UPDATE ke SET name = 'Q' || 'r' WHERE id = 1").await;
     assert_eq!(ids(&pool, "SELECT id FROM ke WHERE name = 'qR'").await, vec![1]);
 }
+
+/// A string concatenation in the WHERE of a table with a nondeterministic
+/// column: the clause was refused whole ("unexpected character '|'"),
+/// whichever column the concatenation was about, because the collation
+/// pass lexed it before the evaluator's operands were lifted out. And a
+/// LIKE pattern concatenated from constants, on any table: the scan reads a
+/// pattern that is a literal. A concatenation that reads such a column is
+/// text under the column's collation, as PostgreSQL has it.
+#[tokio::test(flavor = "multi_thread")]
+async fn concatenation_in_a_where() {
+    let (_server, pool) = server().await;
+    // Over the plain column of the collated table.
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE note = 'X' || ''").await, [1]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE note || '!' = 'x!'").await, [2]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE note IN ('x' || '', 'q') AND id > 0").await, [2]);
+    // Against the collated column: the constant is one value, compared as
+    // the column compares.
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE name = 'B' || 'OB'").await, [1]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE 'AN' || 'N' = name").await, [2]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE name IN ('zo' || 'e', 'BO' || 'B')").await, [1, 4]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE name <> 'b' || 'ob' AND id < 3").await, [2]);
+    // A pattern made of constants, with and without NOT, ESCAPE, a call
+    // around the column, and parentheses (as EF Core writes Contains over
+    // a parameter).
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE name LIKE '%' || 'O' || '%'").await, [1, 4]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE name NOT LIKE '%' || 'o' || '%'").await, [2, 3]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE id > 0 AND (COALESCE(name, '') NOT LIKE '%' || 'N' || '%')").await, [1, 4]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE note LIKE 'x' || '%' ESCAPE '!'").await, [2]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE note LIKE '%' || 'X'").await, [1]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE note ILIKE '%' || 'X' || '%'").await, [1, 2]);
+    // A concatenation reading the collated column compares under its
+    // collation, on either side, in a list, and as a LIKE operand.
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE name || '!' = 'BOB!'").await, [1]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE 'zoe-y' = name || '-' || note").await, [4]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE name || '' IN ('ANN', 'zoe')").await, [2, 4]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE name || '#' LIKE 'B%#'").await, [1]);
+    // Writes read the same WHERE.
+    exec(&pool, "UPDATE people SET note = COALESCE(note || ';', '') || 'u1' WHERE id = 3 AND (COALESCE(note, '') NOT LIKE '%' || 'u1' || '%')").await;
+    exec(&pool, "UPDATE people SET note = COALESCE(note || ';', '') || 'u1' WHERE id = 3 AND (COALESCE(note, '') NOT LIKE '%' || 'u1' || '%')").await;
+    exec(&pool, "UPDATE people SET note = note || ';' || 'u1' WHERE name = 'AN' || 'N' AND note NOT LIKE '%' || 'u1'").await;
+    let notes: Vec<String> = sqlx::raw_sql("SELECT note FROM people WHERE id IN (2, 3) ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.try_get_unchecked::<String, _>(0).unwrap())
+        .collect();
+    assert_eq!(notes, ["x;u1", "u1"]);
+    exec(&pool, "DELETE FROM people WHERE name LIKE 'z' || '%' AND note = 'y' || ''").await;
+    assert_eq!(ids(&pool, "SELECT id FROM people").await, [1, 2, 3]);
+    // A table with no such column reads a constant pattern too.
+    exec(&pool, "CREATE TABLE plain_notes (id int PRIMARY KEY, note text); INSERT INTO plain_notes VALUES (1, 'abc'), (2, 'xbz'), (3, 'ABC')").await;
+    assert_eq!(ids(&pool, "SELECT id FROM plain_notes WHERE note LIKE '%' || 'b' || '%'").await, [1, 2]);
+    assert_eq!(ids(&pool, "SELECT id FROM plain_notes WHERE note NOT LIKE 'a' || '%'").await, [2, 3]);
+    assert_eq!(ids(&pool, "SELECT id FROM plain_notes WHERE note = 'a' || 'bc'").await, [1]);
+}
+
+/// An integer cast to a boolean is true for any non-zero value, as
+/// PostgreSQL's `5::boolean` (and SQL Server's `CAST(5 AS bit)`): only 0 and
+/// 1 were values ("invalid input syntax for type boolean"). Text keeps
+/// PostgreSQL's input: '5' is not a boolean.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_integer_cast_to_a_boolean() {
+    let (_server, pool) = server().await;
+    let row = sqlx::raw_sql("SELECT CAST(5 AS boolean), CAST(0 AS boolean), CAST(-1 AS boolean), (6 # 6)::boolean, NOT CAST(6 # 5 AS boolean)")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let cells: Vec<String> = (0..5).map(|i| row.try_get_unchecked::<String, _>(i).unwrap()).collect();
+    assert_eq!(cells, ["t", "f", "t", "f", "f"]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE CAST(id # 1 AS boolean)").await, [2, 3, 4]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE CASE WHEN note IS NOT NULL THEN ((id # 4) = 0) ELSE CAST(0 AS boolean) END = CAST(1 AS boolean)").await, [4]);
+    assert_eq!(code(&pool, "SELECT CAST('5' AS boolean)").await, "22P02");
+}
+

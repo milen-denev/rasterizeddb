@@ -656,8 +656,20 @@ async fn run_subquery_scaled_body(
 
     let mut rows = crate::core::row::row::vec_into_rows(&response[1..])
         .map_err(|e| format!("subquery result could not be read: {}", e))?;
-    let scales = recognize_query_purpose(sql)
-        .and_then(|purpose| query_output_scales(&purpose, database));
+    // The scales are the select list's and the table's: read off the query
+    // without its row filter, which decides none of them and is parsed with
+    // it otherwise. A filter decorrelated into `id IN (4,000 keys)` was
+    // parsed a second time here, after the run, for every subquery.
+    let unfiltered = if ["UNION", "INTERSECT", "EXCEPT"].iter().any(|w| crate::core::rql::join::find_keyword(sql, w, 0).is_some()) {
+        None
+    } else {
+        crate::pgwire::without_where(sql)
+    };
+    let scales = unfiltered
+        .as_deref()
+        .and_then(recognize_query_purpose)
+        .and_then(|purpose| query_output_scales(&purpose, database))
+        .or_else(|| recognize_query_purpose(sql).and_then(|purpose| query_output_scales(&purpose, database)));
     if let Some(scales) = scales.as_ref().filter(|_| normalize) {
         normalize_decimal_scales(&mut rows, scales);
     }
@@ -10906,7 +10918,15 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>, pe
         // too, at the exact decimal the evaluator computes. Left as text it
         // was evaluated against the column, and a NUMERIC column refused the
         // result's width: "operand size does not match".
-        if trimmed.is_empty() || !(crate::core::rql::expr::needs_evaluation(trimmed) || literal_arithmetic(trimmed)) {
+        // Strings concatenated (`'%' || 'x' || '%'`, as a string `+` of an
+        // inlined parameter arrives): it opens with a quote, which
+        // `needs_evaluation` takes for one literal.
+        let concatenation = trimmed.starts_with('\'')
+            && trimmed.contains("||")
+            && crate::core::sql_scan::quoted_end(trimmed.as_bytes(), 0, b'\'') != trimmed.len();
+        if trimmed.is_empty()
+            || !(crate::core::rql::expr::needs_evaluation(trimmed) || literal_arithmetic(trimmed) || concatenation)
+        {
             return operand.to_string();
         }
         let expr = match crate::core::rql::expr::parse(trimmed, &[]) {
@@ -11097,7 +11117,31 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>, pe
                         if let Some(e) = constant_refusal(term.trim().trim_end_matches(';').trim_end()) {
                             refused.get_or_insert(e);
                         }
-                        out.push_str(term)
+                        // A pattern computed from constants (`c LIKE '%' ||
+                        // 'x' || '%'`) is folded as a comparison's operand
+                        // is: the scan reads a pattern that is a literal,
+                        // and refused this one ("unexpected character '|'").
+                        // Bare, whatever it ends in: a pattern is matched
+                        // as written, never blank-padded.
+                        let pattern = ["LIKE", "ILIKE"]
+                            .iter()
+                            .filter_map(|w| crate::core::rql::join::find_keyword(term, w, 0).map(|at| at + w.len()))
+                            .min();
+                        match pattern {
+                            Some(start) => {
+                                let end = crate::core::rql::join::find_keyword(term, "ESCAPE", start).unwrap_or(term.len());
+                                let folded = fold_operand(&term[start..end], refused, per_row);
+                                let body = folded.trim_end();
+                                let folded = match body.strip_suffix("::text") {
+                                    Some(bare) if bare.ends_with('\'') => format!("{bare}{}", &folded[body.len()..]),
+                                    _ => folded,
+                                };
+                                out.push_str(&term[..start]);
+                                out.push_str(&folded);
+                                out.push_str(&term[end..]);
+                            }
+                            None => out.push_str(term),
+                        }
                     }
                 }
             }

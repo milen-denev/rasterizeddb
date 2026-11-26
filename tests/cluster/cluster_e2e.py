@@ -262,6 +262,7 @@ shard_cert = {tls}/gateway.pem
 shard_key = {tls}/gateway.key
 auth = scram
 unrouted = fan_out
+broadcast_max_bytes = 1
 """)
     log = open(f"{WORK}/gateway2.log", "ab")
     procs["gateway2"] = subprocess.Popen([GATEWAY, "--config", conf], stdout=log, stderr=log)
@@ -773,6 +774,23 @@ def main():
     code, out = psql(GW, "SHOW STORAGE STATS")
     check("SHOW STORAGE STATS answers for the cluster", code == 0 and f"shards|{len(want_shards)}" in out, out)
 
+    # 3c. A join with a small global table: the table copied to every shard,
+    # the join fanned out; an outer join gathered (a copy on every shard
+    # would bring its unmatched rows once per shard).
+    before = int(gateway_value("broadcasts") or 0)
+    code, out = psql(GW, "SELECT count(*) FROM orders o JOIN stores s ON s.id = o.store WHERE s.name = 'store3'")
+    check("a join with a small global table, broadcast", (code, out) == (0, str(rows // 5)) and counter_above("broadcasts", before),
+          (out, before, gateway_value("broadcasts")))
+    code, out = psql(GW, "SELECT s.name, sum(o.v) FROM orders o JOIN stores s ON s.id = o.store GROUP BY s.name ORDER BY s.name")
+    want = "\n".join(f"store{k}|{sum(v for v in range(1, rows + 1) if v % 5 == k)}" for k in range(5))
+    check("  ...grouped and ordered across the shards", (code, out) == (0, want), (out, want))
+    b2 = int(gateway_value("broadcasts") or 0)
+    code, out = psql_script(GW, "SELECT count(*) FROM orders o JOIN stores s ON s.id = o.store WHERE s.name = $1 \\bind store2 \\g\n")
+    check("  ...prepared", (code, out) == (0, str(rows // 5)) and counter_above("broadcasts", b2), (out, gateway_value("broadcasts")))
+    code, out = psql(GW, "SELECT s.name, count(o.id) FROM stores s LEFT JOIN orders o ON o.store = s.id GROUP BY s.name ORDER BY s.name")
+    want = "\n".join(f"store{k}|{rows // 5}" for k in range(5))
+    check("  ...an outer join is gathered, every store once", (code, out) == (0, want), (out, want))
+
     # 4. Two-phase commit across shards: both or neither.
     # Keys 1001 and 1002 land on different shards in this map; the
     # check below holds whether they do or not.
@@ -1012,6 +1030,8 @@ def main():
     if ENTERPRISE:
         client_stats()
     config_api(tls, cmap)
+    cluster_roles()
+    broadcast_limits()
     frontend(tls)
     if RDB_SHARD:
         cluster_backup(tls, cmap)
@@ -1057,6 +1077,63 @@ def restart_gateway(tls, cmap):
     end = time.time() + 30
     while time.time() < end and api("GET", "/v1/health")[0] != 200:
         time.sleep(0.3)
+
+
+def as_role(port, role, password, sql):
+    r = subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(port), "-U", role, "-d", "postgres", "-At", "-v", "ON_ERROR_STOP=1",
+                        "-c", sql], env=dict(ENV, PGPASSWORD=password), capture_output=True, text=True, timeout=60)
+    return r.returncode, (r.stdout.strip() if r.returncode == 0 else r.stderr.strip())
+
+
+def cluster_roles():
+    """Roles and privileges through the gateway land on every shard: a role
+    granted SELECT reads a sharded table (each shard checks it), and an
+    ungranted write is refused."""
+    on_shards = lambda name: [psql(PG[n], f"SELECT count(*) FROM rdb_roles WHERE name = '{name}'")[1] for n in SHARDS]
+    code, out = psql(GW, "CREATE ROLE e2e_app LOGIN PASSWORD 'app-pass-123'")
+    check("roles: CREATE ROLE through the gateway", code == 0, out)
+    check("  ...on every shard", on_shards("e2e_app") == ["1"] * len(SHARDS), on_shards("e2e_app"))
+    code, out = psql(GW, "GRANT SELECT ON orders TO e2e_app")
+    check("  ...GRANT through the gateway", code == 0, out)
+    code, out = as_role(GW, "e2e_app", "app-pass-123", "SELECT count(*) FROM orders")
+    want = psql(GW, "SELECT count(*) FROM orders")[1]
+    check("  ...the role reads a sharded table on every shard", (code, out) == (0, want), (out, want))
+    code, out = as_role(GW, "e2e_app", "app-pass-123", "INSERT INTO orders (id, store, v) VALUES (7999, 1, 1)")
+    check("  ...an ungranted write is refused", code != 0 and ("permission" in out or "42501" in out), out)
+    code, out = psql(GW, "ALTER ROLE e2e_app PASSWORD 'new-pass-456'")
+    check("  ...ALTER ROLE through the gateway", code == 0, out)
+    check("  ...the old password is refused at once", as_role(GW, "e2e_app", "app-pass-123", "SELECT 1")[0] != 0,
+          as_role(GW, "e2e_app", "app-pass-123", "SELECT 1"))
+    check("  ...the new one logs in", as_role(GW, "e2e_app", "new-pass-456", "SELECT 1") == (0, "1"),
+          as_role(GW, "e2e_app", "new-pass-456", "SELECT 1"))
+    code, out = psql(GW, "BEGIN; CREATE ROLE e2e_in_block; COMMIT")
+    check("  ...refused inside a transaction block", code != 0 and "transaction block" in out, out)
+    # A shard that has the role already: the others took it, and the error says so.
+    psql(PG[2], "CREATE ROLE e2e_dup")
+    code, out = psql(GW, "CREATE ROLE e2e_dup")
+    check("  ...a shard refusing after others took it is named", code != 0 and "took effect on shards" in out, out)
+    check("  ...the others have it", on_shards("e2e_dup") == ["1"] * len(SHARDS), on_shards("e2e_dup"))
+    code, out = psql(GW, "DROP ROLE e2e_dup")
+    check("  ...DROP ROLE through the gateway", code == 0 and on_shards("e2e_dup") == ["0"] * len(SHARDS), (out, on_shards("e2e_dup")))
+    code, out = psql(GW, "REVOKE SELECT ON orders FROM e2e_app")
+    check("  ...REVOKE through the gateway", code == 0, out)
+    code, out = as_role(GW, "e2e_app", "new-pass-456", "SELECT count(*) FROM orders")
+    check("  ...and the read is refused after it", code != 0, out)
+    code, out = psql(GW, "DROP ROLE e2e_app")
+    check("  ...the role dropped everywhere", code == 0 and on_shards("e2e_app") == ["0"] * len(SHARDS), (out, on_shards("e2e_app")))
+
+
+def broadcast_limits():
+    """A gateway that copies nothing (broadcast_max_bytes = 1) gathers the
+    same join instead, with the same answer; an outer join with a reference
+    table answers each of its rows once."""
+    before = int(gateway_value("broadcasts_too_large", GW2) or 0)
+    code, out = psql(GW2, "SELECT count(*) FROM orders o JOIN stores s ON s.id = o.store WHERE s.name = 'store3'")
+    want = psql(GW, "SELECT count(*) FROM orders o JOIN stores s ON s.id = o.store WHERE s.name = 'store3'")
+    check("broadcast: too large to copy, gathered instead", (code, out) == want and counter_above("broadcasts_too_large", before, GW2),
+          (out, want, gateway_value("broadcasts_too_large", GW2)))
+    code, out = psql(GW, "SELECT count(*) FROM ref_copy r LEFT JOIN orders o ON o.id = r.id + 100000")
+    check("  ...an outer join with a reference table counts each of its rows once", (code, out) == (0, "40"), out)
 
 
 def config_api(tls, cmap):
@@ -1239,9 +1316,20 @@ def cluster_backup(tls, cmap):
     psql(GW, "DELETE FROM orders WHERE id >= 7000 AND id < 7400")
 
 
-def gateway_value(name):
-    rows = dict(l.split("|", 1) for l in psql(GW, "SHOW GATEWAY")[1].splitlines() if "|" in l)
+def gateway_value(name, port=None):
+    rows = dict(l.split("|", 1) for l in psql(port or GW, "SHOW GATEWAY")[1].splitlines() if "|" in l)
     return rows.get(name)
+
+
+def counter_above(name, before, port=None, secs=10):
+    """Whether a SHOW GATEWAY counter passes `before` within `secs` (the
+    gateway publishes its cores' counters every so often)."""
+    end = time.time() + secs
+    while time.time() < end:
+        if int(gateway_value(name, port) or 0) > before:
+            return True
+        time.sleep(0.25)
+    return False
 
 
 def cluster_rebalance():
