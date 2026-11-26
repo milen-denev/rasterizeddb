@@ -85,7 +85,9 @@ pub(crate) fn rewrite_select(sql: &str) -> Option<Result<String, String>> {
     }
     // A function opening a subquery's FROM over a bare outer column, the
     // column qualified (`executor::qualify_outer_function_args`).
-    let qualified = crate::core::rql::executor::qualify_outer_function_args(sql);
+    let in_from = crate::core::rql::executor::subquery_select_list_functions(sql);
+    let sql = in_from.as_deref().unwrap_or(sql);
+    let qualified = crate::core::rql::executor::qualify_outer_function_args(sql).or(in_from.clone());
     let sql = qualified.as_deref().unwrap_or(sql);
     // A correlated `IN` subquery, as the `EXISTS` it means
     // (`executor::correlated_in_as_exists`): first, so its `NOT IN` form is

@@ -1583,6 +1583,57 @@ fn single_outer_alias(sql: &str) -> Option<String> {
     Some(name.trim_matches('"').to_string())
 }
 
+/// `sql` with each subquery that is one set-returning function and no
+/// `FROM` — `x IN (SELECT jsonb_array_elements_text(t.tags))`, `EXISTS
+/// (SELECT unnest(t.a))` — written with the function in its `FROM`
+/// (`table_functions::select_list_form`), which is what the passes that run
+/// a subquery read. `None` when nothing changes. It was a column named for
+/// the whole call ("column "jsonb_array_elements_text(t.tags)" does not
+/// exist").
+pub(crate) fn subquery_select_list_functions(sql: &str) -> Option<String> {
+    if !crate::core::sql_scan::contains_ignore_ascii_case(sql, b"(select") && !crate::core::sql_scan::contains_ignore_ascii_case(sql, b"( select") {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, bytes[i]);
+                continue;
+            }
+            b'(' => {
+                let inner_at = i + 1;
+                if crate::core::sql_scan::starts_with_keyword(sql[inner_at..].trim_start(), "SELECT") {
+                    if let Some(close) = crate::core::rql::expr::matching_paren(sql, i) {
+                        // After IN, EXISTS, ANY, ALL or SOME the subquery is
+                        // read by its value, not by its column's name.
+                        let before = sql[..i].trim_end();
+                        let word_at = before.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |p| p + 1);
+                        let by_value = ["IN", "EXISTS", "ANY", "ALL", "SOME"].iter().any(|k| before[word_at..].eq_ignore_ascii_case(k));
+                        if let Some(form) = crate::core::rql::table_functions::select_list_form_as(&sql[inner_at..close], !by_value) {
+                            out.push_str(&sql[copied..inner_at]);
+                            out.push_str(&form);
+                            copied = close;
+                            i = close;
+                            continue;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
+}
+
 /// `sql` with the bare column names in the arguments of a function that
 /// opens a subquery's `FROM` qualified by the statement's one outer
 /// relation: `EXISTS (SELECT 1 FROM jsonb_array_elements(tags) e …)` over
@@ -1735,6 +1786,8 @@ pub(crate) fn exists_as_counts(sql: &str) -> Option<String> {
 /// subquery, after an `EXISTS` that compares the row by anything but `=` is
 /// counted (`exists_as_counts`); `None` when it holds none.
 fn correlated_write_where(sql: &str, database: &Arc<Database>, delete: bool) -> Option<Result<WriteWhere, String>> {
+    let in_from = subquery_select_list_functions(sql);
+    let sql = in_from.as_deref().unwrap_or(sql);
     let qualified = qualify_outer_function_args(sql);
     let sql = qualified.as_deref().unwrap_or(sql);
     let split = exists_over_set_operation(sql);

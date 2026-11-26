@@ -281,6 +281,35 @@ struct Relations {
     tables: Vec<Relation>,
     /// For each token, the parentheses that enclose it.
     enclosing: Vec<(usize, usize)>,
+    /// The columns of each function in a `FROM` ([`function_columns`]), by
+    /// the name it goes by there.
+    functions: HashMap<String, Vec<(String, i32)>>,
+}
+
+/// The columns a set-returning function in a `FROM` gives, as PostgreSQL
+/// declares them: `value`, `key` and `value`, or one column named for the
+/// function. `None` for one whose columns depend on its arguments
+/// (`generate_series`, `unnest`, the record functions).
+///
+/// `e.value = $1` over `jsonb_array_elements_text(t.doc) AS e(value)` named
+/// no table's column, so `$1` had no type and a value that looked like a
+/// number was inlined as one: `text = integer` (42883), where PostgreSQL
+/// reads the parameter as the text it is compared with.
+fn function_columns(name: &str) -> Option<Vec<(String, i32)>> {
+    const JSON: i32 = 114;
+    const JSONB: i32 = 3802;
+    let lower = name.to_ascii_lowercase();
+    let col = |n: &str, oid: i32| (n.to_string(), oid);
+    Some(match lower.as_str() {
+        "jsonb_array_elements_text" | "json_array_elements_text" => vec![col("value", TEXT)],
+        "jsonb_array_elements" => vec![col("value", JSONB)],
+        "json_array_elements" => vec![col("value", JSON)],
+        "jsonb_each_text" | "json_each_text" => vec![col("key", TEXT), col("value", TEXT)],
+        "jsonb_each" => vec![col("key", TEXT), col("value", JSONB)],
+        "json_each" => vec![col("key", TEXT), col("value", JSON)],
+        "jsonb_object_keys" | "json_object_keys" => vec![col(&lower, TEXT)],
+        _ => return None,
+    })
 }
 
 impl Relations {
@@ -342,12 +371,17 @@ fn relations(toks: &[Tok]) -> Relations {
         by_name: HashMap::new(),
         tables: Vec::new(),
         enclosing,
+        functions: HashMap::new(),
     };
     for (i, t) in toks.iter().enumerate() {
         let introduces = ["FROM", "JOIN", "UPDATE", "INTO", "USING"]
             .iter()
             .any(|kw| t.keyword(kw));
-        if !introduces {
+        // `FROM t, f(t.doc) AS e`, `, LATERAL f(…)`: a function after a comma.
+        let function_after = (*t == Tok::Comma || t.keyword("LATERAL"))
+            && matches!(toks.get(i + 1), Some(Tok::Ident(None, f)) if function_columns(f).is_some())
+            && toks.get(i + 2) == Some(&Tok::Open);
+        if !introduces && !function_after {
             continue;
         }
         let scope = rel.enclosing[i];
@@ -369,6 +403,46 @@ fn relations(toks: &[Tok]) -> Relations {
         let Some(Tok::Ident(_, table)) = toks.get(i + 1) else {
             continue;
         };
+        // `FROM f(args) [WITH ORDINALITY] [AS] alias [(columns)]`: a
+        // function, by its alias (its own name without one), its columns
+        // renamed in order by the list.
+        if toks.get(i + 2) == Some(&Tok::Open) {
+            if let (Some(mut columns), Some(close)) = (function_columns(table), close_after(toks, i + 2)) {
+                let mut k = close + 1;
+                if toks.get(k).is_some_and(|t| t.keyword("WITH")) && toks.get(k + 1).is_some_and(|t| t.keyword("ORDINALITY")) {
+                    columns.push(("ordinality".to_string(), INT8));
+                    k += 2;
+                }
+                if toks.get(k).is_some_and(|t| t.keyword("AS")) {
+                    k += 1;
+                }
+                let mut name = table.clone();
+                if let Some(Tok::Ident(None, alias)) = toks.get(k) {
+                    if !RESERVED.iter().any(|r| alias.eq_ignore_ascii_case(r)) {
+                        // One unnamed column goes by the alias.
+                        if columns.len() == 1 && columns[0].0.eq_ignore_ascii_case(table) {
+                            columns[0].0 = alias.clone();
+                        }
+                        name = alias.clone();
+                        if toks.get(k + 1) == Some(&Tok::Open) {
+                            if let Some(list_close) = close_after(toks, k + 1) {
+                                let renamed = toks[k + 2..list_close].iter().filter_map(|t| match t {
+                                    Tok::Ident(None, c) => Some(c.clone()),
+                                    _ => None,
+                                });
+                                for (column, new) in columns.iter_mut().zip(renamed) {
+                                    column.0 = new;
+                                }
+                            }
+                        }
+                    }
+                }
+                rel.tables.push(Relation { name: name.clone(), scope });
+                rel.by_name.insert(name.to_ascii_lowercase(), name.clone());
+                rel.functions.insert(name.to_ascii_lowercase(), columns);
+                continue;
+            }
+        }
         rel.tables.push(Relation { name: table.clone(), scope });
         rel.by_name.insert(table.to_ascii_lowercase(), table.clone());
         let mut k = i + 2;
@@ -419,6 +493,12 @@ fn column_oid(
         None => rel.candidates(at),
     };
     for table in candidates {
+        if let Some(columns) = rel.functions.get(&table.to_ascii_lowercase()) {
+            match columns.iter().find(|(c, _)| c.eq_ignore_ascii_case(name)) {
+                Some((_, oid)) => return Some(*oid),
+                None => continue,
+            }
+        }
         if let Some((_, columns)) = scratch.iter().find(|(n, _)| n.eq_ignore_ascii_case(table)) {
             match columns.iter().find(|(c, _)| c.eq_ignore_ascii_case(name)) {
                 Some((_, oid)) => return Some(*oid),
@@ -635,6 +715,18 @@ fn infer_placed(database: &Database, sql: &str, declared: &[i32], scratch: &Scra
         // `$n <op> col`.
         if toks.get(hi + 1).is_some_and(is_comparison) {
             if let Some(oid) = column_at(database, &rel, scratch, &toks, Some(hi + 2)) {
+                set(n, Some(oid), &mut oids);
+                continue;
+            }
+        }
+        // `$n [NOT] IN (SELECT col FROM …)`: the subquery's one column.
+        let in_at = if toks.get(hi + 1).is_some_and(|t| t.keyword("NOT")) { hi + 2 } else { hi + 1 };
+        if toks.get(in_at).is_some_and(|t| t.keyword("IN"))
+            && toks.get(in_at + 1) == Some(&Tok::Open)
+            && toks.get(in_at + 2).is_some_and(|t| t.keyword("SELECT"))
+            && toks.get(in_at + 4).is_some_and(|t| t.keyword("FROM"))
+        {
+            if let Some(oid) = column_at(database, &rel, scratch, &toks, Some(in_at + 3)) {
                 set(n, Some(oid), &mut oids);
                 continue;
             }
