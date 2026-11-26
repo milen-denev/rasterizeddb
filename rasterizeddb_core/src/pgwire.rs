@@ -6601,7 +6601,12 @@ where
         "42704"
     } else if (message.ends_with(" not found in schema")
         || message.contains("is neither a column nor a value")
-        || (message.starts_with("column \"") && message.ends_with("\" does not exist")))
+        || (message.starts_with("column \"") && message.ends_with("\" does not exist"))
+        // A join's item naming a column its relation does not have
+        // ("column 'name' not found in relation 'c'"): the same, where it
+        // was a syntax error (42601; SQL Server's 207 is what an
+        // application tells a missing column by).
+        || (message.starts_with("column '") && message.contains("' not found in relation '")))
         && names_one_identifier(message)
     {
         // A name in the select list, ORDER BY or GROUP BY that is no column

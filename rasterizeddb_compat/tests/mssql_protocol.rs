@@ -2062,6 +2062,94 @@ async fn tiberius_datetime2_beside_a_correlated_subquery() {
     );
 }
 
+/// What the ERP application's pages and writes sent that a query pass had
+/// not: a string `+` in a WHERE (every such WHERE failed with "unexpected
+/// character '|'", the tables all having case-insensitive and
+/// uniqueidentifier columns), EF Core's date-part equality written as
+/// `~CAST(a ^ b AS bit)` (SQL Server's XOR and the NOT of a bit), a
+/// ROW_NUMBER over joined tables inside a derived table, and an unknown
+/// column, which is error 207.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_application_findings() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [Co] ([Id] uniqueidentifier NOT NULL PRIMARY KEY, [Name] nvarchar(50) NOT NULL, [Users] nvarchar(max) NULL, [Placed] datetime2(7) NULL); \
+         INSERT INTO [Co] VALUES ('00000000-0000-0000-0000-000000000001', N'Acme', NULL, '2026-03-05 10:00:00.1234567'), \
+             ('00000000-0000-0000-0000-000000000002', N'Bolt', N'u1', '2026-04-05 10:00:00'), \
+             ('00000000-0000-0000-0000-000000000003', N'Core', N'U9;u2', NULL)",
+    )
+    .await
+    .unwrap();
+    // The application's own UPDATE: append a user once, with parameters.
+    let append = "UPDATE [Co] SET [Users] = COALESCE([Users] + N';', N'') + @P1 WHERE [Id] = @P2 AND (COALESCE([Users], N'') NOT LIKE N'%' + @P1 + N'%')";
+    for (id, times) in [("00000000-0000-0000-0000-000000000001", 2), ("00000000-0000-0000-0000-000000000003", 1)] {
+        for _ in 0..times {
+            c.execute(append, &[&"u9", &uuid::Uuid::parse_str(id).unwrap()]).await.unwrap();
+        }
+    }
+    let r = batch(&mut c, "SELECT [Users] FROM [Co] ORDER BY [Name]").await.unwrap();
+    let users: Vec<Option<String>> = r[0].iter().map(|r| r.get::<&str, _>(0).map(str::to_string)).collect();
+    // Core already holds 'U9' (case-insensitively): not appended again.
+    assert_eq!(users, [Some("u9".to_string()), Some("u1".to_string()), Some("U9;u2".to_string())]);
+    let r = batch(
+        &mut c,
+        "SELECT [Name] FROM [Co] WHERE [Name] = N'AC' + N'ME'; \
+         SELECT [Name] FROM [Co] WHERE [Name] + N'!' = N'bolt!'; \
+         SELECT [Name] FROM [Co] WHERE [Users] LIKE N'%' + N'U' + N'%' ORDER BY [Name]",
+    )
+    .await
+    .unwrap();
+    let names = |rows: &[tiberius::Row]| -> Vec<String> { rows.iter().map(|r| r.get::<&str, _>(0).unwrap().to_string()).collect() };
+    assert_eq!(names(&r[0]), ["Acme"]);
+    assert_eq!(names(&r[1]), ["Bolt"]);
+    assert_eq!(names(&r[2]), ["Acme", "Bolt", "Core"]);
+    // EF Core's `x.Placed.Value.Month == 3`, and `^`, `&`, `|`, `~` over
+    // integers.
+    let r = batch(
+        &mut c,
+        "SELECT COUNT(*) FROM [Co] AS [d] WHERE CASE WHEN [d].[Placed] IS NOT NULL THEN ~CAST(DATEPART(month, CONVERT(date, [d].[Placed])) ^ 3 AS bit) ELSE CAST(0 AS bit) END = CAST(1 AS bit) \
+             AND CASE WHEN [d].[Placed] IS NOT NULL THEN ~CAST(DATEPART(year, CONVERT(date, [d].[Placed])) ^ DATEPART(year, CONVERT(date, [d].[Placed])) AS bit) ELSE CAST(0 AS bit) END = CAST(1 AS bit); \
+         SELECT 6 ^ 3, 6 & 3, 6 | 3, ~6, CAST(6 ^ 6 AS bit), CAST(6 ^ 5 AS bit); \
+         SELECT [d].[Name] FROM [Co] AS [d] WHERE DATEPART(month, [d].[Placed]) ^ 4 = 0",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0][0].get::<i32, _>(0), Some(1));
+    assert_eq!((0..4).map(|i| r[1][0].get::<i32, _>(i).unwrap()).collect::<Vec<_>>(), [5, 2, 7, -7]);
+    assert_eq!((r[1][0].get::<bool, _>(4), r[1][0].get::<bool, _>(5)), (Some(false), Some(true)));
+    assert_eq!(names(&r[2]), ["Bolt"]);
+    // ROW_NUMBER over joined tables inside a derived table, ordered by the
+    // uniqueidentifier keys of both.
+    batch(
+        &mut c,
+        "CREATE TABLE [Li] ([Id] uniqueidentifier NOT NULL PRIMARY KEY, [CoId] uniqueidentifier NOT NULL, [N] int NOT NULL); \
+         INSERT INTO [Li] VALUES ('00000000-0000-0000-0000-00000000000b', '00000000-0000-0000-0000-000000000001', 20), \
+             ('00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-000000000001', 10), \
+             ('00000000-0000-0000-0000-00000000000c', '00000000-0000-0000-0000-000000000002', 30)",
+    )
+    .await
+    .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT [s].[Name], [s].[N] FROM (SELECT [d7].[Name], [d8].[N], ROW_NUMBER() OVER(PARTITION BY [d7].[Id] ORDER BY [d7].[Id], [d8].[Id]) AS [row] \
+             FROM [Co] AS [d7] INNER JOIN [Li] AS [d8] ON [d7].[Id] = [d8].[CoId]) AS [s] WHERE [s].[row] <= 1 ORDER BY [s].[Name]",
+    )
+    .await
+    .unwrap();
+    let got: Vec<(String, i32)> = r[0].iter().map(|r| (r.get::<&str, _>(0).unwrap().to_string(), r.get::<i32, _>(1).unwrap())).collect();
+    assert_eq!(got, [("Acme".to_string(), 10), ("Bolt".to_string(), 30)]);
+    // An unknown column is SQL Server's 207, alone and in a join.
+    for sql in [
+        "SELECT [c].[Nope] FROM [Co] AS [c]",
+        "SELECT [c].[Id], [c].[Nope] FROM [Co] AS [c] INNER JOIN [Li] AS [l] ON [c].[Id] = [l].[CoId]",
+    ] {
+        let e = batch(&mut c, sql).await.err().unwrap_or_else(|| panic!("{sql} was answered"));
+        assert_eq!(number(&e), Some(207), "{sql}: {e}");
+    }
+}
+
 /// NULLs sort first ascending and last descending, as SQL Server's (NULL is
 /// its least value); the engine put them last ascending. And a sort by a
 /// nullable `datetime2(7)` then a uniqueidentifier with TOP took the server
