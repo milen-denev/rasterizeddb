@@ -656,8 +656,20 @@ async fn run_subquery_scaled_body(
 
     let mut rows = crate::core::row::row::vec_into_rows(&response[1..])
         .map_err(|e| format!("subquery result could not be read: {}", e))?;
-    let scales = recognize_query_purpose(sql)
-        .and_then(|purpose| query_output_scales(&purpose, database));
+    // The scales are the select list's and the table's: read off the query
+    // without its row filter, which decides none of them and is parsed with
+    // it otherwise. A filter decorrelated into `id IN (4,000 keys)` was
+    // parsed a second time here, after the run, for every subquery.
+    let unfiltered = if ["UNION", "INTERSECT", "EXCEPT"].iter().any(|w| crate::core::rql::join::find_keyword(sql, w, 0).is_some()) {
+        None
+    } else {
+        crate::pgwire::without_where(sql)
+    };
+    let scales = unfiltered
+        .as_deref()
+        .and_then(recognize_query_purpose)
+        .and_then(|purpose| query_output_scales(&purpose, database))
+        .or_else(|| recognize_query_purpose(sql).and_then(|purpose| query_output_scales(&purpose, database)));
     if let Some(scales) = scales.as_ref().filter(|_| normalize) {
         normalize_decimal_scales(&mut rows, scales);
     }
