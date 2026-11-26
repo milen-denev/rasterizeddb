@@ -419,10 +419,35 @@ public class RasterizedDbTypeMappingSource : RelationalTypeMappingSource
     {
     }
 
+    private static string StoreBase(string storeType)
+    {
+        var paren = storeType.IndexOf('(');
+        return (paren < 0 ? storeType : storeType[..paren]).Trim();
+    }
+
     protected override RelationalTypeMapping? FindMapping(in RelationalTypeMappingInfo mappingInfo)
     {
         var clrType = mappingInfo.ClrType;
         var storeType = mappingInfo.StoreTypeName;
+        if (storeType is not null && storeType.EndsWith("[]", StringComparison.Ordinal))
+        {
+            // integer[], text[]: the element's mapping, as an array of it.
+            var elementClr = clrType is null ? null : RasterizedDbArrayTypeMapping.ElementType(clrType);
+            if (clrType is not null && elementClr is null)
+            {
+                return null;
+            }
+
+            var element = FindMapping(new RelationalTypeMappingInfo(elementClr, storeTypeName: storeType[..^2], storeTypeNameBase: StoreBase(storeType[..^2])));
+            return element is null ? null : new RasterizedDbArrayTypeMapping(clrType ?? element.ClrType.MakeArrayType(), element);
+        }
+
+        if (storeType is null && clrType is not null && RasterizedDbArrayTypeMapping.ElementType(clrType) is { } elementType
+            && FindMapping(new RelationalTypeMappingInfo(elementType)) is { } elementMapping)
+        {
+            return new RasterizedDbArrayTypeMapping(clrType, elementMapping);
+        }
+
         if (storeType is not null)
         {
             var baseName = mappingInfo.StoreTypeNameBase ?? storeType;

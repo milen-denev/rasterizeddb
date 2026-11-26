@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Metadata.Conventions.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Query;
 using Microsoft.EntityFrameworkCore.Storage;
@@ -24,6 +25,7 @@ public static class RasterizedDbServiceCollectionExtensions
         new EntityFrameworkRelationalServicesBuilder(serviceCollection)
             .TryAdd<LoggingDefinitions, RasterizedDbLoggingDefinitions>()
             .TryAdd<IDatabaseProvider, DatabaseProvider<RasterizedDbOptionsExtension>>()
+            .TryAdd<IProviderConventionSetBuilder, RasterizedDbConventionSetBuilder>()
             .TryAdd<IRelationalTypeMappingSource, RasterizedDbTypeMappingSource>()
             .TryAdd<ISqlGenerationHelper, RelationalSqlGenerationHelper>()
             .TryAdd<IRelationalAnnotationProvider, RasterizedDbAnnotationProvider>()

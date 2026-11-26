@@ -3,7 +3,6 @@ using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using RasterizedDb.Data;
 using RasterizedDb.Data.Tests;
-using RasterizedDb.EntityFrameworkCore.Query;
 
 namespace RasterizedDb.EntityFrameworkCore.Tests;
 
