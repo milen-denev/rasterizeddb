@@ -58,6 +58,7 @@ pub(crate) struct Settings {
     pub json_shadow_tables: Option<bool>,
     pub settle_status: Option<bool>,
     pub raise_descriptor_limit: bool,
+    pub wal_truncate_damaged: bool,
 }
 
 impl Default for Settings {
@@ -76,6 +77,7 @@ impl Default for Settings {
             json_shadow_tables: None,
             settle_status: None,
             raise_descriptor_limit: false,
+            wal_truncate_damaged: false,
         }
     }
 }
@@ -258,6 +260,9 @@ impl Settings {
         if let Some(on) = self.settle_status {
             rasterizeddb_core::core::mvcc::status::set_settle_on_open(on);
         }
+        // Every start, off too: it is this start's decision, and an earlier
+        // start in the process must not leave it on.
+        rasterizeddb_core::core::wal::set_truncate_damaged(self.wal_truncate_damaged);
         if self.raise_descriptor_limit {
             let (before, now, budget) = rasterizeddb_core::core::partition::budget::raise_descriptor_limit();
             log::info!("descriptors: soft limit {now} (was {before}); partition open budget {budget}");
