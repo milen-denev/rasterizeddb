@@ -4,6 +4,10 @@ version = "1.0.0"
 edition = "2024"
 description = "A database console for RasterizedDB and PostgreSQL"
 license = "GPL-3.0"
+# Shipped as a binary (release-binaries.yml), never to crates.io; its
+# `enterprise` feature names an unpublished crate, which crates.io could not
+# resolve.
+publish = false
 
 [build-dependencies]
 # The icon and version resource of the Windows executable (build.rs).

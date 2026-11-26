@@ -1,10 +1,11 @@
 //! Ledger tables and secret vaults end to end, in the enterprise build
+//! (this crate's hooks installed before the embedded engine starts, as an
+//! application installs them)
 //! (docs/ledger-and-vault-plan.md): through the native client, against a
 //! directory, with anchors on another directory. One test function: the
 //! ledger's settings are read from the environment once per process.
 
 use rasterizeddb_embedded::Builder;
-use rasterizeddb_embedded::client::Executor;
 
 async fn lines(client: &rasterizeddb_embedded::Client, sql: &str) -> Vec<String> {
     let rows = client.query(sql, &[]).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -44,6 +45,8 @@ async fn ledger_tables_and_vaults() {
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    // As an application does: the licensed hooks before the engine opens.
+    rasterizeddb_enterprise::install_always().unwrap();
     let db = Builder::open(&data).worker_threads(2).start().await.unwrap();
     let c = db.connect().await.unwrap();
 

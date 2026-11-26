@@ -47,7 +47,8 @@ Both are **dual-licensed** and live in the licensed crates
 | `rasterizeddb_client` | GPL | none | `Model::LEDGER` data constant; update/upsert/restore/drop refused before sending |
 | `rasterizeddb_client_enterprise` (new) | dual | `ledger`, `vault` | `LedgerModel`, receipts, proof verification, `VERIFY` reports, ledger migrations, `Vault` client with zeroizing `SecretString` and a locked-memory cache |
 | `rdb_studio_enterprise` (new) | dual | — | ledger and vault panels, behind Studio's `enterprise` feature |
-| `rasterizeddb_server` / `rasterizeddb_embedded` | GPL | `enterprise` | links the licensed crate and installs its hooks |
+| `rasterizeddb_server` | GPL, unpublished | `enterprise` | links the licensed crate and installs its hooks |
+| `rasterizeddb_embedded` | GPL, published | none | no dependency on the licensed crate (crates.io must resolve every optional dependency). An application links `rasterizeddb_enterprise` and calls `install_always()` before `Builder::start`; a ledger table opened without it is refused (fail closed) |
 
 All of these are off in the default GPL build, as D12 requires. A GPL build
 refuses a directory carrying `ledger_v1`, `encrypted_v1` or `vault_v1`.

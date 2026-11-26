@@ -122,6 +122,12 @@
 //! Freed memory goes back to the operating system once the engine has been
 //! idle for a few seconds ([`Builder::idle_trim`], on by default, glibc
 //! only).
+//!
+//! Ledger tables and secret vaults need the separately licensed
+//! `rasterizeddb_enterprise` crate: an application that uses them depends on
+//! it and calls `rasterizeddb_enterprise::install_always()` before
+//! [`Builder::start`]. This crate never links it. Without it, a ledger table or
+//! vault in the directory is refused, never opened unguarded.
 
 // The engine's statement futures nest deeply: as the core's own crates,
 // a compiler before 1.100 needs more room to normalise them.
@@ -761,13 +767,6 @@ fn engine_thread(
             // a database opens, so the opens see them.
             for (key, value) in &deferred.before_open {
                 set_config_at_start(None, key, value).await.map_err(|e| refused(key, value, e))?;
-            }
-            // The licensed guard before the first catalogue: a ledger table
-            // must not open unguarded. One engine per process, but a second
-            // open after a close finds it installed, which is fine.
-            #[cfg(feature = "enterprise")]
-            if !rasterizeddb_core::core::ledger_hooks::installed() {
-                rasterizeddb_enterprise::install_always().map_err(io::Error::other)?;
             }
             let catalog = DatabaseCatalog::open(root.as_deref(), DEFAULT_DATABASE_NAME)
                 .await
