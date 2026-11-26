@@ -588,7 +588,7 @@ how a service running as another user is given access.
 - **`trust`** is allowed on a socket only when its mode admits nobody outside
   its owner and group (`660` yes, `666` no), as it is allowed on TCP only on
   loopback. A trust connection runs as the role it names, with that role's
-  privileges (the native client's `Login::TrustAs("role")`, checked to exist
+  privileges (the native client's `Client::connect_as_role(addr, options, "role")`, checked to exist
   and be allowed to log in). One that names none is never an administrator: in
   a database with roles it reaches the tables it made itself and what PUBLIC is
   granted, nothing else.

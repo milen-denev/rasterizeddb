@@ -16,13 +16,6 @@ pub enum Login {
     /// the connection is refused.
     #[default]
     Trust,
-    /// No exchange, as [`Login::Trust`], running as `role`: what a
-    /// connection to a trust socket of a database with roles needs. A trust
-    /// connection that names no role is no administrator there and gets only
-    /// what PUBLIC is granted. The role is named by the connection's first
-    /// request (with its database, if one is chosen); the server checks it
-    /// exists and may log in.
-    TrustAs(String),
     /// As the operating-system user this process runs as, with no password,
     /// on a unix socket under `--rdb-socket-auth peer`. A role of that name
     /// must exist and be allowed to log in.
@@ -59,7 +52,6 @@ impl fmt::Debug for Login {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Login::Trust => f.write_str("Trust"),
-            Login::TrustAs(role) => f.debug_tuple("TrustAs").field(role).finish(),
             Login::Peer => f.write_str("Peer"),
             Login::PeerAs(user) => f.debug_tuple("PeerAs").field(user).finish(),
             Login::Password { user, .. } => f
@@ -80,7 +72,7 @@ impl Login {
     ) -> Result<Option<Arc<dyn ClientAuthenticator>>, RastcpError> {
         let database = database.map(str::to_string);
         let user = match self {
-            Login::Trust | Login::TrustAs(_) => return Ok(None),
+            Login::Trust => return Ok(None),
             Login::Password { user, password } => {
                 return Ok(Some(Arc::new(PasswordLogin {
                     user: user.clone(),
@@ -109,10 +101,6 @@ impl Login {
         match (self, database) {
             (Login::Trust, Some(name)) => Some(Arc::new(DatabaseSetup {
                 name: name.to_string(),
-            }) as Arc<dyn ConnectionSetup>),
-            (Login::TrustAs(role), database) => Some(Arc::new(RoleSetup {
-                role: role.clone(),
-                database: database.map(str::to_string),
             }) as Arc<dyn ConnectionSetup>),
             _ => None,
         }
@@ -161,6 +149,12 @@ impl ConnectionSetup for DatabaseSetup {
     }
 }
 
+/// What names `role` (and selects `database`, if one) on a trust connection
+/// ([`crate::Client::connect_as_role`]).
+pub(crate) fn role_setup(role: &str, database: Option<&str>) -> Arc<dyn ConnectionSetup> {
+    Arc::new(RoleSetup { role: role.to_string(), database: database.map(str::to_string) })
+}
+
 /// The server's `pgwire::native_session::ROLE_PREFIX`.
 const ROLE_PREFIX: &[u8] = b"\x01ROLE;";
 
@@ -188,7 +182,8 @@ impl ConnectionSetup for RoleSetup {
             Ok(_) => Ok(()),
             // A server older than the request answers it as a query.
             Err(crate::Error::Unsupported(detail)) => Err(RastcpError::AuthenticationError(format!(
-                "this server cannot name role \"{}\" on a trust connection (it predates                  Login::TrustAs), so the connection was not used: {detail}",
+                "this server cannot name role \"{}\" on a trust connection (it predates \
+                 Client::connect_as_role), so the connection was not used: {detail}",
                 self.role
             ))),
             Err(e) => Err(RastcpError::AuthenticationError(match e {
