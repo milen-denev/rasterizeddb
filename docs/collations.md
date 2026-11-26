@@ -67,9 +67,13 @@ refuses it. Comparing columns of two different nondeterministic
 collations, or one with a column compared by its bytes in a join key, is
 `42P22`.
 
-An expression over such a column (`upper(name) = 'BOB'`, `DISTINCT
-upper(name)`) compares by its bytes; PostgreSQL carries the column's
-collation through it.
+Text made from such a column and compared in a `WHERE` or a join
+condition keeps the column's collation, as PostgreSQL carries it through:
+a concatenation (`name || '!' = 'BOB!'`) and `COALESCE`, `NULLIF`,
+`upper`, `lower`, `trim`/`ltrim`/`rtrim`/`btrim`, `substring`/`substr`,
+`left`, `right` and `replace` over it (`upper(name) = 'bob'`,
+`COALESCE(name, '') LIKE '%OB'`). Any other expression over one, and one
+in a select list (`DISTINCT upper(name)`), compares by its bytes.
 
 ## How it works
 
