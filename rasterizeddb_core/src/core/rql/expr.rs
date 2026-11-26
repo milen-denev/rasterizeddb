@@ -726,6 +726,16 @@ fn cast_target(name: &str) -> Option<DbType> {
             "BIGINT" | "INT8" | "INT64" => DbType::I64,
             "INT" | "INTEGER" | "INT4" => DbType::I32,
             "SMALLINT" | "INT2" => DbType::I16,
+            // The engine's own one-byte and unsigned integers, by the names
+            // a column is declared with (`lexer_ac`). A column could be made
+            // `utinyint` (SQL Server's tinyint) and not compared with
+            // `CAST(1 AS utinyint)`, which EF Core writes for every byte
+            // constant: "cast to 'utinyint' is not supported yet".
+            "TINYINT" | "INT1" => DbType::I8,
+            "UTINYINT" | "UINT1" => DbType::U8,
+            "USMALLINT" | "UINT16" | "UINT2" => DbType::U16,
+            "UINT" | "UINT32" | "UINT4" => DbType::U32,
+            "UBIGINT" | "UINT64" | "UINT8" => DbType::U64,
             "TEXT" | "VARCHAR" | "CHARACTER VARYING" => DbType::STRING,
             // `character(n)`: text, held to its length by the cast's
             // modifier (`Expr::TypmodCast`).
