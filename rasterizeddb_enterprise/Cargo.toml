@@ -12,7 +12,7 @@ authors = ["Milen Denev"]
 publish = false
 
 [dependencies]
-rasterizeddb_core = { path = "../rasterizeddb_core", version = "1.0.0", default-features = false, features = ["sharding"] }
+rasterizeddb_core = { path = "../rasterizeddb_core", version = "1.1.0", default-features = false, features = ["sharding"] }
 log = "0.4"
 parking_lot = "0.13"
 # The ledger chain's hash and ids (both already in the tree).

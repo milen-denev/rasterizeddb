@@ -17,7 +17,7 @@ name = "rasterizeddb_core_enterprise"
 path = "../rasterizeddb_core/src/main.rs"
 
 [dependencies]
-rasterizeddb_core = { path = "../rasterizeddb_core", version = "1.0.0", default-features = false }
+rasterizeddb_core = { path = "../rasterizeddb_core", version = "1.1.0", default-features = false }
 rasterizeddb_enterprise = { path = "../rasterizeddb_enterprise", version = "1.0.0", optional = true }
 # main.rs names it directly when Raft is on.
 rasterizeddb_raft = { path = "../rasterizeddb_raft", version = "1.0.0", optional = true }

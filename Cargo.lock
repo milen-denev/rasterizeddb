@@ -5132,7 +5132,7 @@ dependencies = [
 
 [[package]]
 name = "rasterizeddb_client"
-version = "1.0.2"
+version = "1.1.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -5156,7 +5156,7 @@ dependencies = [
 
 [[package]]
 name = "rasterizeddb_client_derive"
-version = "1.0.2"
+version = "1.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5200,7 +5200,7 @@ dependencies = [
 
 [[package]]
 name = "rasterizeddb_core"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -5273,7 +5273,7 @@ dependencies = [
 
 [[package]]
 name = "rasterizeddb_embedded"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "log",
  "rasterizeddb_client",
