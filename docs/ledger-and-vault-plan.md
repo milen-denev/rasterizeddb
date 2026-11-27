@@ -364,7 +364,7 @@ SELECT id FROM patients WHERE ssn = '123-45-6789';      -- 0A000: column "patien
 
 **What may name an encrypted column.** An allowlist over the statement's tokens, run twice: on the client's text before any rewrite, and on the text the executor runs. The column may appear:
 - whole, as a select-list or `RETURNING` item (`ssn`, `p.ssn`, `ssn AS s`, `*`);
-- in an `INSERT` column list, with a literal, `NULL` or bound parameter for it in `VALUES`;
+- as a value of `INSERT … VALUES`: a literal, `NULL`, `DEFAULT` or a bound parameter, given by an explicit column list or by position (no list: the table's columns in order, a ledger table's hidden stamp skipped; a shorter tuple leaves it NULL), one row or many;
 - as `UPDATE … SET ssn = <literal | NULL | $n>`.
 
 Everything else that names it is refused (0A000):
