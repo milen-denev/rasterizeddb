@@ -13,7 +13,7 @@ publish = false
 # Built on the GPL client's public API and its plain-data `Model::LEDGER`;
 # nothing in the GPL crates depends on this one (sharding-plan.md §10).
 [dependencies]
-rasterizeddb_client = { path = "../rasterizeddb_client", version = "1.0.2", default-features = false }
+rasterizeddb_client = { path = "../rasterizeddb_client", version = "1.1.0", default-features = false }
 zeroize = "1"
 # Checking a ledger receipt on the client, against no one's word.
 sha2 = "0.11"
