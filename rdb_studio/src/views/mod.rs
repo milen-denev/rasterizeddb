@@ -10,17 +10,21 @@ pub mod activity;
 pub mod backup;
 pub mod bench;
 pub mod branches;
+pub mod broker;
 pub mod config;
 pub mod dashboard;
 pub mod connect;
 pub mod data;
 pub mod keys;
+#[cfg(feature = "enterprise")]
+pub mod ledger_kit;
 pub mod overview;
 pub mod migrate;
 pub mod query;
 pub mod replication;
 pub mod roles;
 pub mod schema;
+pub mod shards;
 pub mod storage;
 pub mod tables;
 
@@ -182,7 +186,7 @@ fn tabs(studio: &Studio) -> Element<'_, Message> {
     let strip = scrollable(tabs)
         .id(tab_strip_id())
         .direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::new().width(3).scroller_width(3),
+            scrollable::Scrollbar::new().width(6).scroller_width(6).spacing(2),
         ))
         .style(theme::scroller)
         .width(Fill);
@@ -222,11 +226,27 @@ fn pane(studio: &Studio) -> Element<'_, Message> {
         Tab::Backup => backup::view(studio),
         Tab::Storage => storage::view(studio),
         Tab::Branches => branches::view(studio),
+        Tab::Broker => broker::view(studio),
         Tab::Replication => replication::view(studio),
+        Tab::Shards => shards::view(studio),
         Tab::Migrate => migrate::view(studio),
         Tab::Keys => keys::view(studio),
         Tab::Roles => roles::view(studio),
         Tab::Config => config::view(studio),
+        #[cfg(feature = "enterprise")]
+        Tab::Ledger => rdb_studio_enterprise::view(
+            studio.ledger.as_ref(),
+            rdb_studio_enterprise::Actions {
+                reload: Message::ReloadLedger,
+                verify: Message::VerifyLedger,
+                audit: Message::LedgerAudit,
+                run: Message::LedgerRun,
+                input: Message::LedgerInput,
+                confirm: ledger_confirm,
+                open_table: Message::LedgerOpenTable,
+            },
+            &ledger_kit::StudioKit { studio },
+        ),
     };
     container(inner).width(Fill).height(Fill).padding(12).into()
 }
@@ -540,6 +560,9 @@ fn modal_view<'a>(modal: &'a Modal, studio: &'a Studio) -> Element<'a, Message> 
                 )),
             ]
             .spacing(16),
+            field("Compression (zstd, zstd(1) to zstd(22); empty for none)", &col.compression, |v| {
+                Message::ModalField(crate::app::ModalField::Compression, v)
+            }),
             text(format!("Will be written as:  {}", col.data_type()))
                 .size(11)
                 .font(theme::MONO)
@@ -610,6 +633,9 @@ fn modal_view<'a>(modal: &'a Modal, studio: &'a Studio) -> Element<'a, Message> 
                 crate::app::ModalField::Nullable,
                 v
             )),
+            field("Compression (zstd, zstd(1) to zstd(22), none; empty is the default)", &edit.compression, |v| {
+                Message::ModalField(crate::app::ModalField::Compression, v)
+            }),
             text(match edit.statements(table) {
                 Ok(sql) => format!("Will run:\n{}", sql),
                 Err(why) => why,
@@ -619,7 +645,44 @@ fn modal_view<'a>(modal: &'a Modal, studio: &'a Studio) -> Element<'a, Message> 
             .color(theme::TEXT_FAINT),
             text(
                 "A type change rewrites every row, and is refused if a value does not convert. \
-                 Setting NOT NULL is refused while a row holds NULL."
+                 Setting NOT NULL is refused while a row holds NULL. A compression change \
+                 applies to values written from now on; RECOMPRESS rewrites the rest."
+            )
+            .size(11)
+            .color(theme::TEXT_DIM),
+            error_line(error),
+            dialog_actions("APPLY", pending),
+        ]
+        .spacing(12)
+        .width(560)
+        .into(),
+
+        Modal::RowCompression { table, edit, error } => column![
+            dialog_title(format!("Row compression of {}", table)),
+            text(format!(
+                "Now: {}. Row compression stores each row's text, JSON, bytea and array values \
+                 together as one zstd frame; per-column compression is set on each column.",
+                edit.original
+            ))
+            .size(11)
+            .color(theme::TEXT_DIM),
+            field("Row compression (zstd, zstd(1) to zstd(22), or none)", &edit.setting, |v| {
+                Message::ModalField(crate::app::ModalField::Compression, v)
+            }),
+            toggle("Rewrite existing rows now (RECOMPRESS)", edit.recompress, |v| Message::ModalToggle(
+                crate::app::ModalField::Recompress,
+                v
+            )),
+            text(match edit.statements(table) {
+                Ok(sql) => format!("Will run:\n{}", sql),
+                Err(why) => why,
+            })
+            .size(11)
+            .font(theme::MONO)
+            .color(theme::TEXT_FAINT),
+            text(
+                "A new setting applies to rows written from now on. RECOMPRESS rewrites every \
+                 row and trains a dictionary, which takes a while on a large table."
             )
             .size(11)
             .color(theme::TEXT_DIM),
@@ -2013,6 +2076,14 @@ pub fn metric_grid(
 pub fn plain_cell(value: Option<&str>, numeric: bool) -> Element<'_, Message> {
     let content: Element<'_, Message> = match value {
         None => text("∅").size(12).font(theme::MONO).color(theme::TEXT_FAINT).into(),
+        // An encrypted column's value, read by a role without its vault's
+        // SELECT (RasterizedDB enterprise): what it is, not base64 noise.
+        Some(v) if v.starts_with("rdbenc1:") => text("🔒 encrypted (no access to its vault)")
+            .size(12)
+            .font(theme::MONO)
+            .color(theme::TEXT_FAINT)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
         // One line, cut at the cell's edge rather than wrapped onto the
         // rows below; a narrow column is widened by dragging its edge.
         Some(text_value) => text(elide(text_value, 220))
@@ -2060,6 +2131,13 @@ pub fn elide(value: &str, limit: usize) -> std::borrow::Cow<'_, str> {
     }
     let head: String = flattened.chars().take(limit - 1).collect();
     std::borrow::Cow::Owned(format!("{}…", head))
+}
+
+/// The LEDGER page's destructive statements, through the confirmation
+/// dialog, reloading the page once run.
+#[cfg(feature = "enterprise")]
+fn ledger_confirm(title: String, body: String, statement: String) -> Message {
+    Message::Confirm { title, body, statement, refresh: Refresh::Ledger }
 }
 
 /// Wraps a destructive statement in a confirmation.

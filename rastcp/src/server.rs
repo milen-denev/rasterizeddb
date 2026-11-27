@@ -1136,8 +1136,10 @@ impl TcpServer {
         // because an exchange that cannot bind itself to this connection must
         // fail rather than run unbound.
         let binding = tls_stream.channel_binding()?;
+        let certificate = tls_stream.peer_certificate();
 
-        let mut channel = AuthChannel::new(tls_stream, auth_timeout, binding, peer_addr);
+        let mut channel =
+            AuthChannel::new(tls_stream, auth_timeout, binding, peer_addr).with_peer_certificate(certificate);
 
         // The whole exchange is bounded, not just each message: a peer that
         // answers every message just inside the per-message timeout could

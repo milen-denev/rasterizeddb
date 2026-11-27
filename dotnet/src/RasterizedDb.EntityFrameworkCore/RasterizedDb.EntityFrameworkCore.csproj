@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+    <RootNamespace>RasterizedDb.EntityFrameworkCore</RootNamespace>
+    <AssemblyName>RasterizedDb.EntityFrameworkCore</AssemblyName>
+    <PackageId>RasterizedDb.EntityFrameworkCore</PackageId>
+    <Description>Entity Framework Core provider for RasterizedDB over its native protocol (rastcp).</Description>
+    <PackageTags>rasterizeddb;entity framework core;ef core;orm;database</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;EF1001;EF9100</NoWarn>
+  </PropertyGroup>
+  <!-- EF Core 10 needs .NET 10; on .NET 8 and 9 the provider builds against EF Core 9. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.5" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' != 'net10.0'">
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.10" />
+  </ItemGroup>
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <DefineConstants>$(DefineConstants);EF10</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\RasterizedDb.Data\RasterizedDb.Data.csproj" />
+    <InternalsVisibleTo Include="RasterizedDb.EntityFrameworkCore.Tests" />
+  </ItemGroup>
+</Project>

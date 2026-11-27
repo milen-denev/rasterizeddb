@@ -65,6 +65,9 @@ mod pg_import_args;
 /// Redis-compatible key/value store flags.
 #[cfg(feature = "kv_cache")]
 mod kv_args;
+#[cfg(feature = "broker")]
+mod broker_args;
+mod shard_args;
 
 #[derive(Clone, Debug, ValueEnum)]
 enum PgTlsMode {
@@ -226,6 +229,19 @@ struct Args {
     /// disk per log, and each chunk of log is written twice.
     #[arg(long = "wal-prealloc-kb", alias = "wal_prealloc_kb", value_name = "KB")]
     wal_prealloc_kb: Option<u64>,
+
+    /// Start past a damaged log, losing what follows the damage (one start; never saved)
+    ///
+    /// A log with a record that fails its checks and whole records after it
+    /// is damage, not the torn tail of a crash, and the start refuses: it
+    /// names the log, the byte and the commits after it. With this flag the
+    /// records before the damage are replayed and everything from it on is
+    /// dropped, and an ERROR says what went. Writes after the damage that had
+    /// reached the data files may survive in part, so the result is not a
+    /// clean point in time: check it. Restore from a backup instead when the
+    /// commits matter; copy the log first.
+    #[arg(long = "wal-truncate-damaged", alias = "wal_truncate_damaged")]
+    wal_truncate_damaged: bool,
 
     /// Logging level off, error, warn, info, debug, trace (default: error)
     #[arg(long = "log-level", alias = "log_level", value_name = "LEVEL")]
@@ -444,6 +460,18 @@ struct Args {
     #[arg(long = "pg-key", value_name = "PATH")]
     pg_key: Option<String>,
 
+    /// PEM CA certificates that client certificates are verified against.
+    /// Set, a client may log in with a certificate (`--pg-auth cert`): as
+    /// the role its subject common name names, or the role `--pg-cert-map`
+    /// gives its fingerprint.
+    #[arg(long = "pg-client-ca", value_name = "PATH")]
+    pg_client_ca: Option<String>,
+
+    /// Lines `<sha256 fingerprint hex> <role>`: which role each client
+    /// certificate logs in as under `--pg-auth cert`, ahead of its CN.
+    #[arg(long = "pg-cert-map", value_name = "PATH")]
+    pg_cert_map: Option<String>,
+
     /// How pgwire connections authenticate: trust, password, md5 or
     /// scram-sha-256 (default).
     #[arg(long = "pg-auth", default_value = "scram-sha-256")]
@@ -595,6 +623,15 @@ struct Args {
     #[arg(long = "socket-group", value_name = "GROUP")]
     socket_group: Option<String>,
 
+    /// Run as a front-end node (B4.7): MySQL and SQL Server clients' sessions
+    /// go to this gateway (`host:port` of its PostgreSQL listener), logged in
+    /// as each client's own role; this server keeps only a copy of the
+    /// cluster's schema (`rdb-shard ddl --frontend`). MySQL logins then need
+    /// TLS.
+    #[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
+    #[arg(long = "frontend-upstream", value_name = "HOST:PORT")]
+    frontend_upstream: Option<String>,
+
     // --- MySQL / MariaDB protocol ------------------------------------------
     /// Also serve the MySQL / MariaDB client protocol on this TCP port (3306
     /// is MySQL's), beside whichever other listeners run, on the same
@@ -681,6 +718,28 @@ struct Args {
     #[cfg(feature = "mssql_wire")]
     #[arg(long = "mssql-tls", default_value = "prefer")]
     mssql_tls: String,
+
+    /// The collation text columns made over the SQL Server protocol take
+    /// when they name none: `ci` (SQL Server's default, case-insensitive,
+    /// `SQL_Latin1_General_CP1_CI_AS`) or `bin` (compared by their bytes).
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-collation", default_value = "ci")]
+    mssql_collation: String,
+
+    /// The error number for a duplicate in a unique index over the SQL
+    /// Server protocol: `2601`, SQL Server's own, or `2627` (what a PRIMARY
+    /// KEY or UNIQUE constraint reports) for applications testing only that.
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-unique-index-error", default_value_t = 2601)]
+    mssql_unique_index_error: i32,
+
+    /// How `uniqueidentifier` columns made over the SQL Server protocol
+    /// order: `sqlserver` (its last six bytes first, as SQL Server sorts
+    /// them; each such column keeps a hidden key column) or `binary` (by
+    /// their bytes, as PostgreSQL's `uuid`).
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-guid-order", default_value = "sqlserver")]
+    mssql_guid_order: String,
 
     /// PEM certificate chain for the SQL Server listener (default:
     /// `--pg-cert`, else a self-signed one made at start-up).
@@ -868,6 +927,33 @@ struct Args {
     #[cfg(feature = "kv_cache")]
     #[command(flatten)]
     kv: kv_args::KvArgs,
+
+    #[cfg(feature = "broker")]
+    #[command(flatten)]
+    broker: broker_args::BrokerArgs,
+
+    #[cfg(feature = "broker_kafka")]
+    #[command(flatten)]
+    kafka: broker_args::KafkaArgs,
+
+    #[cfg(feature = "broker_amqp")]
+    #[command(flatten)]
+    amqp: broker_args::AmqpArgs,
+
+    #[cfg(feature = "broker_mqtt")]
+    #[command(flatten)]
+    mqtt: broker_args::MqttArgs,
+
+    // --- sharding (docs/sharding-plan.md) ---------------------------------
+    #[command(flatten)]
+    shard: shard_args::ShardArgs,
+
+    /// The enterprise build's configuration (strict tenant mode, placement
+    /// policies, per-user-shard roles): `rasterizeddb_enterprise`'s file
+    /// format. Only in the `rasterizeddb_core_enterprise` binary.
+    #[cfg(feature = "enterprise")]
+    #[arg(long = "enterprise-config", value_name = "FILE")]
+    enterprise_config: Option<std::path::PathBuf>,
 }
 
 /// Applies `--storage-location`, `--storage-policy` and `--storage-min-free`
@@ -1329,8 +1415,26 @@ fn mssql_config(args: &Args) -> Result<Option<rasterizeddb_core::mssql::MsConfig
             None
         }
     };
+    let case_insensitive = match args.mssql_collation.to_ascii_lowercase().as_str() {
+        "ci" => true,
+        "bin" => false,
+        other => return Err(format!("unknown --mssql-collation {other:?}: expected ci or bin")),
+    };
+    if !matches!(args.mssql_unique_index_error, 2601 | 2627) {
+        return Err(format!(
+            "unknown --mssql-unique-index-error {}: expected 2601 or 2627",
+            args.mssql_unique_index_error
+        ));
+    }
     let (bootstrap_user, bootstrap_password) = bootstrap_role(args);
     Ok(Some(MsConfig {
+        case_insensitive,
+        unique_index_error: args.mssql_unique_index_error,
+        guid_order: match args.mssql_guid_order.to_ascii_lowercase().as_str() {
+            "sqlserver" => true,
+            "binary" => false,
+            other => return Err(format!("unknown --mssql-guid-order {other:?}: expected sqlserver or binary")),
+        },
         tcp: args.mssql_port.map(|port| (args.mssql_addr.clone(), port)),
         socket,
         auth,
@@ -1400,6 +1504,13 @@ fn main() -> std::io::Result<()> {
 
     // Parse command line arguments with clap
     let mut args = Args::parse();
+    #[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
+    if let Some(gateway) = args.frontend_upstream.clone()
+        && let Err(e) = rasterizeddb_core::pgwire::set_frontend_upstream(gateway)
+    {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
     // The descriptors the partitions' open budget is derived from: a stock
     // systemd unit's soft limit of 1,024 would leave a budget of 16 open
     // partitions; raised toward the hard limit, as far as the largest
@@ -1487,6 +1598,74 @@ fn main() -> std::io::Result<()> {
         }
     }
 
+    // FIPS mode, before any TLS or crypto is used: the module's self-tests
+    // pass and the FIPS TLS provider is the process's, or nothing starts.
+    if rasterizeddb_core::core::fips::ENABLED {
+        if let Err(e) = rasterizeddb_core::core::fips::self_check() {
+            eprintln!("FIPS: {e}");
+            std::process::exit(2);
+        }
+        rasterizeddb_core::core::fips::install_tls_provider();
+        log::info!("FIPS 140-3 mode: cryptography through the AWS-LC FIPS module");
+    }
+
+    // Client certificates (`--pg-auth cert`, `--rdb-auth cert`): one CA and
+    // one fingerprint map for every listener that offers certificate login.
+    if let Some(ca) = &args.pg_client_ca {
+        rasterizeddb_core::pgwire::client_cert::set_ca(ca.clone());
+    }
+    if let Some(map) = &args.pg_cert_map {
+        if let Err(e) = rasterizeddb_core::pgwire::client_cert::load_map(map) {
+            eprintln!("--pg-cert-map: {e}");
+            std::process::exit(2);
+        }
+    }
+
+    // The licensed hooks, before anything can open a session. The ledger
+    // guard first and always: a ledger table must not open unguarded.
+    #[cfg(feature = "enterprise")]
+    if let Err(e) = rasterizeddb_enterprise::install_always() {
+        eprintln!("enterprise hooks: {e}");
+        std::process::exit(2);
+    }
+    #[cfg(feature = "enterprise")]
+    if let Some(path) = &args.enterprise_config {
+        if let Err(e) = rasterizeddb_enterprise::install(path) {
+            eprintln!("--enterprise-config: {e}");
+            std::process::exit(2);
+        }
+        // T6: strict tenant mode refuses to start where any login would be
+        // let in without a credential.
+        if rasterizeddb_core::core::policy_hooks::installed() && args.pg_auth.eq_ignore_ascii_case("trust") {
+            eprintln!("strict tenant mode needs password authentication: --pg-auth trust is refused");
+            std::process::exit(2);
+        }
+    }
+
+    // Before the database opens: a shard's directory is marked, its map
+    // epoch checked and its ownership installed, so no statement ever runs
+    // unguarded.
+    let shard_location = if args.in_memory { None } else { args.location.clone() };
+    match args.shard.start(shard_location.as_deref()) {
+        Ok(Some(started)) => {
+            #[cfg(feature = "sharding")]
+            eprintln!(
+                "shard {} of cluster {:032x}, map epoch {} ({} ranges owned)",
+                started.shard_id,
+                started.map.cluster_id(),
+                started.map.epoch(),
+                started.map.ranges_of(started.shard_id).len()
+            );
+            #[cfg(not(feature = "sharding"))]
+            let () = started;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
+
     let config = Configuration {
         location: args.location.clone(),
         batch_size: args.batch_size,
@@ -1540,6 +1719,10 @@ fn main() -> std::io::Result<()> {
     // Before any database opens too: the first record of each log reads it.
     if let Some(kb) = args.wal_prealloc_kb {
         let _ = rasterizeddb_core::WAL_PREALLOC_BYTES.set(kb.saturating_mul(1024));
+    }
+    // And this, which recovery reads as each log opens.
+    if args.wal_truncate_damaged {
+        rasterizeddb_core::core::wal::set_truncate_damaged(true);
     }
     #[cfg(feature = "query_stats")]
     if let Some(spec) = args.query_stats.as_deref() {
@@ -1650,6 +1833,14 @@ fn main() -> std::io::Result<()> {
     }
 
     if let Some(v) = args.json_shadow_tables {
+        // Shadow tables are plain tables keyed by a per-row reference, not by
+        // the document's shard key, so a shard cannot keep them with their
+        // rows (sharding-plan.md B1a.11).
+        #[cfg(feature = "sharding")]
+        if v && rasterizeddb_core::core::shard::map_state::current().is_some() {
+            eprintln!("--json-shadow-tables is not supported on a shard (--role shard)");
+            std::process::exit(2);
+        }
         let _ = rasterizeddb_core::JSON_SHADOW_TABLES.set(v);
         if v {
             log::info!(
@@ -1828,6 +2019,69 @@ fn main() -> std::io::Result<()> {
             }
         }
 
+        // The shard's Raft group (sharding-plan.md B3): its store, its
+        // runtime, the apply into the catalogue, and the peers' listener.
+        #[cfg(feature = "sharding_raft")]
+        match args.shard.raft() {
+            Ok(Some((id, net))) => {
+                use rasterizeddb_core::core::shard::{raft_apply, raft_group, raft_net, raft_store};
+                let dir = std::path::Path::new(args.location.as_deref().unwrap_or(".")).join("raft");
+                let (store, restored) = match raft_store::RaftStore::open(&dir) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("the raft store: {e}");
+                        std::process::exit(2);
+                    }
+                };
+                let voters = std::iter::once(id).chain(net.peers.keys().copied());
+                let group = raft_group::Group::start(
+                    id,
+                    store,
+                    restored,
+                    rasterizeddb_raft::Config::new(voters),
+                    rasterizeddb_raft::Timing::default(),
+                    Box::new(raft_apply::ShardMachine::new(catalog.clone(), id)),
+                    std::sync::Arc::new(raft_net::Sender(raft_net::RastcpTransport::new(net.clone()))),
+                );
+                raft_apply::install(group.clone(), id, catalog.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = raft_net::serve(net, group).await {
+                        log::error!("the raft listener stopped: {e}");
+                    }
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+
+        // The gateways' endpoint on a shard (rshard, mTLS), on the catalogue
+        // so a virtual session can attach to any database.
+        #[cfg(feature = "sharding")]
+        match args.shard.listener() {
+            Ok(Some(config)) => {
+                let catalog = catalog.clone();
+                tokio::spawn(async move {
+                    // A shard the gateways cannot reach only looks alive: its
+                    // own pgwire answers, every routed statement fails. Its
+                    // listener failing (a port in use, a bad certificate)
+                    // ends the process, for the supervisor to see.
+                    if let Err(e) = rasterizeddb_core::core::shard::rshard::serve(catalog, config).await {
+                        log::error!("the rshard listener stopped: {e}; a shard cannot run without it, exiting");
+                        eprintln!("the rshard listener stopped: {e}; a shard cannot run without it, exiting");
+                        std::process::exit(2);
+                    }
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+
         // Backups and the rastcp protocol are single-database and act on the
         // default one. Replication starts from it and carries every database
         // (`Database::start_replication_with`); the PostgreSQL listener routes
@@ -2002,7 +2256,7 @@ fn main() -> std::io::Result<()> {
                 let Some(method) = rasterizeddb_core::auth::AuthMethod::parse(&args.rdb_auth)
                 else {
                     eprintln!(
-                        "unknown --rdb-auth {:?}: expected trust or scram-sha-256",
+                        "unknown --rdb-auth {:?}: expected trust, scram-sha-256 or cert (with --pg-client-ca)",
                         args.rdb_auth
                     );
                     std::process::exit(2);
@@ -2124,6 +2378,19 @@ fn main() -> std::io::Result<()> {
                     );
                     std::process::exit(2);
                 };
+                if let Err(e) = rasterizeddb_core::core::fips::check_auth_method(method) {
+                    eprintln!("--pg-auth: {e}");
+                    std::process::exit(2);
+                }
+                if method == rasterizeddb_core::auth::AuthMethod::Cert
+                    && (args.pg_client_ca.is_none() || matches!(args.pg_tls, PgTlsMode::Disable))
+                {
+                    eprintln!(
+                        "--pg-auth cert needs TLS and --pg-client-ca: a certificate is only a \
+                         login once a CA you trust has signed it"
+                    );
+                    std::process::exit(2);
+                }
                 if method == rasterizeddb_core::auth::AuthMethod::Peer {
                     eprintln!(
                         "--pg-auth peer is not offered: over TCP the user would be the caller's \
@@ -2240,6 +2507,152 @@ fn main() -> std::io::Result<()> {
                 std::process::exit(2);
             }
         }
+
+        // The broker's ports, beside the SQL ones. They open only once the
+        // role catalogue exists, so a broker client's first login on a new
+        // database finds its role: the SQL listeners seed it as they start,
+        // which is after this, so it is seeded here the way they would.
+        #[cfg(feature = "broker")]
+        {
+            match (&native, &pgwire) {
+                (_, Some((_, _, auth, _))) => {
+                    if let Err(e) = rasterizeddb_core::pgwire::seed_catalogue_roles(&catalog, auth).await {
+                        eprintln!("could not prepare the role catalogue: {e}");
+                        rasterizeddb_core::shutdown::finalize();
+                        std::process::exit(2);
+                    }
+                }
+                (Some((auth, _)), None) => {
+                    let can_log_in = auth.bootstrap_password.is_some()
+                        || rasterizeddb_core::auth::has_login_role(&arc_database).await;
+                    if auth.authenticates() && can_log_in {
+                        if let Err(e) = rasterizeddb_core::native_auth::seed_roles(&arc_database, auth).await {
+                            eprintln!("could not prepare the role catalogue: {e}");
+                            rasterizeddb_core::shutdown::finalize();
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+
+        // The broker's native protocol, beside the SQL ports. Bound here for
+        // the same reason as the Redis port above.
+        #[cfg(feature = "broker")]
+        {
+            if let Err(e) = args.broker.apply() {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+            let (socket_mode, socket_group) = socket_permissions(&args);
+            match args.broker.native(socket_mode, socket_group, args.pg_cert.as_deref(), args.pg_key.as_deref()) {
+                Ok(Some(config)) => match rasterizeddb_core::core::broker::net::bind(&config).await {
+                    Ok(listeners) => {
+                        // Opened before the port answers, so a damaged log
+                        // stops the start-up with its reason.
+                        if let Err(e) = arc_database.broker.get() {
+                            eprintln!("could not open the broker: {e}");
+                            std::process::exit(2);
+                        }
+                        let database = arc_database.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = rasterizeddb_core::core::broker::net::serve(listeners, database, config).await {
+                                log::error!("broker: the native listener stopped: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("could not start the broker's native listener: {e}");
+                        std::process::exit(2);
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+            #[cfg(feature = "broker_kafka")]
+            match args.kafka.config(&args.broker, args.pg_cert.as_deref(), args.pg_key.as_deref()) {
+                Ok(Some(config)) => match rasterizeddb_core::core::broker::kafka::bind(&config).await {
+                    Ok(listeners) => {
+                        if let Err(e) = arc_database.broker.get() {
+                            eprintln!("could not open the broker: {e}");
+                            std::process::exit(2);
+                        }
+                        let database = arc_database.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = rasterizeddb_core::core::broker::kafka::serve(listeners, database, config).await {
+                                log::error!("broker: the Kafka listener stopped: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("could not start the Kafka listener: {e}");
+                        std::process::exit(2);
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+            #[cfg(feature = "broker_amqp")]
+            match args.amqp.config(&args.broker, args.pg_cert.as_deref(), args.pg_key.as_deref()) {
+                Ok(Some(config)) => match rasterizeddb_core::core::broker::amqp::bind(&config).await {
+                    Ok(listeners) => {
+                        if let Err(e) = arc_database.broker.get() {
+                            eprintln!("could not open the broker: {e}");
+                            std::process::exit(2);
+                        }
+                        let database = arc_database.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = rasterizeddb_core::core::broker::amqp::serve(listeners, database, config).await {
+                                log::error!("broker: the AMQP listener stopped: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("could not start the AMQP listener: {e}");
+                        std::process::exit(2);
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+            #[cfg(feature = "broker_mqtt")]
+            match args.mqtt.config(&args.broker, args.pg_cert.as_deref(), args.pg_key.as_deref()) {
+                Ok(Some(config)) => match rasterizeddb_core::core::broker::mqtt::bind(&config).await {
+                    Ok(listeners) => {
+                        if let Err(e) = arc_database.broker.get() {
+                            eprintln!("could not open the broker: {e}");
+                            std::process::exit(2);
+                        }
+                        let database = arc_database.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = rasterizeddb_core::core::broker::mqtt::serve(listeners, database, config).await {
+                                log::error!("broker: the MQTT listener stopped: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("could not start the MQTT listener: {e}");
+                        std::process::exit(2);
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+
 
         // A listener returns an error only when it could not start — the port
         // taken, the certificate unreadable — since a failed accept is retried

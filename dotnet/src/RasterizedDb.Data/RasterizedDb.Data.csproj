@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+    <RootNamespace>RasterizedDb.Data</RootNamespace>
+    <AssemblyName>RasterizedDb.Data</AssemblyName>
+    <PackageId>RasterizedDb.Data</PackageId>
+    <Description>ADO.NET driver for RasterizedDB's native protocol (rastcp): SQL, transactions, administration and the key/value cache, without the PostgreSQL wire layer.</Description>
+    <PackageTags>rasterizeddb;database;ado.net;driver</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- TLS for password logins: SslStream exposes no RFC 5705 exporter, which the login's channel binding needs. -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="RasterizedDb.Data.Tests" />
+    <InternalsVisibleTo Include="RasterizedDb.EntityFrameworkCore" />
+  </ItemGroup>
+</Project>

@@ -350,6 +350,26 @@ impl PinBoard {
         Ok(())
     }
 
+    /// Records a shard taking or giving up a span of this table's map
+    /// (`ACQUIRE_SPAN` / `RELEASE_SPAN`, sharding-plan.md B0.4): applied to a
+    /// copy of the state, made durable, then published, so the state never
+    /// holds a record the log does not. The table's open slots still show the
+    /// old epoch; the caller reopens the table to serve the new one (the
+    /// ownership protocol of B1a/B2 does that under its fence).
+    #[cfg(feature = "sharding")]
+    pub(crate) async fn record_span(&self, rec: &Record) -> io::Result<()> {
+        if !matches!(rec, Record::AcquireSpan { .. } | Record::ReleaseSpan { .. }) {
+            return Err(invalid(format!("record_span takes ACQUIRE_SPAN or RELEASE_SPAN, not {}", rec.kind().name())));
+        }
+        let mut state = self.state.lock().await;
+        let mut next = state.clone();
+        next.apply(rec).map_err(invalid)?;
+        self.log.append_durable(rec).await?;
+        self.grow(&next);
+        *state = next;
+        Ok(())
+    }
+
     /// The first-write edge (§7.2): a clean partition's first writer makes
     /// `DIRTY` durable and lowers the handle before its first stamp. Every
     /// writer that found the slot unpinned waits here; the first does the

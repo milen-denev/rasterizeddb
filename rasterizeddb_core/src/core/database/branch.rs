@@ -1458,6 +1458,11 @@ impl DatabaseCatalog {
                 meta.parent
             ));
         }
+        // A reset replaces the branch's tables with its parent's: its ledger
+        // tables and vaults would go, retention, holds and all.
+        if let Some(branch) = self.get(name) {
+            branch.admit_every_special(crate::core::ledger_hooks::WriteKind::Rewind)?;
+        }
         // Refused before the copy, not after it.
         {
             let entry = self.databases.get(name).ok_or("branch vanished")?;
@@ -1553,6 +1558,11 @@ impl DatabaseCatalog {
                 "cannot promote over the default database \"{parent}\": it is the catalogue root and \
                  cannot be swapped while the server runs"
             ));
+        }
+        // A promotion replaces the parent with the branch: the parent's
+        // ledger tables and vaults would be swapped for the branch's copies.
+        if let Some(parent_db) = self.get(&parent) {
+            parent_db.admit_every_special(crate::core::ledger_hooks::WriteKind::Rewind)?;
         }
         // Both checked before either is detached.
         for n in [name, parent.as_str()] {
@@ -2093,6 +2103,15 @@ pub(super) fn parse(trimmed: &str, upper: &str) -> Option<Result<DatabaseStateme
             };
             Some(Ok(DatabaseStatement::DiffBranch { name, into }))
         }
+        ("CREATE", "BRANCH") | ("RESET", "BRANCH") | ("PROMOTE", "BRANCH") | ("MERGE", "BRANCH")
+            if on_a_shard() && !(words[0] == "MERGE" && words.contains(&"USING")) =>
+        {
+            Some(Err(
+                "0A000: database branches are not supported on a shard: a branch copies this shard's ranges \
+                 alone, under a cluster map that knows nothing of it"
+                    .to_string(),
+            ))
+        }
         ("CREATE", "BRANCH") => Some(parse_create(&words, &tokens, &name_at)),
         ("DROP", "BRANCH") => {
             let if_exists = words.get(2) == Some(&"IF") && words.get(3) == Some(&"EXISTS");
@@ -2137,6 +2156,18 @@ pub(super) fn parse(trimmed: &str, upper: &str) -> Option<Result<DatabaseStateme
         ("MERGE", "BRANCH") if words.contains(&"USING") => None,
         ("MERGE", "BRANCH") => Some(parse_merge(&words, &name_at)),
         _ => None,
+    }
+}
+
+/// True when this node runs as a shard (sharding-plan.md B1a.11).
+fn on_a_shard() -> bool {
+    #[cfg(feature = "sharding")]
+    {
+        crate::core::shard::map_state::current().is_some()
+    }
+    #[cfg(not(feature = "sharding"))]
+    {
+        false
     }
 }
 

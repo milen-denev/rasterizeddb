@@ -1,0 +1,14 @@
+[package]
+name = "rdb_studio_enterprise"
+version = "1.0.0"
+edition = "2024"
+description = "RasterizedDB Studio's enterprise pages: ledger tables and secret vaults"
+repository = "https://github.com/milen-denev/rasterizeddb"
+# The RasterizedDB Enterprise License 1.0, as rasterizeddb_enterprise's: see LICENSE.
+license-file = "LICENSE"
+authors = ["Milen Denev"]
+publish = false
+
+# Linked only by rdb_studio's `enterprise` feature (sharding-plan.md §10, L8).
+[dependencies]
+iced = "0.14.0"

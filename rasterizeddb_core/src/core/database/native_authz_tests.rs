@@ -195,3 +195,31 @@ async fn an_ordinary_query_from_an_ordinary_user_still_runs() {
         text_of(&response)
     );
 }
+
+/// The rdb_roles escalation (reported on 1.0.1), over the native protocol:
+/// an ordinary role neither writes itself superuser nor reads a verifier.
+#[tokio::test]
+async fn r2r3_native_role_catalogue_is_closed_to_an_ordinary_user() {
+    let context = NativeContext {
+        database: in_memory_db().await,
+        authentication_required: true,
+        catalog: None,
+        statement_timeout: None,
+    };
+    let admin = StdArc::new(Principal::new("admin", true));
+    let created = process_incoming_queries(context.clone(), admin, b"CREATE USER bob PASSWORD 'pw'".to_vec()).await;
+    assert_eq!(created.first(), Some(&0), "{}", text_of(&created));
+    let bob = StdArc::new(Principal::new("bob", false));
+    for sql in [
+        "UPDATE rdb_roles SET is_superuser = 1 WHERE name = 'bob'",
+        "UPDATE \"rdb_roles\" SET is_superuser = 1",
+        "SELECT password FROM rdb_roles",
+        "SELECT * FROM public.rdb_roles",
+        "DELETE FROM rdb_roles",
+    ] {
+        let r = process_incoming_queries(context.clone(), bob.clone(), sql.as_bytes().to_vec()).await;
+        assert_eq!(r.first(), Some(&3), "{sql} must be refused: {}", text_of(&r));
+    }
+    let role = crate::auth::lookup_role(&context.database, "bob").await.expect("bob still exists");
+    assert!(!role.is_superuser, "bob made himself superuser");
+}

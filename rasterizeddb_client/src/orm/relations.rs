@@ -870,6 +870,10 @@ impl<P: Model, C: Model> With<P, C> {
 /// relation's count.
 pub(crate) trait Include<P>: Send + Sync {
     fn load<'a>(&'a self, db: &'a dyn SendSql, parents: &'a mut [P]) -> BoxFuture<'a, Result<()>>;
+    /// Where the related model's rows live, for a router to choose the
+    /// shard the relation loads from.
+    #[cfg_attr(not(feature = "sharding"), allow(dead_code))]
+    fn child(&self) -> super::Sharding;
 }
 
 pub(crate) struct Eager<P, C>(pub(crate) With<P, C>);
@@ -882,6 +886,9 @@ where
     fn load<'a>(&'a self, db: &'a dyn SendSql, parents: &'a mut [P]) -> BoxFuture<'a, Result<()>> {
         Box::pin(self.0.load_dyn(db, parents))
     }
+    fn child(&self) -> super::Sharding {
+        C::SHARD
+    }
 }
 
 pub(crate) struct Count<P, C>(pub(crate) With<P, C>);
@@ -893,6 +900,9 @@ where
 {
     fn load<'a>(&'a self, db: &'a dyn SendSql, parents: &'a mut [P]) -> BoxFuture<'a, Result<()>> {
         Box::pin(self.0.count_dyn(db, parents))
+    }
+    fn child(&self) -> super::Sharding {
+        C::SHARD
     }
 }
 

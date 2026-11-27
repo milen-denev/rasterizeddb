@@ -10,6 +10,22 @@ authors = ["Milen Denev"]
 description = "The RasterizedDB server and engine: a SQL database speaking the PostgreSQL, MySQL, SQL Server and native protocols, with MVCC, a write-ahead log, replication and S3 backup."
 
 [dependencies]
+# route_v1 (XXH64, key frames, the range map) and the shard map: one copy
+# shared with the client and the gateway.
+rasterizeddb_router = { path = "../rasterizeddb_router", version = "1.0.0" }
+# The message broker's batch format and wire protocol (feature `broker`),
+# shared with the client.
+rasterizeddb_mq = { path = "../rasterizeddb_mq", version = "1.0.1", optional = true }
+# The Kafka adapter's codecs for what producers compress with (feature
+# `broker_kafka`; zstd is already in the tree). Pure Rust, small.
+flate2 = { version = "1", optional = true }
+snap = { version = "1", optional = true }
+lz4_flex = { version = "0.11", optional = true, default-features = false, features = ["frame", "std"] }
+# Ed25519 for signed cluster maps (sharding-plan.md B2); already in the tree
+# as rustls's crypto provider.
+aws-lc-rs = { version = "1.19", optional = true }
+# Per-shard Raft (sharding-plan.md B3): our own consensus core, no I/O.
+rasterizeddb_raft = { path = "../rasterizeddb_raft", version = "1.0.0", optional = true }
 # `AT TIME ZONE`: zone rules from the system's tz database
 # (/usr/share/zoneinfo). Already in the tree through env_logger; no bundled
 # copy where the host has one, so the server answers with the zones its host
@@ -49,7 +65,7 @@ dashmap = "6.2"
 # `--log-level trace` in a release build shows at most debug.
 log = { version = "0.4", features = ["release_max_level_debug"] }
 libmimalloc-sys = "0.1"
-rastcp = { path = "../rastcp", version = "1.0.1" }
+rastcp = { path = "../rastcp", version = "1.0.2" }
 env_logger = "0.11"
 crc = "3.4"
 # CRC-32/ISO-HDLC with PCLMULQDQ: the WAL, replication log, backup archives and
@@ -101,6 +117,10 @@ zstd = { version = "0.14", optional = true, features = ["zstdmt"] }
 # has no other use for.
 webpki-roots = { version = "1", optional = true }
 
+[build-dependencies]
+# The icon and version resource of the Windows executable (build.rs).
+winresource = "0.1.34"
+
 [dev-dependencies]
 criterion = { version = "0.8" }
 tempfile = "3"
@@ -108,6 +128,9 @@ tempfile = "3"
 # that talk to a listener this crate starts. The server itself carries no
 # client.
 rasterizeddb_client = { path = "../rasterizeddb_client", default-features = false }
+# Client certificates signed at test time (tests/native_cert_login.rs);
+# already in the tree as rastcp's certificate generator.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # The write gate's source test parses `src/` (core/index_store/gate_source_tests.rs).
 syn = { version = "3", features = ["full", "visit"] }
 proc-macro2 = "1"
@@ -175,8 +198,37 @@ name = "kv_table_bench"
 required-features = ["kv_storage"]
 
 [features]
-default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching"]
+default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching", "storage_compression", "sharding", "broker", "broker_kafka", "broker_amqp", "broker_mqtt"]
 enable_long_row = []
+
+# Sharding (docs/sharding-plan.md §4): a shard's ownership of level-0 block
+# ranges, the guard on every path that stamps a row, its partition maps'
+# FOREIGN spans and their ACQUIRE_SPAN/RELEASE_SPAN writers, and (from B1a)
+# admission, classification and the gateway's virtual-session endpoint. In
+# the default list and dormant: nothing changes until a start passes
+# `--role shard`. Every build decodes the span records, so there is one
+# format; a build without the feature has none of the rest, and its stamping
+# hooks compile to nothing. No crate of its own: routing is
+# `rasterizeddb_router`'s.
+sharding = ["dep:aws-lc-rs", "dep:zstd"]
+
+# FIPS 140-3 mode (src/core/fips.rs): TLS through rustls's FIPS provider and
+# every security hash, MAC and KDF through the AWS-LC FIPS module; md5 logins
+# refused; the server refuses to start unless the module reports FIPS mode.
+# Off by default: AWS-LC's FIPS build needs CMake, Go and Perl.
+fips = ["dep:aws-lc-rs", "aws-lc-rs/fips", "rustls/fips"]
+
+# Per-shard Raft over row images (sharding-plan.md B3): each shard a
+# replicated group with automatic failover. Off until phase 3 meets its
+# gate (the deterministic simulation and the power-loss harness).
+sharding_raft = ["sharding", "dep:rasterizeddb_raft"]
+
+# Two-phase commit across shards (sharding-plan.md B5): PREPARE TRANSACTION /
+# COMMIT PREPARED / ROLLBACK PREPARED, status code 0b11 kept across restarts,
+# and the anchor decision log a gateway coordinates with. A directory that
+# holds a prepared transaction cannot be opened by a build without it (B0.1
+# refuses 0b11). Off by default.
+sharding_2pc = ["sharding"]
 
 # Database branches: `CREATE BRANCH`, `RESET`/`PROMOTE`/`DROP BRANCH`,
 # `MERGE BRANCH` and `SHOW BRANCH DIFF` (docs/branching.md). No crate of its
@@ -215,6 +267,18 @@ index_store_failpoints = []
 # still interoperates with one that has it — the handshake only ever picks a
 # codec both ends advertise, so the link falls back to uncompressed.
 replication_compression = ["dep:zstd"]
+
+# Compression of stored values (docs/compression.md): a variable-width column
+# declared `COMPRESSION zstd` or `zstd(level)` stores each value of at least
+# `core::compression::MIN_VALUE_BYTES` as a zstd frame when that saves bytes.
+#
+# Nothing is compressed unless a column asks for it, so a build with this
+# feature and no such column writes the rows it always did. A directory that
+# has used it carries `compressed_values_v1` in its `incompat_features` file,
+# and a build without the feature refuses that directory rather than read a
+# frame as text. Without it the `COMPRESSION` clauses are accepted and ignored,
+# as `pg_dump` output carries them.
+storage_compression = ["dep:zstd"]
 
 # One-way import of a live PostgreSQL database: schema, then data.
 #
@@ -278,6 +342,18 @@ query_stats = []
 # connection, and the port is closed unless `--kv-port` is given.
 kv_cache = []
 
+# The message broker (docs/broker.md): topics, queues, subscriptions and
+# exchanges inside the database, on `--broker-port` (the native protocol)
+# and `BROKER …` statements. Dormant until a port is given or a statement
+# first uses it.
+broker = ["dep:rasterizeddb_mq"]
+# The Kafka protocol on `--kafka-port` (docs/broker.md §7).
+broker_kafka = ["broker", "dep:flate2", "dep:snap", "dep:lz4_flex", "dep:zstd"]
+# AMQP 0-9-1 on `--amqp-port`: RabbitMQ's clients (docs/broker.md §7).
+broker_amqp = ["broker"]
+# MQTT 3.1.1 and 5.0 on `--mqtt-port` (docs/broker.md §7).
+broker_mqtt = ["broker"]
+
 # The MySQL / MariaDB client protocol (`--mysql-port`, `--mysql-socket`),
 # beside whichever other listeners run. Each connection is translated onto an
 # in-process PostgreSQL session, so it adds no crate of its own: SHA-256 and
@@ -296,3 +372,7 @@ mssql_wire = []
 # a root certificate bundle, or the code that signs requests. A backup covers
 # every storage location a database has, so it needs `storage_pools`.
 s3_backup = ["dep:zstd", "dep:webpki-roots", "storage_pools"]
+# `main.rs` is also compiled by `rasterizeddb_server`, whose `enterprise`
+# feature it checks; that name is no feature of this crate.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("enterprise"))'] }

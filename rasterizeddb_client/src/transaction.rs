@@ -120,6 +120,9 @@ pub(crate) struct Dial {
     /// ([`crate::Options::database`]).
     pub(crate) setup: Option<Arc<dyn rastcp::session::ConnectionSetup>>,
     pub(crate) trust: crate::Trust,
+    /// The client certificate of a certificate login
+    /// ([`crate::Client::connect_with_certificate`]).
+    pub(crate) identity: Option<Arc<rastcp::tls::ClientIdentity>>,
     /// The client's notice handler ([`crate::Client::set_notice_handler`]).
     pub(crate) notices: Arc<crate::notice::NoticeHook>,
 }
@@ -160,6 +163,9 @@ impl Connections {
             Some(timeout) => builder.timeout(timeout),
             None => builder.no_timeout(),
         };
+        if let Some(identity) = &self.dial.identity {
+            builder = builder.identity(crate::client::clone_identity(identity));
+        }
         if let Some(authenticator) = &self.dial.authenticator {
             builder = builder.authenticator(authenticator.clone());
         }
@@ -290,6 +296,10 @@ struct State {
 pub struct Transaction {
     state: tokio::sync::Mutex<State>,
     connections: Arc<Connections>,
+    /// Set by a router's `begin_for`: the one shard this transaction's rows
+    /// may live on.
+    #[cfg(feature = "sharding")]
+    scope: std::sync::OnceLock<crate::shard::ShardScope>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -308,7 +318,15 @@ impl Transaction {
                 in_flight: false,
             }),
             connections,
+            #[cfg(feature = "sharding")]
+            scope: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Pins the transaction to a router's shard (once).
+    #[cfg(feature = "sharding")]
+    pub(crate) fn pin_shard(&self, scope: crate::shard::ShardScope) {
+        let _ = self.scope.set(scope);
     }
 
     /// Sends one statement on the transaction's connection and reads its
@@ -461,6 +479,11 @@ impl Transaction {
 impl Executor for Transaction {
     fn send_checked(&self, sql: &str) -> impl Future<Output = Result<Rows>> + Send {
         self.exchange(sql, Step::Statement)
+    }
+
+    #[cfg(feature = "sharding")]
+    fn __shard_scope(&self) -> Option<&crate::shard::ShardScope> {
+        self.scope.get()
     }
 }
 

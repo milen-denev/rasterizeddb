@@ -155,7 +155,21 @@ impl Pacing {
             // cancellation and the deadlock detector. A fixed budget turned
             // every wait past it into 40001 under READ COMMITTED, where
             // PostgreSQL waits and proceeds.
-            Some(blocker) if live(blocker) => wait_for(database, self.site, waiter, blocker, since).await,
+            // A wait that ended with its blocker starts the budget and the
+            // blind count again: the replay after it is a new race, and a
+            // writer that slipped in and finished meanwhile is not the old
+            // conflict running long. Counted from the first conflict, every
+            // waiter behind a holder kept for more than the budget failed
+            // its next blind replay at once (40001 under READ COMMITTED with
+            // three or more writers on one row; pms's case loads).
+            Some(blocker) if live(blocker) => {
+                let pause = wait_for(database, self.site, waiter, blocker, since).await;
+                if matches!(pause, Pause::Retry) {
+                    self.since = None;
+                    self.blind = 0;
+                }
+                pause
+            }
             known => {
                 self.blind += 1;
                 if self.blind > max_blind || since.elapsed() >= CONFLICT_WAIT_BUDGET {

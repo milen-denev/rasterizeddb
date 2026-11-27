@@ -69,9 +69,37 @@ pub enum PgFunc {
     Ascii,
     Chr,
     StartsWith,
+    /// `pg_input_is_valid(text, type)`: whether the text reads as a value
+    /// of the type, as a cast to it would (PostgreSQL 16): what T-SQL's
+    /// `TRY_CAST` is translated over.
+    PgInputIsValid,
+    /// `__rdb_t7_digit(t)`: how many 100 ns a time value's text lies from
+    /// the microsecond the engine reads it as (-5 to 5): its seven-digit
+    /// fraction less ten times the engine's six, rounded half to even
+    /// (`.0429169` is `.042917` less 1). The column keeps the engine's
+    /// value, so every comparison that ignores the digit still reads it as
+    /// before; [`TickText`](Self::TickText) puts them back together.
+    TickDigit,
+    /// `__rdb_t7_text(t, d)`: the time `t` moved `d` 100 ns, as text with
+    /// seven fractional digits.
+    TickText,
+    /// `__rdb_t7_floor(t, d)`: the time `t` moved `d` 100 ns, cut to the
+    /// microsecond: what everything at a microsecond or coarser reads
+    /// (`23:59:59.9999996` is held as the next day's `00:00:00` less 4;
+    /// its day is this one).
+    TickFloor,
     Initcap,
     Md5,
     ToHex,
+    /// `rdb_route_block(type, value)`: the level-0 block route_v1 gives
+    /// `value` as a key of column type `type`, the unit a shard map assigns.
+    RdbRouteBlock,
+    /// `rdb_route_point(type, value)`: the same value's level-0 point,
+    /// `0x…` hex (a point may pass `int8`'s range).
+    RdbRoutePoint,
+    /// `rdb_shard_of(type, value)`: the shard the served cluster map gives
+    /// `value`'s block; NULL on a node that is not a shard.
+    RdbShardOf,
     QuoteLiteral,
     Format,
     RegexpReplace,
@@ -239,6 +267,14 @@ pub enum PgFunc {
     /// to a domain with constraints (`domains::checked_cast`): the value,
     /// or the error of the first constraint it violates.
     DomainValue,
+    /// `pg_sleep(seconds)`, `pg_sleep_for(interval)`, `pg_sleep_until(timestamptz)`:
+    /// a wait, made by the async caller of a `SELECT` with no `FROM`
+    /// (`no_from::NoFrom::wait`) before it evaluates the row. Evaluated
+    /// anywhere else it is refused ([`call`]): a synchronous evaluator could
+    /// only wait by blocking its runtime worker.
+    PgSleep,
+    PgSleepFor,
+    PgSleepUntil,
 }
 
 /// The range type a constructor builds.
@@ -272,12 +308,12 @@ fn range_bound_type(range: &DbType) -> DbType {
 /// evaluator from a select list or a `WHERE` (`expr::is_function`).
 pub const NAMES: &[&str] = &[
     "LEFT", "RIGHT", "SUBSTR", "SUBSTRING", "STRPOS", "POSITION", "REVERSE", "REPEAT", "CONCAT", "CONCAT_WS",
-    "SPLIT_PART", "TRANSLATE", "ASCII", "CHR", "STARTS_WITH", "INITCAP", "MD5", "TO_HEX", "QUOTE_LITERAL",
+    "SPLIT_PART", "TRANSLATE", "ASCII", "CHR", "STARTS_WITH", "INITCAP", "MD5", "TO_HEX", "RDB_ROUTE_BLOCK", "RDB_ROUTE_POINT", "RDB_SHARD_OF", "QUOTE_LITERAL",
     "FORMAT", "REGEXP_REPLACE", "CEIL", "CEILING", "FLOOR", "SIGN", "POWER", "POW", "SQRT", "CBRT", "EXP", "LN",
     "LOG", "LOG10", "PI", "DEGREES", "RADIANS", "RANDOM", "DIV", "GCD", "LCM", "WIDTH_BUCKET", "FACTORIAL", "JUSTIFY_HOURS", "JUSTIFY_DAYS", "JUSTIFY_INTERVAL", "MAKE_DATE", "MAKE_TIMESTAMP",
     "TO_TIMESTAMP", "TO_DATE", "TO_CHAR", "AGE", "ENCODE", "DECODE", "JSON_BUILD_OBJECT", "JSONB_BUILD_OBJECT",
     "JSON_BUILD_ARRAY", "JSONB_BUILD_ARRAY", "TO_JSON", "TO_JSONB", "JSONB_ARRAY_LENGTH", "JSON_ARRAY_LENGTH",
-    "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF",
+    "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF", "PG_INPUT_IS_VALID", "__RDB_T7_DIGIT", "__RDB_T7_TEXT", "__RDB_T7_FLOOR",
     "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CAT", "JSONB_SET", "JSONB_STRIP_NULLS", "NEXTVAL", "CURRVAL", "SETVAL",
     "LASTVAL", "PG_GET_USERBYID", "FORMAT_TYPE", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF", "PG_GET_PARTKEYDEF",
     "PG_GET_FUNCTION_RESULT", "PG_GET_FUNCTION_ARGUMENTS", "PG_GET_FUNCTION_IDENTITY_ARGUMENTS", "PG_GET_EXPR",
@@ -290,6 +326,7 @@ pub const NAMES: &[&str] = &[
     "SCALE", "MIN_SCALE", "TRIM_SCALE", "OVERLAY", "JSONB_PRETTY", "JSONB_INSERT",
     "ISEMPTY", "LOWER_INC", "UPPER_INC", "LOWER_INF", "UPPER_INF", "RANGE_MERGE", "INT4RANGE", "INT8RANGE",
     "NUMRANGE", "DATERANGE", "TSRANGE", "TSTZRANGE", "__RDB_DOMAIN_VALUE",
+    "PG_SLEEP", "PG_SLEEP_FOR", "PG_SLEEP_UNTIL",
 ];
 
 /// `a ~ b`, `a ~* b`, `a !~ b`, `a !~* b` (one, at the top level) as the
@@ -356,9 +393,16 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "ASCII" => (Ascii, &[1]),
         "CHR" => (Chr, &[1]),
         "STARTS_WITH" => (StartsWith, &[2]),
+        "PG_INPUT_IS_VALID" => (PgInputIsValid, &[2]),
+        "__RDB_T7_DIGIT" => (TickDigit, &[1]),
+        "__RDB_T7_TEXT" => (TickText, &[2]),
+        "__RDB_T7_FLOOR" => (TickFloor, &[2]),
         "INITCAP" => (Initcap, &[1]),
         "MD5" => (Md5, &[1]),
         "TO_HEX" => (ToHex, &[1]),
+        "RDB_ROUTE_BLOCK" => (RdbRouteBlock, &[2]),
+        "RDB_ROUTE_POINT" => (RdbRoutePoint, &[2]),
+        "RDB_SHARD_OF" => (RdbShardOf, &[2]),
         "QUOTE_LITERAL" => (QuoteLiteral, &[1]),
         "FORMAT" => (Format, &[]),
         "REGEXP_REPLACE" => (RegexpReplace, &[3, 4]),
@@ -484,6 +528,9 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "TSRANGE" => (TsRange, &[2, 3]),
         "TSTZRANGE" => (TstzRange, &[2, 3]),
         "__RDB_DOMAIN_VALUE" => (DomainValue, &[]),
+        "PG_SLEEP" => (PgSleep, &[1]),
+        "PG_SLEEP_FOR" => (PgSleepFor, &[1]),
+        "PG_SLEEP_UNTIL" => (PgSleepUntil, &[1]),
         _ => return None,
     };
     let variadic_ok = match func {
@@ -506,6 +553,45 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
     Some(Ok(func))
 }
 
+/// How long a call of the `pg_sleep` family over `arg` waits, as PostgreSQL
+/// reads it: seconds (fractions allowed), an interval (a month as thirty
+/// days), or an instant (a zone-less text as UTC). A NULL, a negative span or
+/// an instant already past waits nothing. `None` for any other function.
+pub fn sleep_span(func: PgFunc, arg: &Value) -> Option<Result<std::time::Duration, String>> {
+    use std::time::Duration;
+    let micros = |m: i128| Duration::from_micros(m.clamp(0, u64::MAX as i128) as u64);
+    if arg.is_null() && matches!(func, PgFunc::PgSleep | PgFunc::PgSleepFor | PgFunc::PgSleepUntil) {
+        return Some(Ok(Duration::ZERO));
+    }
+    Some(match func {
+        PgFunc::PgSleep => float_of(arg).map(|secs| {
+            // NaN and negatives wait nothing; past `Duration`'s range, its end.
+            Duration::try_from_secs_f64(if secs > 0.0 { secs } else { 0.0 }).unwrap_or(Duration::MAX)
+        }),
+        PgFunc::PgSleepFor => match arg {
+            Value::Data { bytes, db_type: DbType::INTERVAL } => crate::core::pg_types::decode_interval(bytes)
+                .ok_or_else(|| "an interval could not be read".to_string()),
+            other => crate::core::pg_types::parse_interval(&text_of(other))
+                .ok_or_else(|| format!("invalid input syntax for type interval: \"{}\"", text_of(other))),
+        }
+        .map(|iv| micros(crate::core::pg_types::interval_sort_key(iv))),
+        PgFunc::PgSleepUntil => {
+            let at = match arg {
+                Value::Data { db_type: DbType::DATE | DbType::DATETIME | DbType::TIMESTAMP, .. } => timestamp_of(arg),
+                other => crate::core::value_codec::parse_timestamp_us(&text_of(other))
+                    .ok_or_else(|| format!("invalid input syntax for type timestamp with time zone: \"{}\"", text_of(other))),
+            };
+            at.map(|at| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_micros() as i128);
+                micros(at as i128 - now)
+            })
+        }
+        _ => return None,
+    })
+}
+
 /// What a call to `func` over `args` evaluates to, as PostgreSQL types it:
 /// `ceil`, `floor`, `sign`, `sqrt` keep NUMERIC and are `double precision`
 /// otherwise, `div` is NUMERIC, the text family is text.
@@ -515,7 +601,11 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
     match func {
         Strpos | Ascii | JsonbArrayLength | NumNonnulls | NumNulls | Cardinality | WidthBucket => DbType::I32,
         Factorial => DbType::DECIMAL,
-        StartsWith => DbType::BOOL,
+        StartsWith | PgInputIsValid => DbType::BOOL,
+        TickDigit => DbType::I32,
+        TickText => DbType::STRING,
+        TickFloor => first(),
+        RdbRouteBlock | RdbShardOf => DbType::I64,
         Ceil | Floor | Sign | Sqrt => {
             if first() == DbType::DECIMAL {
                 DbType::DECIMAL
@@ -1237,6 +1327,64 @@ fn text_of(v: &Value) -> String {
     }
 }
 
+/// `rdb_route_block`'s answer: the level-0 block of `value` as a key of a
+/// column declared `type_name`, through the same `rasterizeddb_router` code a
+/// client routes with. The column's family decides, as in the engine: a UUID
+/// given to a `text` column hashes as its text.
+fn route_block(type_name: &str, value: &Value) -> Result<u64, String> {
+    use rasterizeddb_router::key::{KeyFamily, KeyValue, shard_block};
+    let t = type_name.trim().to_ascii_lowercase();
+    let family = match t.as_str() {
+        "smallint" | "int2" | "integer" | "int" | "int4" | "bigint" | "int8" | "tinyint" | "int1" => KeyFamily::Integer,
+        "text" | "varchar" | "character varying" | "string" => KeyFamily::Text,
+        "uuid" => KeyFamily::Uuid,
+        _ => {
+            return Err(format!(
+                "rdb_route_block: \"{type_name}\" is not a type a partition or shard key may have (integer, text, varchar or uuid)"
+            ));
+        }
+    };
+    let Value::Data { bytes, db_type } = value else {
+        return Err("rdb_route_block: a NULL key routes nowhere".to_string());
+    };
+    let text;
+    let key = match family {
+        KeyFamily::Integer => KeyValue::Int(match db_type {
+            DbType::U64 if bytes.len() == 8 => u64::from_le_bytes(bytes.as_slice().try_into().unwrap()) as i128,
+            DbType::I128 if bytes.len() == 16 => i128::from_le_bytes(bytes.as_slice().try_into().unwrap()),
+            DbType::STRING => {
+                let t = text_of(value);
+                t.trim().parse::<i128>().map_err(|_| format!("invalid input syntax for type integer: \"{t}\""))?
+            }
+            _ => int_of(value, "the key")? as i128,
+        }),
+        KeyFamily::Uuid => KeyValue::Uuid(match db_type {
+            DbType::UUID if bytes.len() == 16 => bytes.as_slice().try_into().unwrap(),
+            _ => {
+                let t = text_of(value);
+                crate::core::value_codec::parse_uuid(t.trim())
+                    .ok_or_else(|| format!("invalid input syntax for type uuid: \"{t}\""))?
+            }
+        }),
+        KeyFamily::Text => {
+            text = text_of(value);
+            KeyValue::Text(&text)
+        }
+    };
+    shard_block(key, family)
+}
+
+/// The shard owning `block` under the map this node serves as a shard.
+#[cfg(feature = "sharding")]
+fn served_shard_of(block: u64) -> Option<u32> {
+    crate::core::shard::map_state::current().map(|s| s.map.shard_of_block(block))
+}
+
+#[cfg(not(feature = "sharding"))]
+fn served_shard_of(_block: u64) -> Option<u32> {
+    None
+}
+
 /// An integer argument; `Err` for one that is not an integer.
 fn int_of(v: &Value, what: &str) -> Result<i64, String> {
     let Value::Data { bytes, db_type } = v else {
@@ -1370,6 +1518,14 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         return Ok(args[0].clone());
     }
     Ok(match func {
+        PgSleep | PgSleepFor | PgSleepUntil => {
+            let name = match func {
+                PgSleep => "pg_sleep",
+                PgSleepFor => "pg_sleep_for",
+                _ => "pg_sleep_until",
+            };
+            return Err(format!("0A000: {name}() is supported only as an item of a SELECT with no FROM"));
+        }
         Left | Right => {
             let chars: Vec<char> = s(0).chars().collect();
             let n = int_of(&args[1], "the length")?;
@@ -1454,6 +1610,16 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             text_value(c.to_string())
         }
         StartsWith => data(vec![u8::from(s(0).starts_with(&s(1)))], DbType::BOOL),
+        PgInputIsValid => data(vec![u8::from(crate::core::rql::expr::input_is_valid(&s(0), &s(1))?)], DbType::BOOL),
+        TickDigit => int_value(tick_offset(&s(0))),
+        TickFloor => {
+            let offset = int_of(&args[1], "the 100 ns offset")?;
+            tick_floor(&args[0], offset).unwrap_or_else(|| args[0].clone())
+        }
+        TickText => {
+            let offset = int_of(&args[1], "the 100 ns offset")?.clamp(-9, 9);
+            text_value(tick_shifted(&args[0], offset).unwrap_or_else(|| tick_text(&s(0), 0)))
+        }
         Initcap => {
             let mut out = String::new();
             let mut in_word = false;
@@ -1484,6 +1650,21 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             let v = int_of(&args[0], "the value")?;
             let wide = matches!(&args[0], Value::Data { db_type: DbType::I64, .. }) || i32::try_from(v).is_err();
             text_value(if wide { format!("{:x}", v as u64) } else { format!("{:x}", v as i32 as u32) })
+        }
+        RdbShardOf => {
+            let block = route_block(&s(0), &args[1])?;
+            match served_shard_of(block) {
+                Some(shard) => data((shard as i64).to_le_bytes().to_vec(), DbType::I64),
+                None => Value::Null,
+            }
+        }
+        RdbRouteBlock | RdbRoutePoint => {
+            let block = route_block(&s(0), &args[1])?;
+            if func == RdbRouteBlock {
+                data((block as i64).to_le_bytes().to_vec(), DbType::I64)
+            } else {
+                text_value(format!("{:#018x}", block << 16))
+            }
         }
         QuoteLiteral => text_value(quote_literal(&s(0))),
         Format => text_value(format_text(args)?),
@@ -3400,5 +3581,133 @@ mod case_mapping_tests {
         assert_eq!(pg_lower("ΟΔΟΣ"), "οδοσ");
         assert_eq!(pg_lower("İ"), "i");
         assert_eq!(pg_upper("ǆ"), "Ǆ");
+    }
+}
+
+/// How far (in 100 ns) a time's text lies from the microsecond the engine
+/// reads it as: its seventh fractional digit, plus ten times the
+/// microseconds the text cut to six digits is less what the whole text is
+/// read as. Read by the engine's own parser both times, so the value a
+/// column keeps and its offset agree however the engine rounds (it rounds
+/// through a float: `.5046365` and `.5215135` go opposite ways).
+pub(crate) fn tick_offset(text: &str) -> i64 {
+    let Some(dot) = text.rfind('.') else { return 0 };
+    let digits_end = text[dot + 1..].find(|c: char| !c.is_ascii_digit()).map_or(text.len(), |e| dot + 1 + e);
+    let digits = &text[dot + 1..digits_end];
+    if digits.len() <= 6 {
+        return 0;
+    }
+    let seventh = i64::from(digits.as_bytes()[6] - b'0');
+    let cut = format!("{}{}{}", &text[..=dot], &digits[..6], &text[digits_end..]);
+    // A date before the time is a timestamp, a zone after it one with a
+    // zone; else a time of day.
+    let dated = text.trim_start().get(4..5) == Some("-");
+    let zoned = !text[digits_end..].trim().is_empty();
+    let target = match (dated, zoned) {
+        (true, true) => "timestamptz",
+        (true, false) => "timestamp",
+        _ => "time",
+    };
+    match (crate::core::rql::expr::cast_text_micros(&cut, target), crate::core::rql::expr::cast_text_micros(text, target)) {
+        (Some(cut), Some(whole)) => seventh + 10 * (cut - whole),
+        _ => 0,
+    }
+}
+
+/// The time `value` moved `offset` 100 ns and cut to the microsecond, as
+/// a value of its type; `None` for a value of no time type.
+pub(crate) fn tick_floor(value: &Value, offset: i64) -> Option<Value> {
+    let Value::Data { bytes, db_type } = value else { return None };
+    let (micros, big_endian) = match db_type {
+        DbType::TIMESTAMP | DbType::DATETIME => (i64::from_le_bytes(bytes.get(..8)?.try_into().ok()?), false),
+        DbType::TIME => (i64::from_be_bytes(bytes.get(..8)?.try_into().ok()?), true),
+        _ => return None,
+    };
+    let us = micros.checked_mul(10)?.checked_add(offset)?.div_euclid(10);
+    let mut out = if big_endian { us.to_be_bytes().to_vec() } else { us.to_le_bytes().to_vec() };
+    out.extend_from_slice(bytes.get(8..).unwrap_or(&[]));
+    Some(Value::Data { bytes: out, db_type: db_type.clone() })
+}
+
+/// The time `value` (a timestamp's or time's stored value) moved `offset`
+/// 100 ns, as text with seven fractional digits; `None` for any other.
+pub(crate) fn tick_shifted(value: &Value, offset: i64) -> Option<String> {
+    let Value::Data { bytes, db_type } = value else { return None };
+    let (micros, big_endian) = match db_type {
+        DbType::TIMESTAMP | DbType::DATETIME => (i64::from_le_bytes(bytes.get(..8)?.try_into().ok()?), false),
+        DbType::TIME => (i64::from_be_bytes(bytes.get(..8)?.try_into().ok()?), true),
+        _ => return None,
+    };
+    let ticks = micros.checked_mul(10)?.checked_add(offset)?;
+    let (us, digit) = (ticks.div_euclid(10), ticks.rem_euclid(10) as u8);
+    let bytes = if big_endian { us.to_be_bytes().to_vec() } else { us.to_le_bytes().to_vec() };
+    let literal = crate::core::rql::subquery::value_to_literal(db_type, &bytes)?;
+    Some(tick_text(crate::core::value_codec::unquote_sql(&literal).as_ref(), digit))
+}
+
+/// A time value's text with seven fractional digits, the seventh `digit`.
+pub(crate) fn tick_text(text: &str, digit: u8) -> String {
+    let (head, tail, digits) = match text.rfind('.') {
+        Some(dot) => {
+            let end = text[dot + 1..].find(|c: char| !c.is_ascii_digit()).map_or(text.len(), |e| dot + 1 + e);
+            (&text[..dot], &text[end..], &text[dot + 1..end])
+        }
+        // No fraction: after the seconds (`15:03:07`, `… 15:03:07+00`).
+        None => {
+            let end = text.rfind(':').map(|c| c + 3).filter(|&e| e <= text.len()).unwrap_or(text.len());
+            (&text[..end], &text[end..], "")
+        }
+    };
+    let mut fraction: String = digits.chars().take(6).collect();
+    while fraction.len() < 6 {
+        fraction.push('0');
+    }
+    format!("{head}.{fraction}{digit}{tail}")
+}
+
+#[cfg(test)]
+mod tick_tests {
+    use super::*;
+
+    /// A time's seven digits come back whole from the microsecond the
+    /// engine reads it as and the offset: for every rounding the engine's
+    /// parser makes, the half cases included (the pilot's `.5046365` and
+    /// `.5215135` came back a microsecond off when the offset assumed
+    /// half-to-even).
+    #[test]
+    fn hundred_nanosecond_offsets() {
+        let mut cases: Vec<String> = [
+            "12:00:00.5046365", "18:10:23.5215135", "00:11:13.5227755", "13:44:54.2513405",
+            "15:03:07.0429169", "15:03:07.0429165", "15:03:07.0429175", "15:03:07.0429161", "23:59:59.9999995",
+            "23:59:59.9999999", "15:03:07.0000005",
+        ]
+        .iter()
+        .map(|t| format!("2026-03-23 {t}"))
+        .collect();
+        for k in 0..2000u32 {
+            cases.push(format!("2026-03-23 10:11:12.{:07}", k * 4999 % 10_000_000));
+        }
+        for text in &cases {
+            let us = crate::core::rql::expr::cast_text_micros(text, "timestamp").unwrap();
+            let v = Value::Data { bytes: us.to_le_bytes().to_vec(), db_type: DbType::TIMESTAMP };
+            let off = tick_offset(text);
+            assert!((-9..=9).contains(&off), "{text}: {off}");
+            let back = tick_shifted(&v, off).unwrap();
+            let want = if text.ends_with("23:59:59.9999995") || text.ends_with("23:59:59.9999999") {
+                // Across midnight: the same instant, the next day's text is
+                // not this one's, and the date is the value's own.
+                back.clone()
+            } else {
+                text.clone()
+            };
+            assert_eq!(back, want, "{text}");
+        }
+        assert_eq!(tick_offset("2026-03-23 15:03:07.042916"), 0);
+        assert_eq!(tick_offset("15:03:07"), 0);
+        let t = "15:03:07.9999996";
+        let us = crate::core::rql::expr::cast_text_micros(t, "time").unwrap();
+        let v = Value::Data { bytes: us.to_be_bytes().to_vec(), db_type: DbType::TIME };
+        assert_eq!(tick_shifted(&v, tick_offset(t)).as_deref(), Some(t));
+        assert_eq!(tick_text("15:03:07+00", 4), "15:03:07.0000004+00");
     }
 }

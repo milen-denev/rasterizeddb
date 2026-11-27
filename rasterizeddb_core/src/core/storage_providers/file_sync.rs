@@ -4305,3 +4305,21 @@ mod test {
         }
     }
 }
+
+impl LocalStorageProvider {
+    /// Deletes the file `name` of this provider's directory and its staging
+    /// `.tmp`, as `drop_io` of a provider opened on it would, without opening
+    /// one: opening creates the file when it is missing and syncs it and its
+    /// directory, two flushes per file only to delete it (a block's COMMIT
+    /// discarding its held-aside copies paid ~30 per CREATE INDEX). The
+    /// caller syncs the directory once the deletions are done.
+    pub(crate) fn drop_named(&self, name: &str) {
+        let delimiter = if cfg!(windows) { "\\" } else { "/" };
+        let file_str = format!("{}{}{}", self.location, delimiter, name);
+        let temp_file_str = format!("{}.tmp", file_str);
+        for path in [file_str, temp_file_str] {
+            drop(crate::core::sync_audit::note("unlink", Path::new(&path)));
+            let _ = remove_file(Path::new(&path));
+        }
+    }
+}

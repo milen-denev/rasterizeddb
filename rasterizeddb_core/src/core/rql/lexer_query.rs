@@ -1666,9 +1666,41 @@ pub(crate) fn extract_where_columns(
     // author never wrote.
     let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
 
-    // Check each schema field to see if it appears in the WHERE clause.
+    // A name made of word bytes alone is in the clause exactly when one of
+    // the clause's words (its maximal runs of word bytes) is that name: one
+    // pass over the clause, each word looked up. Every field was searched
+    // for at every byte of the clause instead, and a field the clause does
+    // not name was searched for to its end: with an `IN` list of 4,000
+    // keys (160 KB) over a table of 75 stored fields that was twelve million
+    // comparisons a parse, and more than half the time of the statement.
+    let plain_name = |name: &str| !name.is_empty() && name.bytes().all(is_word_byte);
+    let names: std::collections::HashSet<&[u8]> =
+        schema.iter().filter(|f| !f.is_deleted && plain_name(&f.name)).map(|f| f.name.as_bytes()).collect();
+    if !names.is_empty() {
+        let mut found = 0usize;
+        let mut i = 0usize;
+        while i < where_bytes.len() && found < names.len() {
+            if !is_word_byte(where_bytes[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < where_bytes.len() && is_word_byte(where_bytes[i]) {
+                i += 1;
+            }
+            if let Some(name) = names.get(&where_bytes[start..i]) {
+                // (Word bytes are ASCII: the name is valid UTF-8 as it was.)
+                if where_columns.insert(String::from_utf8_lossy(name).into_owned()) {
+                    found += 1;
+                }
+            }
+        }
+    }
+
+    // Any other name (one holding a space, a dot, a letter outside ASCII) is
+    // looked for where it stands, between bytes that are not a word's.
     // Tombstones are skipped: a dropped column cannot be referenced.
-    for field in schema.iter().filter(|f| !f.is_deleted) {
+    for field in schema.iter().filter(|f| !f.is_deleted && !plain_name(&f.name)) {
         let field_bytes = field.name.as_bytes();
         if field_bytes.len() > where_bytes.len() {
             continue;
@@ -1692,6 +1724,81 @@ pub(crate) fn extract_where_columns(
     }
 
     where_columns
+}
+
+#[cfg(test)]
+mod extract_where_columns_tests {
+    use super::*;
+    use crate::core::db_type::DbType;
+
+    /// What the function answered before it read the clause once: every
+    /// field searched for at every byte.
+    fn reference(where_clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let bytes = where_clause.as_bytes();
+        let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        for field in schema.iter().filter(|f| !f.is_deleted) {
+            let name = field.name.as_bytes();
+            if where_clause.is_empty() || name.len() > bytes.len() {
+                continue;
+            }
+            for i in 0..=bytes.len() - name.len() {
+                if &bytes[i..i + name.len()] == name
+                    && (i == 0 || !is_word_byte(bytes[i - 1]))
+                    && (i + name.len() == bytes.len() || !is_word_byte(bytes[i + name.len()]))
+                {
+                    out.insert(field.name.clone());
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn schema(names: &[&str]) -> SmallVec<[SchemaField; 20]> {
+        let mut s = SmallVec::new();
+        for (i, name) in names.iter().enumerate() {
+            s.push(SchemaField::new((*name).into(), DbType::STRING, 8, 0, i as u64, false));
+        }
+        s
+    }
+
+    /// The names a clause holds are the ones the byte-by-byte search found:
+    /// a name that is a prefix or a suffix of another, one at either end of
+    /// the clause, one in quotes or in a string, one that is not a word, a
+    /// dropped one, and a long list of keys.
+    #[test]
+    fn the_names_in_a_clause_are_the_ones_searched_for_byte_by_byte() {
+        let mut fields = schema(&["id", "foo", "foo_id", "context", "context_id", "name", "__ci_name", "a", "x1", "Mixed", "sale date", "tür", "d.e", "gone"]);
+        fields.last_mut().unwrap().is_deleted = true;
+        let keys: Vec<String> = (0..500).map(|k| format!("'{k:08x}-0000-4000-8000-{k:012x}'")).collect();
+        let long = format!("id IN ({}) AND context_id = 3", keys.join(", "));
+        let clauses = [
+            "",
+            "id",
+            "foo_id = 1",
+            "foo = 1 AND context_id > 2",
+            "x.context = y.foo_id",
+            "\"name\" = 'a' OR __ci_name = 'x1'",
+            "name='id'",
+            "a=1",
+            "(a)",
+            "mixed = 1 AND Mixed = 2",
+            "\"sale date\" > '2026-01-01' AND tür = 1 AND t.d.e = 2",
+            "sale dates = 1 OR xtür = 2 OR tür_ = 3",
+            "gone = 1 AND id2 = 2 AND _id = 3 AND id_ = 4",
+            "name",
+            "x1 = name",
+            long.as_str(),
+        ];
+        for clause in clauses {
+            assert_eq!(extract_where_columns(clause, &fields), reference(clause, &fields), "{}", &clause[..clause.len().min(80)]);
+        }
+        assert_eq!(
+            extract_where_columns(&long, &fields).into_iter().collect::<Vec<_>>(),
+            ["context_id".to_string(), "id".to_string()]
+        );
+    }
 }
 
 /// Parses a QueryPurpose::QueryRows variant and returns QueryRows with separate RowFetch structures
@@ -1735,6 +1842,62 @@ pub struct ParseMemo {
     sql: String,
     fields: SmallVec<[SchemaField; 20]>,
     parsed: Result<QueryRows, String>,
+    /// The last join planned in the scope ([`join_plan_memo`]).
+    join: Option<JoinMemo>,
+}
+
+/// A join's plan, its statement, and each relation's fields as the planner
+/// was told them.
+struct JoinMemo {
+    sql: String,
+    schemas: Vec<(String, Option<SmallVec<[SchemaField; 20]>>)>,
+    plan: Result<crate::core::rql::join::JoinPlan, String>,
+}
+
+/// The plan of the join `sql` made earlier in this [`parse_memo_scope`],
+/// when every relation it asked about still has the fields it was told
+/// (`schema_of`, asked again); `None` otherwise, or outside a scope.
+///
+/// A join is read three times as a single-table SELECT is: to describe its
+/// columns, to find their scales, and to run it, and planning one is all
+/// text. For a point lookup with one select-list subquery (joined to its
+/// row as a constant) the three plans were a third of the statement.
+pub(crate) fn join_plan_memo(
+    sql: &str,
+    schema_of: &dyn Fn(&str) -> Option<SmallVec<[SchemaField; 20]>>,
+) -> Option<Result<crate::core::rql::join::JoinPlan, String>> {
+    PARSE_MEMO
+        .try_with(|memo| {
+            let memo = memo.borrow();
+            let join = memo.as_ref()?.join.as_ref()?;
+            (join.sql == sql && join.schemas.iter().all(|(name, fields)| schema_of(name) == *fields)).then(|| join.plan.clone())
+        })
+        .ok()
+        .flatten()
+}
+
+/// Keeps `plan` for [`join_plan_memo`]: the join `sql`, planned against
+/// `schemas`. Nothing is kept outside a scope.
+pub(crate) fn remember_join_plan(
+    sql: &str,
+    schemas: Vec<(String, Option<SmallVec<[SchemaField; 20]>>)>,
+    plan: &Result<crate::core::rql::join::JoinPlan, String>,
+) {
+    let _ = PARSE_MEMO.try_with(|memo| {
+        let join = Some(JoinMemo { sql: sql.to_string(), schemas, plan: plan.clone() });
+        let mut memo = memo.borrow_mut();
+        match memo.as_mut() {
+            Some(memo) => memo.join = join,
+            None => {
+                *memo = Some(Box::new(ParseMemo {
+                    sql: String::new(),
+                    fields: SmallVec::new(),
+                    parsed: Err(String::new()),
+                    join,
+                }))
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1780,7 +1943,7 @@ pub fn row_fetch_from_select_query(
         .try_with(|memo| {
             memo.borrow()
                 .as_ref()
-                .filter(|m| m.sql == sql && m.fields == *schema)
+                .filter(|m| !m.sql.is_empty() && m.sql == sql && m.fields == *schema)
                 .map(|m| m.parsed.clone())
         })
         .ok()
@@ -1790,10 +1953,14 @@ pub fn row_fetch_from_select_query(
     }
     let parsed = parse_select_query(query_purpose, schema);
     let _ = PARSE_MEMO.try_with(|memo| {
-        *memo.borrow_mut() = Some(Box::new(ParseMemo {
+        let mut memo = memo.borrow_mut();
+        // (The join planned in this scope, if any, stays.)
+        let join = memo.as_mut().and_then(|m| m.join.take());
+        *memo = Some(Box::new(ParseMemo {
             sql: sql.to_string(),
             fields: schema.clone(),
             parsed: parsed.clone(),
+            join,
         }));
     });
     parsed
@@ -2189,6 +2356,14 @@ fn parse_select_query(
         (columns_part, false)
     };
 
+    // A window over a column with a nondeterministic collation partitions
+    // and sorts by its key (`collate_rewrite::rewrite_windows`).
+    let windowed_ci = if crate::core::rql::collation::any_order(schema) {
+        crate::core::tokenizer::collate_rewrite::rewrite_windows(columns_part, schema)
+    } else {
+        None
+    };
+    let columns_part = windowed_ci.as_deref().unwrap_or(columns_part);
     let mut select_items = parse_select_items(columns_part, schema)?;
 
     // `DISTINCT ON (k, …)`: each key a select item it names or an expression
@@ -2424,6 +2599,37 @@ fn parse_select_query(
     // `GROUP BY city HAVING count(*) > 1`. Both used to be rejected. The fold
     // needs no special case: it already emits the grouping key for a plain
     // column, so a plan whose items are all keys yields one row per group.
+    // Grouping by a column with a nondeterministic collation groups by its
+    // key (`collation::group_by_keys`); a `SELECT DISTINCT` of plain columns
+    // over one is that grouping.
+    let as_distinct = distinct && !has_aggregate && group_by.is_empty() && distinct_on.is_empty();
+    let grouped_distinct =
+        crate::core::rql::collation::group_by_keys(&mut group_by, &mut select_items, schema, as_distinct);
+    // Sorted by a `uuid` in SQL Server's order: the groups sort by it.
+    let grouped_distinct = grouped_distinct
+        || (crate::core::rql::collation::any_order(schema)
+            && crate::core::rql::collation::guid_group_order(
+                &mut group_by,
+                &mut select_items,
+                schema,
+                as_distinct && !grouped_distinct,
+                &order_terms,
+            ));
+    let distinct = distinct && !grouped_distinct;
+    // A DISTINCT left over a plain column with a nondeterministic collation
+    // (beside an expression, which compares by its bytes) would tell its
+    // spellings apart.
+    if distinct
+        && let Some(f) = select_items.iter().find_map(|i| match i {
+            SelectItem::Column { field, .. } if !crate::core::rql::collation::of(&field.name, schema).is_binary() => Some(field),
+            _ => None,
+        })
+    {
+        return Err(format!(
+            "SELECT DISTINCT over column \"{}\" beside an expression, which has a case-insensitive collation, is not supported yet",
+            f.name
+        ));
+    }
     let is_grouped = has_aggregate || !group_by.is_empty();
     // A key naming an output column sorts by that column's value
     // (`output_item_named`). A plain column item sorts by its source column,
@@ -2447,13 +2653,38 @@ fn parse_select_query(
     let by_output = output_exprs.iter().any(Option::is_some) || output_windows.iter().any(Option::is_some);
     // Columns with a nondeterministic collation sort by their key; what
     // would compare them by their bytes is refused (`collation::plan_single`).
+    let original: Vec<String> = order_terms.iter().map(|t| t.token.clone()).collect();
     let order_terms =
         crate::core::rql::collation::plan_single(columns_part, schema, order_terms, &group_by, is_grouped, distinct)?;
+    // A collation's key term goes in before the term it sorts (each term
+    // kept, in order): what each original term reads moves with it, and
+    // a key term reads its column. Indexed by the old positions, a key
+    // term took the next term's output, and the last ran past the end.
+    if order_terms.len() != original.len() {
+        let (mut exprs, mut windows) = (Vec::with_capacity(order_terms.len()), Vec::with_capacity(order_terms.len()));
+        let mut at = 0;
+        for term in &order_terms {
+            if original.get(at) == Some(&term.token) {
+                exprs.push(output_exprs[at].take());
+                windows.push(output_windows[at]);
+                at += 1;
+            } else {
+                exprs.push(None);
+                windows.push(None);
+            }
+        }
+        output_exprs = exprs;
+        output_windows = windows;
+    }
+    crate::core::rql::collation::mark_aggregates(&mut select_items, schema);
 
     // HAVING with nothing to group by is the whole table as one group, which
     // only means something if there is an aggregate to test.
     if having_raw.is_some() && !is_grouped {
         return Err("HAVING requires an aggregate in the SELECT list".to_string());
+    }
+    if let Some(text) = having_raw.as_deref() {
+        crate::core::rql::collation::refuse_in_having(text, schema)?;
     }
 
     // Every non-aggregate select item of a grouped query must be a grouping
@@ -3310,6 +3541,57 @@ mod tests {
         row_fetch_from_select_query(&purpose, &schema).unwrap();
         row_fetch_from_select_query(&purpose, &schema).unwrap();
         assert_eq!(parses() - before, 2);
+    }
+
+    /// Inside a memo scope a join planned again against the same relations
+    /// is not planned again (it is read to describe its columns, to find
+    /// their scales and to run); against other fields it is, and a
+    /// single-table parse in between does not lose it.
+    #[test]
+    fn a_memo_plans_a_join_once_per_set_of_fields() {
+        use crate::core::rql::join::{PLANS, plan_statement};
+        let schema = make_schema();
+        let plans = || PLANS.with(std::cell::Cell::get);
+        let sql = "SELECT a.id, b.name FROM users a JOIN users b ON a.id = b.id WHERE a.id = 1";
+        let purpose = QueryPurpose::QueryRows(crate::core::rql::lexer_s1::QueryRowsData {
+            table_name: "users".to_string(),
+            query: "SELECT id, name FROM users WHERE id = 1".to_string(),
+        });
+        let fields = std::cell::RefCell::new(schema.clone());
+        let schema_of = |name: &str| (name == "users").then(|| fields.borrow().clone());
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(parse_memo_scope(async {
+            let before = plans();
+            let first = plan_statement(sql, &schema_of).unwrap();
+            let again = plan_statement(sql, &schema_of).unwrap();
+            assert_eq!(plans() - before, 1, "the second read was planned again");
+            assert_eq!(format!("{first:?}"), format!("{again:?}"));
+            row_fetch_from_select_query(&purpose, &schema).unwrap();
+            plan_statement(sql, &schema_of).unwrap();
+            assert_eq!(plans() - before, 1, "a single-table parse lost the join's plan");
+
+            // Other fields (a DDL between a describe and a run).
+            fields.borrow_mut()[0].db_type = DbType::I32;
+            fields.borrow_mut()[0].size = 4;
+            let other = plan_statement(sql, &schema_of).unwrap();
+            assert_eq!(plans() - before, 2, "other fields must be planned against");
+            assert_ne!(format!("{other:?}"), format!("{first:?}"), "the fields did not reach the plan");
+
+            // A failing one is answered for itself, once.
+            let broken = "SELECT a.nope FROM users a JOIN users b ON a.id = b.id";
+            let e1 = plan_statement(broken, &schema_of).unwrap_err();
+            let e2 = plan_statement(broken, &schema_of).unwrap_err();
+            assert_eq!(e1, e2);
+            assert_eq!(plans() - before, 3);
+            // One plan is kept: the first statement again is planned again.
+            plan_statement(sql, &schema_of).unwrap();
+            assert_eq!(plans() - before, 4);
+        }));
+        // Outside a scope every read plans.
+        let before = plans();
+        plan_statement(sql, &schema_of).unwrap();
+        plan_statement(sql, &schema_of).unwrap();
+        assert_eq!(plans() - before, 2);
     }
 
     #[test]

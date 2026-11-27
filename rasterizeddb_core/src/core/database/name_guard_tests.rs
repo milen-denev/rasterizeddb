@@ -32,6 +32,8 @@ fn create_stmt(name: &str) -> CreateTable {
         primary_key: None,
         if_not_exists: false,
         is_immutable: false,
+        special: crate::core::row::schema::SpecialTable::None,
+        ledger_policy: Vec::new(),
     }
 }
 

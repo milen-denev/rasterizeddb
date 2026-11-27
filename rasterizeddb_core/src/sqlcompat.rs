@@ -157,8 +157,34 @@ pub(crate) fn quote_ident(name: &str) -> String {
 
 /// A name as the engine is sent it: folded to lower case, quoted when it
 /// would not survive unquoted.
+/// The engine keeps a name in at most this many bytes (indexes, keys,
+/// columns); SQL Server's `sysname` is 128 *characters*, and a stored name
+/// is longer in bytes: an index is `<table>__<name>`, a dot in a bracketed
+/// name three bytes (`mssql::lex::NAME_DOT`).
+pub(crate) const NAME_BYTES: usize = 128;
+
+/// A name longer than [`NAME_BYTES`] as one that fits: its first bytes (whole
+/// characters) and a hash of all of it, the same for every statement that
+/// names it, so a DROP or a rename finds what the CREATE made.
+pub(crate) fn fit_name(name: String) -> String {
+    if name.len() <= NAME_BYTES {
+        return name;
+    }
+    // FNV-1a: stable across builds and platforms, unlike the std hasher.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let mut cut = NAME_BYTES - 17;
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}_{h:016x}", &name[..cut])
+}
+
 pub(crate) fn ident_sql(name: &str) -> String {
-    let lower = name.to_lowercase();
+    let lower = fit_name(name.to_lowercase());
     let plain = !lower.is_empty()
         && lower
             .chars()

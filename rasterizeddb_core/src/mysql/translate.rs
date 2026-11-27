@@ -244,6 +244,11 @@ pub(crate) struct Forward {
     /// added when it is switched on again (a dump creates its tables in an
     /// order its keys do not follow).
     pub(crate) deferred: Vec<String>,
+    /// This front end's own statements on its catalogue that the DDL needs
+    /// (`ON_UPDATE_TABLE`), run after `statements` succeed and announced to
+    /// the session as the front end's (`PgBridge::system_query`), which is
+    /// what lets them past its catalogue guard.
+    pub(crate) system: Vec<String>,
 }
 
 /// The words that never start an implicit alias.
@@ -1945,6 +1950,7 @@ fn rewrite_insert(
         found_rows: None,
         params: 0,
         deferred: Vec::new(),
+        system: Vec::new(),
     })
 }
 
@@ -2176,6 +2182,7 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
         found_rows: None,
         params: 0,
         deferred: Vec::new(),
+        system: Vec::new(),
     })
 }
 
@@ -2241,6 +2248,7 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
             found_rows: None,
             params: 0,
             deferred: Vec::new(),
+            system: Vec::new(),
         });
     }
     let (table, after) =
@@ -2267,6 +2275,7 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
         found_rows: None,
         params: 0,
         deferred: Vec::new(),
+        system: Vec::new(),
     })
 }
 
@@ -2740,6 +2749,7 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
         found_rows: None,
         params: 0,
         deferred,
+        system: Vec::new(),
     })
 }
 
@@ -3069,6 +3079,7 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
         found_rows: None,
         params: 0,
         deferred: Vec::new(),
+        system: Vec::new(),
     })
 }
 
@@ -3197,6 +3208,7 @@ fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
             found_rows: None,
             params: 0,
             deferred: Vec::new(),
+            system: Vec::new(),
         });
     }
     let cols = index_columns(&tokens[paren + 1..close])?;
@@ -3222,6 +3234,7 @@ fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
         found_rows: None,
         params: 0,
         deferred: Vec::new(),
+        system: Vec::new(),
     })
 }
 
@@ -3299,6 +3312,7 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
         found_rows: None,
         params: 0,
         deferred: Vec::new(),
+        system: Vec::new(),
     })
 }
 
@@ -3349,6 +3363,7 @@ pub(crate) fn translate(
             found_rows: None,
             params: 0,
             deferred: Vec::new(),
+            system: Vec::new(),
         },
         "INSERT" => rewrite_insert(sql, tokens, &mut cx, false)?,
         "REPLACE" => rewrite_insert(sql, tokens, &mut cx, true)?,
@@ -3385,6 +3400,7 @@ pub(crate) fn translate(
                         found_rows: None,
                         params: 0,
                         deferred: Vec::new(),
+                        system: Vec::new(),
                     }
                 }
                 "VIEW" | "OR" => {
@@ -3407,6 +3423,7 @@ pub(crate) fn translate(
                         found_rows: None,
                         params: 0,
                         deferred: Vec::new(),
+                        system: Vec::new(),
                     }
                 }
                 other => return Err(MyError::unsupported(format!("CREATE {other}"))),
@@ -3431,6 +3448,7 @@ pub(crate) fn translate(
                 found_rows: None,
                 params: 0,
                 deferred: Vec::new(),
+                system: Vec::new(),
             }
         }
         "RENAME" => {
@@ -3458,6 +3476,7 @@ pub(crate) fn translate(
                 found_rows: None,
                 params: 0,
                 deferred: Vec::new(),
+                system: Vec::new(),
             }
         }
         "EXPLAIN" | "DESCRIBE" | "DESC" => {
@@ -3484,6 +3503,7 @@ pub(crate) fn translate(
                 found_rows: None,
                 params: 0,
                 deferred: Vec::new(),
+                system: Vec::new(),
             }
         }
         _ => Forward {
@@ -3492,9 +3512,10 @@ pub(crate) fn translate(
             found_rows: None,
             params: 0,
             deferred: Vec::new(),
+            system: Vec::new(),
         },
     };
-    forward.statements.extend(meta_statements(&cx));
+    forward.system = meta_statements(&cx);
     forward.params = params;
     Ok(forward)
 }
@@ -3526,6 +3547,7 @@ fn select_forward(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward
         found_rows,
         params: 0,
         deferred: Vec::new(),
+        system: Vec::new(),
     })
 }
 
@@ -3591,10 +3613,10 @@ mod tests {
 
     fn tr(env: &TestEnv, sql: &str) -> String {
         let tokens = lex(sql.as_bytes(), Mode::default()).unwrap();
-        translate(sql.as_bytes(), tokens, env, true)
-            .unwrap()
-            .statements
-            .join("; ")
+        let forward = translate(sql.as_bytes(), tokens, env, true).unwrap();
+        // The catalogue statements a DDL needs run after it, as the front
+        // end's own.
+        forward.statements.iter().chain(&forward.system).cloned().collect::<Vec<_>>().join("; ")
     }
 
     fn err(env: &TestEnv, sql: &str) -> MyError {

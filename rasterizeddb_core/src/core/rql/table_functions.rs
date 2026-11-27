@@ -58,6 +58,13 @@ pub enum JsonbFn {
     ObjectKeys,
     ToRecord,
     ToRecordset,
+    /// The `json` forms: the text as stored, an object's members in the
+    /// order written (and each of them), a value's own spelling.
+    JsonEach,
+    JsonEachText,
+    JsonArrayElements,
+    JsonArrayElementsText,
+    JsonObjectKeys,
 }
 
 /// Each jsonb function's name, longest first where one begins another.
@@ -69,6 +76,11 @@ const JSONB_FUNCTIONS: &[(&str, JsonbFn)] = &[
     ("JSONB_OBJECT_KEYS", JsonbFn::ObjectKeys),
     ("JSONB_TO_RECORDSET", JsonbFn::ToRecordset),
     ("JSONB_TO_RECORD", JsonbFn::ToRecord),
+    ("JSON_ARRAY_ELEMENTS_TEXT", JsonbFn::JsonArrayElementsText),
+    ("JSON_ARRAY_ELEMENTS", JsonbFn::JsonArrayElements),
+    ("JSON_EACH_TEXT", JsonbFn::JsonEachText),
+    ("JSON_EACH", JsonbFn::JsonEach),
+    ("JSON_OBJECT_KEYS", JsonbFn::JsonObjectKeys),
 ];
 
 /// A computed relation: its column names and types, and its rows as SQL
@@ -348,7 +360,7 @@ pub fn compute(item: &Item) -> Result<Computed, String> {
     // A single-column function named by its alias alone takes the alias's
     // name, as PostgreSQL names it.
     if item.columns.is_empty()
-        && matches!(item.kind, Kind::GenerateSeries(_) | Kind::Unnest(_) | Kind::Jsonb(JsonbFn::ObjectKeys, _))
+        && matches!(item.kind, Kind::GenerateSeries(_) | Kind::Unnest(_) | Kind::Jsonb(JsonbFn::ObjectKeys | JsonbFn::JsonObjectKeys, _))
         && computed.columns.len() - usize::from(item.ordinality) == 1
     {
         computed.columns[0].0 = item.alias.clone();
@@ -636,6 +648,9 @@ fn jsonb_rows(f: JsonbFn, args: &[String], definitions: &[String]) -> Result<Com
     };
     let columns = jsonb_columns(f, definitions)?;
     let value = constant(arg, &name)?;
+    if matches!(f, JsonbFn::JsonEach | JsonbFn::JsonEachText | JsonbFn::JsonArrayElements | JsonbFn::JsonArrayElementsText | JsonbFn::JsonObjectKeys) {
+        return json_rows(f, &name, &value, columns);
+    }
     let doc = match &value {
         Value::Null => return Ok(Computed { columns, rows: Vec::new() }),
         Value::Data { bytes, db_type: DbType::JSONB } => crate::core::jsonb::decode(bytes)?,
@@ -671,6 +686,8 @@ fn jsonb_rows(f: JsonbFn, args: &[String], definitions: &[String]) -> Result<Com
     };
     let mut rows: Vec<Vec<String>> = Vec::new();
     match f {
+        // Answered above (`json_rows`).
+        JsonbFn::JsonEach | JsonbFn::JsonEachText | JsonbFn::JsonArrayElements | JsonbFn::JsonArrayElementsText | JsonbFn::JsonObjectKeys => {}
         JsonbFn::Each | JsonbFn::EachText | JsonbFn::ObjectKeys => {
             let serde_json::Value::Object(map) = &doc else {
                 return Err(if f == JsonbFn::ObjectKeys {
@@ -727,6 +744,57 @@ fn jsonb_rows(f: JsonbFn, args: &[String], definitions: &[String]) -> Result<Com
     Ok(Computed { columns, rows })
 }
 
+/// The `json` functions' rows: read from the document's text as stored, so
+/// a value keeps its spelling and an object its members' order (and a key
+/// written twice, both), as PostgreSQL's `json` does.
+fn json_rows(f: JsonbFn, name: &str, value: &Value, columns: Vec<(String, DbType, String)>) -> Result<Computed, String> {
+    use crate::core::json_text;
+    let text = match value {
+        Value::Null => return Ok(Computed { columns, rows: Vec::new() }),
+        other => crate::core::rql::expr::as_text(other),
+    };
+    let quote = |t: &str| format!("'{}'", t.replace('\'', "''"));
+    // A value as JSON, or as `->>` gives it.
+    let cell = |span: json_text::Span, as_text: bool| -> Result<String, String> {
+        if !as_text {
+            return Ok(quote(&text[span]));
+        }
+        Ok(match json_text::as_text(&text, span)? {
+            Some(t) => quote(&t),
+            None => "NULL".to_string(),
+        })
+    };
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    match f {
+        JsonbFn::JsonArrayElements | JsonbFn::JsonArrayElementsText => match json_text::array_elements(&text)? {
+            Ok(spans) => {
+                for span in spans {
+                    rows.push(vec![cell(span, f == JsonbFn::JsonArrayElementsText)?]);
+                }
+            }
+            Err("an object") => return Err(format!("cannot call {name} on a non-array")),
+            Err(_) => return Err(format!("cannot call {name} on a scalar")),
+        },
+        _ => match json_text::object_members(&text)? {
+            Ok(members) => {
+                for (key, span) in members {
+                    rows.push(match f {
+                        JsonbFn::JsonObjectKeys => vec![quote(&key)],
+                        _ => vec![quote(&key), cell(span, f == JsonbFn::JsonEachText)?],
+                    });
+                }
+            }
+            Err(what) if f == JsonbFn::JsonObjectKeys => return Err(format!("cannot call {name} on {what}")),
+            Err("an array") => return Err("cannot deconstruct an array as an object".to_string()),
+            Err(_) => return Err("cannot deconstruct a scalar".to_string()),
+        },
+    }
+    if rows.len() > MAX_ROWS {
+        return Err(format!("{name} producing more than {MAX_ROWS} rows is not supported"));
+    }
+    Ok(Computed { columns, rows })
+}
+
 /// A jsonb function's columns: fixed for most, the definition list for the
 /// record functions (which PostgreSQL requires of them).
 fn jsonb_columns(f: JsonbFn, definitions: &[String]) -> Result<Vec<(String, DbType, String)>, String> {
@@ -737,6 +805,11 @@ fn jsonb_columns(f: JsonbFn, definitions: &[String]) -> Result<Vec<(String, DbTy
         JsonbFn::ArrayElements => vec![col("value", DbType::JSONB, "JSONB")],
         JsonbFn::ArrayElementsText => vec![col("value", DbType::STRING, "TEXT")],
         JsonbFn::ObjectKeys => vec![col("jsonb_object_keys", DbType::STRING, "TEXT")],
+        JsonbFn::JsonEach => vec![col("key", DbType::STRING, "TEXT"), col("value", DbType::JSONTEXT, "JSON")],
+        JsonbFn::JsonEachText => vec![col("key", DbType::STRING, "TEXT"), col("value", DbType::STRING, "TEXT")],
+        JsonbFn::JsonArrayElements => vec![col("value", DbType::JSONTEXT, "JSON")],
+        JsonbFn::JsonArrayElementsText => vec![col("value", DbType::STRING, "TEXT")],
+        JsonbFn::JsonObjectKeys => vec![col("json_object_keys", DbType::STRING, "TEXT")],
         JsonbFn::ToRecord | JsonbFn::ToRecordset => {
             if definitions.is_empty() {
                 return Err("a column definition list is required for functions returning \"record\"".to_string());
@@ -795,6 +868,13 @@ pub fn columns_of(item: &Item) -> Result<Vec<(String, DbType)>, String> {
 /// alone in a select list with no `FROM`: the `FROM` form it means.
 /// `None` for anything else.
 pub fn select_list_form(sql: &str) -> Option<String> {
+    select_list_form_as(sql, true)
+}
+
+/// [`select_list_form`]; with `named` false the one item carries no output
+/// name, for a subquery read by its value (`x IN (SELECT f(…))`), where the
+/// item becomes one side of a comparison.
+pub fn select_list_form_as(sql: &str, named: bool) -> Option<String> {
     let trimmed = sql.trim().trim_end_matches(';').trim_end();
     let body = trimmed.get(..7).filter(|w| w.eq_ignore_ascii_case("SELECT "))?;
     let _ = body;
@@ -803,10 +883,17 @@ pub fn select_list_form(sql: &str) -> Option<String> {
         return None;
     }
     let upper = list.to_ascii_uppercase();
+    // The json functions of one column: `value`, or the keys under the
+    // function's own name.
+    const ELEMENTS: [&str; 4] = ["jsonb_array_elements_text", "jsonb_array_elements", "json_array_elements_text", "json_array_elements"];
+    const KEYS: [&str; 2] = ["jsonb_object_keys", "json_object_keys"];
+    let starts = |n: &str| upper.starts_with(&n.to_ascii_uppercase()) && !upper.as_bytes().get(n.len()).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
     let name = if upper.starts_with("GENERATE_SERIES") {
         "generate_series"
     } else if upper.starts_with("UNNEST") {
         "unnest"
+    } else if let Some(n) = ELEMENTS.iter().chain(KEYS.iter()).find(|n| starts(n)) {
+        *n
     } else {
         return None;
     };
@@ -827,6 +914,14 @@ pub fn select_list_form(sql: &str) -> Option<String> {
         }
         alias.trim_matches('"').to_string()
     };
+    if ELEMENTS.contains(&name) {
+        // The relation under a name of its own: its column is `value`.
+        return Some(if named {
+            format!("SELECT __srf.value AS {label} FROM {call} AS __srf")
+        } else {
+            format!("SELECT __srf.value FROM {call} AS __srf")
+        });
+    }
     Some(format!("SELECT {label} FROM {call} AS {label}"))
 }
 

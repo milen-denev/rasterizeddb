@@ -714,7 +714,36 @@ pub fn relations_as_rows(database: &Database, sql: &str) -> Result<Option<String
 /// The sequences a statement's `nextval`/`currval`/`setval` calls name, read
 /// off its text (`nextval('s')`, `nextval('public.s'::regclass)`).
 pub fn named_in(sql: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_, name) in calls_in(sql) {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Each `nextval`/`currval`/`setval` call a statement makes, as (the
+/// function, the sequence), once per pair.
+pub fn calls_in(sql: &str) -> Vec<(&'static str, String)> {
+    use crate::core::sql_scan::{skip_comment, skip_quoted};
     let lower = sql.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    // Where calls can be: a call written inside a string, a quoted name or a
+    // comment (`'nextval(''t_id_seq'')'`, as a column default is reported)
+    // names no sequence.
+    let mut code = vec![true; bytes.len()];
+    let mut i = 0;
+    while i < bytes.len() {
+        match skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            Some(end) => {
+                let end = end.clamp(i + 1, bytes.len());
+                code[i..end].fill(false);
+                i = end;
+            }
+            None => i += 1,
+        }
+    }
     let mut out = Vec::new();
     for func in ["nextval", "currval", "setval"] {
         let mut from = 0;
@@ -722,7 +751,7 @@ pub fn named_in(sql: &str) -> Vec<String> {
             from = at + func.len();
             let before_ok = at == 0 || !(lower.as_bytes()[at - 1].is_ascii_alphanumeric() || lower.as_bytes()[at - 1] == b'_');
             let rest = lower[from..].trim_start();
-            if !before_ok || !rest.starts_with('(') {
+            if !before_ok || !code[at] || !rest.starts_with('(') {
                 continue;
             }
             let open = sql.len() - rest.len();
@@ -732,8 +761,9 @@ pub fn named_in(sql: &str) -> Vec<String> {
             let arg = arg.split("::").next().unwrap_or(arg).trim();
             if arg.starts_with('\'') && arg.ends_with('\'') && arg.len() >= 2 {
                 let name = sequence::sequence_name_of(&arg[1..arg.len() - 1].replace("''", "'"));
-                if !out.contains(&name) {
-                    out.push(name);
+                let call = (func, name);
+                if !out.contains(&call) {
+                    out.push(call);
                 }
             }
         }
@@ -784,5 +814,8 @@ mod tests {
             named_in("SELECT nextval('public.s'::regclass), currval('\"S\"'), setval('t_id_seq', 5), xnextval('q')"),
             vec!["s", "S", "t_id_seq"]
         );
+        // A call inside a string, a quoted name or a comment is text.
+        assert!(named_in("SELECT 'nextval(''t_id_seq'')' AS d, \"currval('q')\" -- setval('r', 1)\n").is_empty());
+        assert_eq!(named_in("SELECT 'x', nextval('s') /* currval('q') */"), vec!["s"]);
     }
 }

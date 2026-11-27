@@ -174,6 +174,18 @@ pub enum Expr {
         steps: Vec<crate::core::jsonb::Step>,
         as_text: bool,
     },
+    /// `doc #> ARRAY[k1, k2]` / `#>>` with path elements that are not
+    /// constants (columns, parameters already bound, expressions): each
+    /// element's text is a `#>` step, an object's key or an array's position
+    /// as the container decides (`jsonb::Step::Either`), as in PostgreSQL. A
+    /// NULL element makes the result NULL. A path of constants is rewritten
+    /// to a literal path before parsing (`sql_scan::json_path_arrays`); this
+    /// is the rest, which failed to parse.
+    DynamicPath {
+        base: Box<Expr>,
+        keys: Vec<Expr>,
+        as_text: bool,
+    },
 }
 
 /// The modifier of a cast the evaluator applies ([`Expr::TypmodCast`]).
@@ -412,6 +424,9 @@ pub enum TextFunc {
     /// read; `CiAiKey` for case and accents.
     CiKey,
     CiAiKey,
+    /// `__rdb_guid_key(uuid)`: a `uuid`'s key in SQL Server's order
+    /// (`collation::Strength::GuidOrder`).
+    GuidKey,
     /// `date_trunc('minute', ts)` — an instant floored to a unit.
     DateTrunc,
     /// `to_tsvector(config, document)` — a document reduced to its lexemes.
@@ -457,6 +472,16 @@ pub enum TextFunc {
     Round,
     /// `trunc(x [, places])`: [`TextFunc::Round`] toward zero.
     Trunc,
+    /// `__rdb_round_kept(x, places)`: SQL Server's `ROUND`, which rounds the
+    /// value and keeps its type: a `decimal(19,6)` stays one (7.99 is
+    /// 7.990000, where `round(x, 2)` is a numeric of two places), a float
+    /// stays a float (PostgreSQL has no `round(double precision, integer)`)
+    /// and an integer an integer (`ROUND(12345, -2)` is 12300). Half away
+    /// from zero in each. `mssql::translate` writes it.
+    RoundKept,
+    /// `__rdb_trunc_kept(x, places)`: [`TextFunc::RoundKept`] toward zero,
+    /// SQL Server's `ROUND(x, places, 1)`.
+    TruncKept,
     /// `EXTRACT(field FROM x)`: a `numeric`, as PostgreSQL 14 and later
     /// return it, at the field's display scale (six places for `SECOND` and
     /// `EPOCH`, three for `MILLISECONDS`, none otherwise).
@@ -572,8 +597,12 @@ pub fn needs_evaluation(text: &str) -> bool {
     // A path into a document is an expression, not a column name. Asked
     // structurally rather than by looking for `->`, so `#>` and `#>>` are
     // covered too and a column whose *name* contains an arrow is not.
-    if crate::core::jsonb::parse_path_expression(trimmed).is_some()
+    if crate::core::jsonb::parse_path_expression_any(trimmed).is_some()
         || crate::core::jsonb::parse_qualified_path_expression(trimmed).is_some()
+        // `(doc) #> '{a}'`, `(doc -> 'a') #>> '{}'`: a path over a group. It
+        // reached the select list's call branch, the leading `(` a call
+        // named nothing ("function '' is not supported yet").
+        || path_over_expression(trimmed).is_some()
     {
         return true;
     }
@@ -701,6 +730,16 @@ fn cast_target(name: &str) -> Option<DbType> {
             "BIGINT" | "INT8" | "INT64" => DbType::I64,
             "INT" | "INTEGER" | "INT4" => DbType::I32,
             "SMALLINT" | "INT2" => DbType::I16,
+            // The engine's own one-byte and unsigned integers, by the names
+            // a column is declared with (`lexer_ac`). A column could be made
+            // `utinyint` (SQL Server's tinyint) and not compared with
+            // `CAST(1 AS utinyint)`, which EF Core writes for every byte
+            // constant: "cast to 'utinyint' is not supported yet".
+            "TINYINT" | "INT1" => DbType::I8,
+            "UTINYINT" | "UINT1" => DbType::U8,
+            "USMALLINT" | "UINT16" | "UINT2" => DbType::U16,
+            "UINT" | "UINT32" | "UINT4" => DbType::U32,
+            "UBIGINT" | "UINT64" | "UINT8" => DbType::U64,
             "TEXT" | "VARCHAR" | "CHARACTER VARYING" => DbType::STRING,
             // `character(n)`: text, held to its length by the cast's
             // modifier (`Expr::TypmodCast`).
@@ -843,6 +882,26 @@ fn cast_to(inner: Expr, target: &str) -> Result<Expr, String> {
     Ok(cast)
 }
 
+/// Whether `text` reads as a value of `target` (`pg_input_is_valid`): the
+/// cast a `CAST(text AS target)` makes, made; an unknown type is an error,
+/// as PostgreSQL's is.
+pub(crate) fn input_is_valid(text: &str, target: &str) -> Result<bool, String> {
+    let literal = Expr::Literal { bytes: text.as_bytes().to_vec(), db_type: DbType::STRING };
+    let cast = cast_to(literal, target)?;
+    Ok(eval(&cast, &Row::default(), &[]).is_ok())
+}
+
+/// The microseconds `text` cast to `target` (a timestamp, timestamptz or
+/// time) is read as, by the cast a statement makes.
+pub(crate) fn cast_text_micros(text: &str, target: &str) -> Option<i64> {
+    let literal = Expr::Literal { bytes: text.as_bytes().to_vec(), db_type: DbType::STRING };
+    match eval(&cast_to(literal, target).ok()?, &Row::default(), &[]).ok()? {
+        Value::Data { bytes, db_type: DbType::TIME } => Some(i64::from_be_bytes(bytes.get(..8)?.try_into().ok()?)),
+        Value::Data { bytes, .. } => Some(i64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)),
+        Value::Null => None,
+    }
+}
+
 /// Position of a top-level `::`, if the expression ends in a cast.
 fn top_level_cast(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
@@ -972,10 +1031,11 @@ pub(crate) fn case_block_end(text: &str) -> Option<usize> {
 pub const FUNCTIONS: &[&str] = &[
     "COALESCE", "NULLIF", "LEAST", "GREATEST", "QUOTE_IDENT", "LOWER", "UPPER", "LENGTH", "CHAR_LENGTH",
     "CHARACTER_LENGTH", "OCTET_LENGTH", "DATE_TRUNC", "REPLACE", "ARRAY_LENGTH", "ARRAY_NDIMS",
-    "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "ROUND", "TRUNC", "DATE_PART", "MOD", "BTRIM", "LTRIM", "RTRIM", "RPAD", "LPAD", "JSONB_TYPEOF",
+    "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "ROUND", "TRUNC", "__RDB_ROUND_KEPT", "__RDB_TRUNC_KEPT", "DATE_PART", "MOD", "BTRIM", "LTRIM", "RTRIM", "RPAD", "LPAD", "JSONB_TYPEOF",
     "REGEXP_LIKE", "SIMILAR_TO_ESCAPE", "__CHECK_REGEXP_LIKE", "__CHECK_REGEXP_UNCERTAIN",
     "TO_TSVECTOR", "TO_TSQUERY", "PLAINTO_TSQUERY", "PHRASETO_TSQUERY", "WEBSEARCH_TO_TSQUERY", "TS_MATCH_VQ",
     "TS_MATCH_TQ", "TS_MATCH_TT", "TS_RANK",
+    "JSONB_EXTRACT_PATH", "JSONB_EXTRACT_PATH_TEXT", "JSON_EXTRACT_PATH", "JSON_EXTRACT_PATH_TEXT",
 ];
 
 /// Whether `name` (any case) is a function this evaluator calls: one of
@@ -1024,7 +1084,13 @@ pub(crate) fn path_operator_refusal(column: &SchemaField, text: &str) -> Option<
     let at = after_column.find(['-', '#'])?;
     let rest = &after_column[at..];
     let operator = ["#>>", "#>", "->>", "->"].into_iter().find(|op| rest.starts_with(op))?;
-    Some(format!("operator does not exist: {name} {operator} unknown"))
+    // The right side as PostgreSQL types it: a number is an integer, a
+    // quoted constant not yet anything.
+    let operand = match rest[operator.len()..].trim_start().bytes().next() {
+        Some(b) if b.is_ascii_digit() || b == b'-' => "integer",
+        _ => "unknown",
+    };
+    Some(format!("operator does not exist: {name} {operator} {operand}"))
 }
 
 /// `text` as an operand and the path steps after it, when it is a path over
@@ -1055,7 +1121,7 @@ fn path_over_expression(text: &str) -> Option<(&str, (crate::core::jsonb::PathEx
     }
     let operator = ["#>>", "#>", "->>", "->"].into_iter().find(|op| text[at..].starts_with(op))?;
     // The steps read by the one path parser, over a stand-in column.
-    let path = crate::core::jsonb::parse_path_expression(&format!("x{}", &text[at..]))?;
+    let path = crate::core::jsonb::parse_path_expression_any(&format!("x{}", &text[at..]))?;
     Some((base, (path, operator)))
 }
 
@@ -1478,7 +1544,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         match path_at {
             Some(at) => {
                 if let (Some(path), Some(operator)) = (
-                    crate::core::jsonb::parse_path_expression(&format!("x{}", &text[at..])),
+                    crate::core::jsonb::parse_path_expression_any(&format!("x{}", &text[at..])),
                     ["#>>", "#>", "->>", "->"].into_iter().find(|op| text[at..].starts_with(op)),
                 ) {
                     let base = parse(text[..at].trim_end(), schema)?;
@@ -1514,7 +1580,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     // relations' `doc` never meet here under one name. Unread, the whole
     // `t.doc->>'k'` was looked up as a column ("not found in schema"), which
     // failed every ORM query reading a document field.
-    let path = crate::core::jsonb::parse_path_expression(text)
+    let path = crate::core::jsonb::parse_path_expression_any(text)
         .or_else(|| crate::core::jsonb::parse_qualified_path_expression(text).map(|(_, path)| path));
     if let Some(path) = path {
         if let Some(column) = schema
@@ -1536,6 +1602,21 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     // `'{"a":1}'::jsonb->'a'`, `to_jsonb(x)->>0`. `::` binds tighter than
     // `->`, so the cast is the operand rather than the arrow being part of
     // its type name.
+    if let Some((lhs, as_text, elements)) = dynamic_path(text) {
+        let base = parse(lhs, schema)?;
+        if !yields_json_text(&base) && static_type(&base) != DbType::JSONB {
+            return Err(format!(
+                "operator does not exist: {} {} text[]",
+                pg_operand_type_name(&base),
+                if as_text { "#>>" } else { "#>" }
+            ));
+        }
+        let keys = crate::core::sql_scan::split_top_level(elements, b',')
+            .into_iter()
+            .map(|k| parse(k, schema))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Expr::DynamicPath { base: Box::new(base), keys, as_text });
+    }
     if let Some((base, path)) = path_over_expression(text) {
         let base = parse(base, schema)?;
         let json_text = yields_json_text(&base);
@@ -2013,6 +2094,27 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             };
 
             let upper_name = name.to_ascii_uppercase();
+            // `jsonb_extract_path(doc, k1, k2)` / `_text`: `doc #> ARRAY[k1,
+            // k2]` / `#>>`, each key a `#>` step.
+            if let Some(as_text) = match upper_name.as_str() {
+                "JSONB_EXTRACT_PATH" | "JSON_EXTRACT_PATH" => Some(false),
+                "JSONB_EXTRACT_PATH_TEXT" | "JSON_EXTRACT_PATH_TEXT" => Some(true),
+                _ => None,
+            } {
+                let mut args = args;
+                if args.len() < 2 {
+                    return Err(format!("function {}() needs a document and at least one path element", name.to_ascii_lowercase()));
+                }
+                let base = args.remove(0);
+                if !yields_json_text(&base) && static_type(&base) != DbType::JSONB {
+                    return Err(format!(
+                        "function {}({}, …) does not exist",
+                        name.to_ascii_lowercase(),
+                        pg_operand_type_name(&base)
+                    ));
+                }
+                return Ok(Expr::DynamicPath { base: Box::new(base), keys: args, as_text });
+            }
             let mut args = args;
             if matches!(
                 upper_name.as_str(),
@@ -2055,7 +2157,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     blank_pad_text_branches(args.iter_mut());
                     Ok(Expr::Greatest(args))
                 }
-                "QUOTE_IDENT" | "LOWER" | "UPPER" | "__RDB_CI_KEY" | "__RDB_CI_AI_KEY" => {
+                "QUOTE_IDENT" | "LOWER" | "UPPER" | "__RDB_CI_KEY" | "__RDB_CI_AI_KEY" | "__RDB_GUID_KEY" => {
                     if args.len() != 1 {
                         return Err(format!("{} takes exactly one argument", upper_name));
                     }
@@ -2106,6 +2208,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         "LOWER" => TextFunc::Lower,
                         "__RDB_CI_KEY" => TextFunc::CiKey,
                         "__RDB_CI_AI_KEY" => TextFunc::CiAiKey,
+                        "__RDB_GUID_KEY" => TextFunc::GuidKey,
                         _ => TextFunc::Upper,
                     };
                     Ok(Expr::Call(func, args))
@@ -2268,6 +2371,37 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         return Err("abs takes exactly one argument".to_string());
                     }
                     Ok(Expr::Call(TextFunc::Abs, args))
+                }
+                "__RDB_ROUND_KEPT" | "__RDB_TRUNC_KEPT" => {
+                    let mut args = args;
+                    let func = if upper_name == "__RDB_TRUNC_KEPT" { TextFunc::TruncKept } else { TextFunc::RoundKept };
+                    if args.len() != 2 {
+                        return Err("round takes a number and the places".to_string());
+                    }
+                    if matches!(&args[0], Expr::Null) {
+                        return Ok(Expr::Null);
+                    }
+                    // An untyped string constant is a numeric one.
+                    if matches!(&args[0], Expr::Literal { db_type: DbType::STRING, .. }) {
+                        let literal = args.remove(0);
+                        args.insert(0, Expr::Cast(Box::new(literal), DbType::DECIMAL));
+                    }
+                    let ty = static_type(&args[0]);
+                    if !(matches!(ty, DbType::DECIMAL | DbType::F32 | DbType::F64) || is_integer_type(&ty)) {
+                        return Err(format!("argument data type {} is invalid for argument 1 of round function", ty.to_string().to_lowercase()));
+                    }
+                    if columns_of(&args[1]).is_empty() {
+                        args[1] = match eval(&args[1], &Row::default(), &[])? {
+                            Value::Null => Expr::Null,
+                            value => {
+                                let p = as_i64(&value).ok_or_else(|| "the places of round must be an integer".to_string())?;
+                                Expr::Literal { bytes: (p.clamp(-1000, 1000) as i32).to_le_bytes().to_vec(), db_type: DbType::I32 }
+                            }
+                        };
+                    } else if !is_integer_type(&static_type(&args[1])) {
+                        return Err("the places of round must be an integer".to_string());
+                    }
+                    Ok(Expr::Call(func, args))
                 }
                 "ROUND" | "TRUNC" => {
                     let mut args = args;
@@ -3720,6 +3854,12 @@ pub fn columns_of(expr: &Expr) -> Vec<SchemaField> {
                 }
             }
             Expr::PathOf { base, .. } => walk(base, out),
+            Expr::DynamicPath { base, keys, .. } => {
+                walk(base, out);
+                for key in keys {
+                    walk(key, out);
+                }
+            }
             Expr::Concat(a, b) => {
                 walk(a, out);
                 walk(b, out);
@@ -3843,7 +3983,7 @@ pub fn static_type(expr: &Expr) -> DbType {
         }
         // As a column's path: `->>` text, `->` the base's own kind, a `json`
         // one travelling as text (`yields_json_text`).
-        Expr::PathOf { base, as_text, .. } => {
+        Expr::PathOf { base, as_text, .. } | Expr::DynamicPath { base, as_text, .. } => {
             if *as_text || yields_json_text(base) {
                 DbType::STRING
             } else {
@@ -3896,6 +4036,8 @@ pub fn static_type(expr: &Expr) -> DbType {
         Expr::Call(TextFunc::TsRank, _) => DbType::F32,
         // The argument's own type, as PostgreSQL's `abs` family returns.
         Expr::Call(TextFunc::Abs, args) => args.first().map(static_type).unwrap_or(DbType::I32),
+        // The argument's own type: what SQL Server's `ROUND` returns.
+        Expr::Call(TextFunc::RoundKept | TextFunc::TruncKept, args) => args.first().map(static_type).unwrap_or(DbType::DECIMAL),
         // `round(numeric)` and `round(…, places)` are NUMERIC; `round` of an
         // integer or a float alone is `double precision`.
         Expr::Call(TextFunc::Round | TextFunc::Trunc, args) => {
@@ -4074,6 +4216,8 @@ pub fn display_scale(expr: &Expr) -> Option<u32> {
             None => Some(0),
             Some(places) => round_places(places).map(|p| p.max(0) as u32).filter(|s| *s <= DECIMAL_SCALE),
         },
+        // The places the argument is shown at: its type is kept.
+        Expr::Call(TextFunc::RoundKept | TextFunc::TruncKept, args) => args.first().and_then(display_scale),
         Expr::NumericCast { scale, .. } => Some(*scale),
         // A cast to plain `numeric` keeps the places of an exact value.
         Expr::Cast(inner, DbType::DECIMAL)
@@ -4576,6 +4720,29 @@ pub(crate) fn pg_integer_text(text: &str) -> Option<i128> {
     Some(if negative { -value } else { value })
 }
 
+/// `lhs #> ARRAY[…]` / `#>>` at the top level, the array closing the text:
+/// the operand, whether text is wanted, and the elements' text.
+fn dynamic_path(text: &str) -> Option<(&str, bool, &str)> {
+    let nesting = Nesting::of(text);
+    let bytes = text.as_bytes();
+    let at = (0..bytes.len().saturating_sub(1)).find(|&i| bytes[i] == b'#' && bytes[i + 1] == b'>' && nesting.top_level(i))?;
+    let as_text = bytes.get(at + 2) == Some(&b'>');
+    let rest = text[at + if as_text { 3 } else { 2 }..].trim_start();
+    if rest.len() < 6 || !rest[..5].eq_ignore_ascii_case("ARRAY") {
+        return None;
+    }
+    let after = rest[5..].trim_start();
+    if !after.starts_with('[') {
+        return None;
+    }
+    let close = crate::core::sql_scan::matching_close(after, 0)?;
+    if !after[close + 1..].trim().is_empty() {
+        return None;
+    }
+    let lhs = text[..at].trim();
+    (!lhs.is_empty()).then_some((lhs, as_text, &after[1..close]))
+}
+
 pub(crate) fn as_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -4627,6 +4794,7 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             | TextFunc::Upper
             | TextFunc::CiKey
             | TextFunc::CiAiKey
+            | TextFunc::GuidKey
             | TextFunc::QuoteIdent
             | TextFunc::ToTsVector
             | TextFunc::ToTsQuery
@@ -4860,6 +5028,10 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             &as_text(&args[0]),
             crate::core::rql::collation::Strength::CaseAccentInsensitive,
         )),
+        TextFunc::GuidKey => string(crate::core::rql::collation::key(
+            &as_text(&args[0]),
+            crate::core::rql::collation::Strength::GuidOrder,
+        )),
         TextFunc::Upper => string(crate::core::rql::pg_functions::pg_upper(&as_text(&args[0]))),
 
         // Full-text search. Both sides carry their canonical text form — see
@@ -5075,6 +5247,51 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
                     bytes: (v.m as f64 / 10f64.powi(v.s as i32)).to_le_bytes().to_vec(),
                     db_type: DbType::F64,
                 },
+            }
+        }
+        TextFunc::RoundKept | TextFunc::TruncKept => {
+            let toward_zero = func == TextFunc::TruncKept;
+            let Value::Data { bytes, db_type } = &args[0] else {
+                return Ok(Value::Null);
+            };
+            let places = match args.get(1) {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(p) => as_i64(p).ok_or_else(|| "the places must be an integer".to_string())?.clamp(-1000, 1000) as i32,
+            };
+            match db_type {
+                DbType::DECIMAL => {
+                    let v = decimal_value_as_pgnum(bytes)?;
+                    let r = if toward_zero { v.trunc_places(places) } else { v.round_places(places) }
+                        .and_then(|r| r.round_to(v.s))
+                        .ok_or_else(|| PAST_38_DIGITS.to_string())?;
+                    pgnum_as_decimal_value(r)
+                }
+                DbType::F32 | DbType::F64 => {
+                    let f = as_f64(&args[0]).ok_or_else(|| format!("round is not defined for {}", db_type))?;
+                    // Past the digits a float holds there is nothing to round.
+                    let unit = 10f64.powi(places.clamp(-400, 400));
+                    let scaled = f * unit;
+                    let r = if !scaled.is_finite() || unit == 0.0 {
+                        if unit == 0.0 { 0.0 } else { f }
+                    } else if toward_zero {
+                        scaled.trunc() / unit
+                    } else {
+                        scaled.round() / unit
+                    };
+                    cast(Value::Data { bytes: r.to_le_bytes().to_vec(), db_type: DbType::F64 }, db_type)?
+                }
+                t if is_integer_type(t) => {
+                    if places >= 0 {
+                        return Ok(args[0].clone());
+                    }
+                    let v = as_i64(&args[0]).map(|v| crate::core::rql::pg_numeric::PgNum::int(v as i128)).ok_or_else(|| format!("round is not defined for {}", db_type))?;
+                    let r = if toward_zero { v.trunc_places(places) } else { v.round_places(places) }
+                        .and_then(|r| r.units_at(0))
+                        .and_then(|units| i64::try_from(units).ok())
+                        .ok_or_else(|| "arithmetic overflow error converting expression to data type int".to_string())?;
+                    cast(Value::Data { bytes: r.to_le_bytes().to_vec(), db_type: DbType::I64 }, db_type)?
+                }
+                other => return Err(format!("round is not defined for {}", other)),
             }
         }
         TextFunc::Round | TextFunc::Trunc => {
@@ -6401,6 +6618,25 @@ pub(crate) fn pg_numeric(
             let field = args.first().and_then(field_literal).ok_or("EXTRACT lost its field")?;
             Some(date_field_value(field, &eval(&args[1], row, schema)?)?)
         }
+        // The value rounded, at the places it had.
+        Expr::Call(func @ (TextFunc::RoundKept | TextFunc::TruncKept), args) if static_type(expr) == DbType::DECIMAL => {
+            let places = match args.get(1) {
+                None | Some(Expr::Null) => None,
+                Some(places) => match round_places(places) {
+                    Some(p) => Some(p),
+                    None => as_i64(&eval(places, row, schema)?).map(|p| p.clamp(-1000, 1000) as i32),
+                },
+            };
+            match (pg_numeric(&args[0], row, schema)?, places) {
+                (None, _) => None,
+                (Some(None), _) | (_, None) => Some(None),
+                (Some(Some(v)), Some(p)) => Some(Some(
+                    if *func == TextFunc::TruncKept { v.trunc_places(p) } else { v.round_places(p) }
+                        .and_then(|r| r.round_to(v.s))
+                        .ok_or_else(|| PAST_38_DIGITS.to_string())?,
+                )),
+            }
+        }
         Expr::Call(func @ (TextFunc::Round | TextFunc::Trunc), args) if static_type(expr) == DbType::DECIMAL => {
             let places = match args.get(1) {
                 None => Some(0),
@@ -6519,7 +6755,13 @@ fn numeric_product_or_quotient(expr: &Expr) -> bool {
             whens.iter().any(|(_, r)| numeric_product_or_quotient(r))
                 || otherwise.as_deref().is_some_and(numeric_product_or_quotient)
         }
-        Expr::Column(_) | Expr::Literal { .. } | Expr::Null | Expr::Scalar(_) | Expr::JsonPath { .. } | Expr::PathOf { .. } => false,
+        Expr::Column(_)
+        | Expr::Literal { .. }
+        | Expr::Null
+        | Expr::Scalar(_)
+        | Expr::JsonPath { .. }
+        | Expr::PathOf { .. }
+        | Expr::DynamicPath { .. } => false,
     }
 }
 
@@ -6536,7 +6778,7 @@ fn reads_wide_decimal(expr: &Expr, schema: &[SchemaField]) -> bool {
                 f.db_type == DbType::DECIMAL && f.scale.is_some_and(|s| s > crate::core::value_codec::DECIMAL_SCALE)
             }
             Expr::Literal { .. } => is_wide_literal(expr),
-            Expr::Null | Expr::Scalar(_) | Expr::JsonPath { .. } | Expr::PathOf { .. } => false,
+            Expr::Null | Expr::Scalar(_) | Expr::JsonPath { .. } | Expr::PathOf { .. } | Expr::DynamicPath { .. } => false,
             Expr::Concat(a, b) | Expr::NullIf(a, b) | Expr::Mod(a, b) | Expr::Arith(a, _, b) => wide(a) || wide(b),
             Expr::Call(_, args) | Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => args.iter().any(wide),
             Expr::Cast(inner, _) => wide(inner),
@@ -7794,7 +8036,7 @@ pub(crate) fn yields_json_text(expr: &Expr) -> bool {
     match expr {
         Expr::Column(field) => field.json_text,
         Expr::JsonPath { column, as_text, .. } => column.json_text && !as_text,
-        Expr::PathOf { base, as_text, .. } => yields_json_text(base) && !as_text,
+        Expr::PathOf { base, as_text, .. } | Expr::DynamicPath { base, as_text, .. } => yields_json_text(base) && !as_text,
         Expr::Cast(_, DbType::JSONTEXT) => true,
         Expr::Call(TextFunc::Pg(func), _) => crate::core::rql::pg_functions::yields_json_text(*func),
         _ => false,
@@ -8373,6 +8615,22 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 Value::Null => return Ok(Value::Null),
             };
             path_value(&document, steps, *as_text, column.json_text)?
+        }
+        Expr::DynamicPath { base, keys, as_text: wants_text } => {
+            let json_text = yields_json_text(base);
+            let document = match eval(base, row, schema)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Data { bytes, .. } if json_text => bytes,
+                value => as_jsonb(value)?,
+            };
+            let mut steps = Vec::with_capacity(keys.len());
+            for key in keys {
+                match eval(key, row, schema)? {
+                    Value::Null => return Ok(Value::Null),
+                    value => steps.push(crate::core::jsonb::Step::Either(as_text(&value))),
+                }
+            }
+            path_value(&document, &steps, *wants_text, json_text)?
         }
         Expr::PathOf { base, steps, as_text } => {
             let json_text = yields_json_text(base);
@@ -9294,6 +9552,20 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
         bytes,
         db_type: db_type.clone(),
     };
+    // An integer to a boolean: zero is false, anything else true, as
+    // PostgreSQL casts one (`5::boolean` is true) and as SQL Server makes a
+    // bit. Through its text below, only 0 and 1 were values ("invalid input
+    // syntax for type boolean: \"5\"").
+    if *target == DbType::BOOL
+        && matches!(
+            db_type,
+            DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64
+        )
+    {
+        if let Some(n) = as_i64(&value) {
+            return Ok(Value::Data { bytes: vec![u8::from(n != 0)], db_type: DbType::BOOL });
+        }
+    }
     if let Some(n) = as_i64(&value) {
         // A narrowing that does not fit is PostgreSQL's `integer out of range`,
         // never the low bytes: `3000000000::bigint::int` was -1294967296.

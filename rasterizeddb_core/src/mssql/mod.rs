@@ -14,10 +14,13 @@
 //! The password travels inside TLS (TDS encrypts the whole connection here;
 //! login-only encryption is not offered). Windows authentication is not.
 
+pub(crate) mod accounts;
+pub(crate) mod applock;
 pub(crate) mod conn;
 pub(crate) mod fulltext;
 pub(crate) mod lex;
 pub(crate) mod merge;
+pub(crate) mod openjson;
 pub(crate) mod routines;
 pub(crate) mod tds;
 pub(crate) mod translate;
@@ -87,6 +90,20 @@ pub struct MsConfig {
     pub bootstrap_user: String,
     pub bootstrap_password: Option<String>,
     pub limits: ConnectionLimits,
+    /// Text columns a `CREATE TABLE` / `ADD COLUMN` makes without a
+    /// `COLLATE` compare without case, as under SQL Server's default
+    /// collation (`SQL_Latin1_General_CP1_CI_AS`): each is given the
+    /// engine's `rdb_ci`. Off, they compare by their bytes.
+    pub case_insensitive: bool,
+    /// The error number a duplicate in a unique *index* is reported with:
+    /// 2601, as SQL Server's (a PRIMARY KEY or UNIQUE constraint is 2627),
+    /// or 2627 for applications that only test for that one.
+    pub unique_index_error: i32,
+    /// `uniqueidentifier` columns a `CREATE TABLE` / `ADD COLUMN` makes
+    /// order as SQL Server's (the engine's `rdb_guid_order`: ORDER BY,
+    /// `<`, `>`, BETWEEN, min/max follow its last six bytes first). Off,
+    /// they order by their bytes, as PostgreSQL's `uuid`.
+    pub guid_order: bool,
 }
 
 pub(crate) struct Shared {
@@ -95,6 +112,11 @@ pub(crate) struct Shared {
     pub(crate) acceptor: Option<tokio_rustls::TlsAcceptor>,
     pub(crate) active: AtomicUsize,
     pub(crate) stopping: tokio::sync::watch::Sender<bool>,
+    /// Databases' names as CREATE DATABASE declared them, by the engine's
+    /// (folded) name: read once from the default database's
+    /// `translate::NAMES_TABLE`, kept up to date by this listener's
+    /// CREATE and DROP DATABASE.
+    pub(crate) database_names: parking_lot::Mutex<Option<std::collections::HashMap<String, String>>>,
 }
 
 pub struct MsListener {
@@ -207,6 +229,7 @@ pub async fn serve(listener: MsListener, catalog: Arc<DatabaseCatalog>) -> io::R
         acceptor,
         active: AtomicUsize::new(0),
         stopping,
+        database_names: parking_lot::Mutex::new(None),
     });
     let serving = shared.clone();
     let task = tokio::spawn(async move { accept_loop(listener, serving).await });

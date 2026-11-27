@@ -17,28 +17,13 @@ use super::map::PointRange;
 use crate::core::hash::xxh64;
 
 /// Seed of level 0; level `i` uses `LEVEL_SEED + i` ("RDBPRT").
-pub const LEVEL_SEED: u64 = 0x5244_4250_5254_0000;
+pub use rasterizeddb_router::key::LEVEL_SEED;
 
 /// At most three key columns (§1b, "Widths").
-pub const MAX_ARITY: usize = 3;
+pub use rasterizeddb_router::key::MAX_ARITY;
 
 /// A normalisation, and the tag that keeps families apart in the frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum KeyFamily {
-    /// I8–I128 and U8–U64, as an `i128`, 16 bytes little-endian.
-    Integer = 0x01,
-    /// The 16 stored octets.
-    Uuid = 0x02,
-    /// The UTF-8 bytes, as stored.
-    Text = 0x03,
-}
-
-impl KeyFamily {
-    pub fn tag(self) -> u8 {
-        self as u8
-    }
-}
+pub use rasterizeddb_router::key::KeyFamily;
 
 /// The family a column of type `t` hashes in, or why it may not be a key.
 ///
@@ -191,19 +176,8 @@ pub fn route_bytes(t: &DbType, column: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// `family:u8 ‖ len:u32 LE ‖ bytes`.
-pub fn frame(family: KeyFamily, normalised: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(5 + normalised.len());
-    push_frame(family, normalised, &mut out);
-    out
-}
-
-fn push_frame(family: KeyFamily, normalised: &[u8], out: &mut impl Extend<u8>) {
-    // Callers check the length fits; a frame never truncates it.
-    let len = u32::try_from(normalised.len()).expect("frame length checked by caller");
-    out.extend([family.tag()]);
-    out.extend(len.to_le_bytes());
-    out.extend(normalised.iter().copied());
-}
+pub use rasterizeddb_router::key::frame;
+use rasterizeddb_router::key::push_frame;
 
 /// `H_i = XXH64(frame(family, normalised), LEVEL_SEED + i)`.
 pub fn level_hash(level: usize, family: KeyFamily, normalised: &[u8]) -> Result<u64, String> {
@@ -351,30 +325,13 @@ impl KeySpec {
     }
 }
 
-/// The points under fixed level hashes: each fills the top `widths[i]` bits
-/// of its level, and the levels not given span everything below. Split out
-/// so the top block, which no known value hashes into, can be tested: its
-/// `hi` is 2⁶⁴, one past what a `u64` holds.
+/// The points under fixed level hashes (`rasterizeddb_router::key::assemble`).
 fn assemble(hashes: &[u64], widths: &[u32]) -> PointRange {
-    let mut lo: u64 = 0;
-    let mut low_bits: u32 = 64;
-    for (&h, &w) in hashes.iter().zip(widths) {
-        low_bits -= w;
-        lo |= (h >> (64 - w)) << low_bits;
-    }
-    PointRange {
-        lo,
-        hi: lo as u128 + (1u128 << low_bits),
-    }
+    rasterizeddb_router::key::assemble(hashes, widths)
 }
 
 fn widths(arity: usize) -> &'static [u32] {
-    match arity {
-        1 => &[48],
-        2 => &[48, 16],
-        3 => &[48, 8, 8],
-        _ => unreachable!("KeySpec::new bounds the arity"),
-    }
+    rasterizeddb_router::key::widths(arity).expect("KeySpec::new bounds the arity")
 }
 
 #[cfg(test)]
@@ -669,6 +626,42 @@ mod tests {
         assert!(s.point_of(&[&42i32.to_le_bytes(), &UUID[..15]]).is_err(), "short uuid");
         assert!(s.prefix_range(&[&[0; 4], &UUID, b"x"]).is_err(), "too many values");
         assert!(level_hash(3, KeyFamily::Text, b"").is_err());
+    }
+
+    /// The engine (stored bytes, `core::hash::xxh64` behind the fence) and
+    /// the router (typed values) give byte-identical hashes and points for
+    /// every family and width, so a client routes where the engine stores.
+    #[test]
+    fn core_and_router_agree() {
+        use rasterizeddb_router::key::{self as r, KeyValue};
+        let ints: [(DbType, Vec<u8>, i128); 6] = [
+            (DbType::I8, (-5i8).to_le_bytes().to_vec(), -5),
+            (DbType::I16, 300i16.to_le_bytes().to_vec(), 300),
+            (DbType::I32, i32::MIN.to_le_bytes().to_vec(), i32::MIN as i128),
+            (DbType::I64, 42i64.to_le_bytes().to_vec(), 42),
+            (DbType::U32, u32::MAX.to_le_bytes().to_vec(), u32::MAX as i128),
+            (DbType::U64, u64::MAX.to_le_bytes().to_vec(), u64::MAX as i128),
+        ];
+        let long = "x".repeat(200);
+        for level in 0..MAX_ARITY {
+            for (t, col, v) in &ints {
+                assert_eq!(h(level, t, col), KeyValue::Int(*v).level_hash(level, KeyFamily::Integer).unwrap(), "{t}");
+            }
+            for s in ["", "abc", NON_ASCII, long.as_str()] {
+                assert_eq!(h(level, &DbType::STRING, s.as_bytes()), KeyValue::Text(s).level_hash(level, KeyFamily::Text).unwrap());
+                assert_eq!(level_hash(level, KeyFamily::Text, s.as_bytes()), r::level_hash(level, KeyFamily::Text, s.as_bytes()));
+            }
+            assert_eq!(h(level, &DbType::UUID, &UUID), KeyValue::Uuid(UUID).level_hash(level, KeyFamily::Uuid).unwrap());
+        }
+        let three = spec(&[DbType::I32, DbType::STRING, DbType::UUID]);
+        assert_eq!(
+            three.point_of(&[&7i32.to_le_bytes(), b"abc", &UUID]).unwrap(),
+            r::point_of(&[KeyFamily::Integer, KeyFamily::Text, KeyFamily::Uuid], &[KeyValue::Int(7), "abc".into(), UUID.into()]).unwrap()
+        );
+        assert_eq!(
+            three.prefix_range(&[&7i32.to_le_bytes()]).unwrap(),
+            r::prefix_range(&[KeyFamily::Integer, KeyFamily::Text, KeyFamily::Uuid], &[KeyValue::Int(7)]).unwrap()
+        );
     }
 
     #[test]

@@ -644,12 +644,14 @@ pub fn row_assignments(sql: &str) -> Result<Option<String>, String> {
                             Some(at) => item[..at].trim(),
                             None => item.trim(),
                         };
-                        format!("{value} AS __rdb_row{}", n + 1)
+                        // (Not `__rdb_…`: the role guard would take the
+                        // name for a catalogue's.)
+                        format!("{value} AS __row_value{}", n + 1)
                     })
                     .collect();
                 for (n, column) in columns.iter().enumerate() {
                     out_items.push(format!(
-                        "{column} = (SELECT __rdb_row{} FROM (SELECT {} {tail}) AS __rdb_row)",
+                        "{column} = (SELECT __row_value{} FROM (SELECT {} {tail}) AS __row_values)",
                         n + 1,
                         named.join(", ")
                     ));
@@ -1693,6 +1695,18 @@ pub fn respell_qualifier(text: &str, from: &str, to: &str) -> String {
     out
 }
 
+/// A relation or column name as written (`t`, `"T"`, `public."a.b"`), as the
+/// name it stands for: the last segment outside double quotes, unquoted,
+/// its doubled quotes one. Dots inside quotes are the name's own: SQL
+/// Server's `[DenevCloud.ERP.Colors]` is one table.
+pub fn bare_name(raw: &str) -> String {
+    let last = last_name_segment(raw.trim()).trim();
+    match last.strip_prefix('"').and_then(|l| l.strip_suffix('"')) {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => last.to_string(),
+    }
+}
+
 /// The last segment of a possibly schema-qualified name as written
 /// (`public.t` → `t`, `"public"."T"` → `"T"`, `"a.b"` → `"a.b"`): dots inside
 /// double quotes do not split it. Quotes are kept for the caller to trim.
@@ -2271,7 +2285,11 @@ pub fn plain_branch_parentheses(sql: &str) -> std::borrow::Cow<'_, str> {
         } else if alone || own_tail {
             continue;
         } else if set_operation {
-            format!("SELECT * FROM ({inner}) __rdb_branch{number}")
+            // Named outside the catalogue's `__rdb_` namespace: the role
+            // guard reads every identifier of the statement it is given,
+            // this one included, and refused the client's query as a read
+            // of "a system catalog".
+            format!("SELECT * FROM ({inner}) __set_branch{number}")
         } else {
             inner.to_string()
         };
@@ -2790,6 +2808,512 @@ pub fn split_top_level(list: &str, delimiter: u8) -> Vec<&str> {
     out
 }
 
+/// `percentile_cont(f) WITHIN GROUP (ORDER BY x [DESC])`, and
+/// `percentile_disc`, as the ordered aggregate call the aggregate path reads:
+/// `percentile_cont(x, f ORDER BY x [DESC])`, the fraction where
+/// `string_agg`'s delimiter goes (`aggregate::AggFunc::PercentileCont`).
+/// Refused before as an unsupported function.
+pub fn within_group(sql: &str) -> Cow<'_, str> {
+    if !contains_ignore_ascii_case(sql, b"WITHIN") {
+        return Cow::Borrowed(sql);
+    }
+    let mut text = sql.to_string();
+    let mut from = 0usize;
+    let mut changed = false;
+    while let Some((start, end, replacement)) = next_within_group(&text, from) {
+        from = start + replacement.len();
+        text.replace_range(start..end, &replacement);
+        changed = true;
+    }
+    if changed { Cow::Owned(text) } else { Cow::Borrowed(sql) }
+}
+
+fn next_within_group(sql: &str, from: usize) -> Option<(usize, usize, String)> {
+    let bytes = sql.as_bytes();
+    let skip_ws = |mut i: usize| {
+        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        i
+    };
+    let word_at = |i: usize, w: &str| {
+        sql.get(i..i + w.len()).is_some_and(|t| t.eq_ignore_ascii_case(w))
+            && (i == 0 || !is_identifier_byte(bytes[i - 1]))
+            && bytes.get(i + w.len()).is_none_or(|b| !is_identifier_byte(*b))
+    };
+    let mut i = from;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' || b == b'"' {
+            i = quoted_end(bytes, i, b).max(i + 1);
+            continue;
+        }
+        let name = ["percentile_cont", "percentile_disc", "mode"].into_iter().find(|n| word_at(i, n));
+        let Some(name) = name else {
+            i += 1;
+            continue;
+        };
+        let open = skip_ws(i + name.len());
+        if bytes.get(open) != Some(&b'(') {
+            i += name.len();
+            continue;
+        }
+        let close = matching_close(sql, open)?;
+        let within = skip_ws(close + 1);
+        if !word_at(within, "WITHIN") {
+            i = close + 1;
+            continue;
+        }
+        let group = skip_ws(within + "WITHIN".len());
+        if !word_at(group, "GROUP") {
+            i = close + 1;
+            continue;
+        }
+        let order_open = skip_ws(group + "GROUP".len());
+        if bytes.get(order_open) != Some(&b'(') {
+            i = close + 1;
+            continue;
+        }
+        let order_close = matching_close(sql, order_open)?;
+        let order = sql[order_open + 1..order_close].trim();
+        let Some(keys) = order.get(..5).filter(|w| w.eq_ignore_ascii_case("ORDER")).map(|_| order[5..].trim_start()) else {
+            i = close + 1;
+            continue;
+        };
+        let Some(keys) = keys.get(..2).filter(|w| w.eq_ignore_ascii_case("BY")).map(|_| keys[2..].trim()) else {
+            i = close + 1;
+            continue;
+        };
+        // One sort key, as PostgreSQL requires of these; its expression is
+        // the aggregate's argument, without ASC/DESC/NULLS.
+        if split_top_level(keys, b',').len() != 1 {
+            i = close + 1;
+            continue;
+        }
+        let mut argument = keys;
+        loop {
+            let upper = argument.to_ascii_uppercase();
+            let cut = ["NULLS FIRST", "NULLS LAST", "DESC", "ASC"]
+                .into_iter()
+                .find(|w| upper.ends_with(w) && upper[..upper.len() - w.len()].ends_with(char::is_whitespace));
+            match cut {
+                Some(w) => argument = argument[..argument.len() - w.len()].trim_end(),
+                None => break,
+            }
+        }
+        let fraction = sql[open + 1..close].trim();
+        // `mode()` takes no direct argument.
+        let replacement = if fraction.is_empty() {
+            format!("{}({argument} ORDER BY {keys})", &sql[i..i + name.len()])
+        } else {
+            format!("{}({argument}, {fraction} ORDER BY {keys})", &sql[i..i + name.len()])
+        };
+        return Some((i, order_close + 1, replacement));
+    }
+    None
+}
+
+/// `x [NOT] LIKE|ILIKE ANY|SOME|ALL (array)` as the `OR` (`ANY`) or `AND`
+/// (`ALL`) of one comparison per element, as PostgreSQL means it:
+/// `title ILIKE ANY ('{"%a%","%b%"}')` is `(title ILIKE '%a%' OR title ILIKE
+/// '%b%')`. Read only `x = ANY(…)` was supported: a pattern match over an
+/// array failed ("unexpected LPar after the end of the expression",
+/// "function 'ANY' is not supported yet"), and pms's chat router binds its
+/// patterns as a `text[]`, which arrives here inlined as an array literal.
+///
+/// The array is an array literal (`'{…}'`, optionally cast to an array
+/// type), `ARRAY[…]` of string constants, or `NULL`. Empty, `ANY` is false
+/// and `ALL` true; `NULL` makes the comparison `NULL`, as a `NULL` element
+/// makes its own. Anything else (a column, a subquery) is left as written.
+pub fn like_quantified_arrays(sql: &str) -> Cow<'_, str> {
+    if !(contains_ignore_ascii_case(sql, b"LIKE")
+        && (contains_ignore_ascii_case(sql, b"ANY")
+            || contains_ignore_ascii_case(sql, b"ALL")
+            || contains_ignore_ascii_case(sql, b"SOME")))
+    {
+        return Cow::Borrowed(sql);
+    }
+    let mut text = sql.to_string();
+    let mut from = 0usize;
+    let mut changed = false;
+    // One rewrite at a time, re-scanning after it: each changes the text
+    // after the operand it found.
+    while let Some((start, end, replacement)) = next_like_quantified(&text, from) {
+        from = start + replacement.len();
+        text.replace_range(start..end, &replacement);
+        changed = true;
+    }
+    if changed { Cow::Owned(text) } else { Cow::Borrowed(sql) }
+}
+
+/// The first `… LIKE ANY (…)` at or after `from` that can be spelled out:
+/// its span and its replacement.
+fn next_like_quantified(sql: &str, from: usize) -> Option<(usize, usize, String)> {
+    let bytes = sql.as_bytes();
+    let word_at = |i: usize, w: &str| {
+        sql.get(i..i + w.len()).is_some_and(|t| t.eq_ignore_ascii_case(w))
+            && (i == 0 || !is_identifier_byte(bytes[i - 1]))
+            && bytes.get(i + w.len()).is_none_or(|b| !is_identifier_byte(*b))
+    };
+    let skip_ws = |mut i: usize| {
+        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        i
+    };
+    let mut i = from;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' || b == b'"' {
+            i = quoted_end(bytes, i, b).max(i + 1);
+            continue;
+        }
+        if b == b'$' && !(i > 0 && is_identifier_byte(bytes[i - 1])) {
+            if let Some(end) = dollar_quote_end(bytes, i) {
+                i = end.max(i + 1);
+                continue;
+            }
+        }
+        let op = if word_at(i, "ILIKE") { Some("ILIKE") } else if word_at(i, "LIKE") { Some("LIKE") } else { None };
+        let Some(op) = op else {
+            i += 1;
+            continue;
+        };
+        let after_op = skip_ws(i + op.len());
+        let quantifier = ["ANY", "SOME", "ALL"].into_iter().find(|q| word_at(after_op, q));
+        let Some(quantifier) = quantifier else {
+            i += op.len();
+            continue;
+        };
+        let open = skip_ws(after_op + quantifier.len());
+        if bytes.get(open) != Some(&b'(') {
+            i += op.len();
+            continue;
+        }
+        let Some(close) = matching_close(sql, open) else { return None };
+        // `NOT` before the operator belongs to each comparison.
+        let mut operator_start = i;
+        let mut negated = false;
+        let mut k = i;
+        while k > 0 && bytes[k - 1].is_ascii_whitespace() {
+            k -= 1;
+        }
+        if k >= 3 && word_at(k - 3, "NOT") {
+            negated = true;
+            operator_start = k - 3;
+        }
+        let Some(operand_from) = operand_start(sql, operator_start) else {
+            i += op.len();
+            continue;
+        };
+        let operand = sql[operand_from..operator_start].trim();
+        let Some(elements) = quantified_patterns(&sql[open + 1..close]) else {
+            i = close + 1;
+            continue;
+        };
+        let comparison = format!("{operand} {}{op}", if negated { "NOT " } else { "" });
+        let joiner = if quantifier == "ALL" { " AND " } else { " OR " };
+        let replacement = match elements {
+            None => format!("({comparison} NULL)"),
+            Some(list) if list.is_empty() => {
+                (if quantifier == "ALL" { "(1 = 1)" } else { "(1 = 0)" }).to_string()
+            }
+            Some(list) => {
+                let parts: Vec<String> = list
+                    .iter()
+                    .map(|e| match e {
+                        Some(p) => format!("{comparison} '{}'", p.replace('\'', "''")),
+                        None => format!("{comparison} NULL"),
+                    })
+                    .collect();
+                format!("({})", parts.join(joiner))
+            }
+        };
+        return Some((operand_from, close + 1, replacement));
+    }
+    None
+}
+
+/// The patterns an array argument holds: `Some(None)` for `NULL` (the whole
+/// array), `Some(Some(list))` with `None` for a `NULL` element, `None` when
+/// the argument is not a constant array this can read.
+#[allow(clippy::option_option)]
+fn quantified_patterns(arg: &str) -> Option<Option<Vec<Option<String>>>> {
+    let mut a = arg.trim();
+    if a.eq_ignore_ascii_case("NULL") {
+        return Some(None);
+    }
+    // `ARRAY['%a%', '%b%']`, its elements string constants or NULL.
+    if a.len() > 5 && a[..5].eq_ignore_ascii_case("ARRAY") && a[5..].trim_start().starts_with('[') {
+        let open = a.len() - a[5..].trim_start().len();
+        let close = matching_close(a, open)?;
+        if !a[close + 1..].trim().is_empty() && !a[close + 1..].trim_start().starts_with("::") {
+            return None;
+        }
+        let mut out = Vec::new();
+        for element in split_top_level(&a[open + 1..close], b',') {
+            if element.eq_ignore_ascii_case("NULL") {
+                out.push(None);
+                continue;
+            }
+            let e = element.split("::").next().unwrap_or(element).trim();
+            if e.len() >= 2 && e.starts_with('\'') && quoted_end(e.as_bytes(), 0, b'\'') == e.len() {
+                out.push(Some(e[1..e.len() - 1].replace("''", "'")));
+            } else {
+                return None;
+            }
+        }
+        return Some(Some(out));
+    }
+    // `CAST('{…}' AS text[])`.
+    if a.len() > 4 && a[..4].eq_ignore_ascii_case("CAST") && a[4..].trim_start().starts_with('(') {
+        let open = a.len() - a[4..].trim_start().len();
+        if matching_close(a, open) == Some(a.len() - 1) {
+            let inner = &a[open + 1..a.len() - 1];
+            let cut = inner.to_ascii_uppercase().rfind(" AS ")?;
+            a = inner[..cut].trim();
+        }
+    }
+    // `'{…}'`, optionally `::text[]`.
+    if !a.starts_with('\'') {
+        return None;
+    }
+    let end = quoted_end(a.as_bytes(), 0, b'\'');
+    let rest = a[end..].trim();
+    if !(rest.is_empty() || rest.starts_with("::")) {
+        return None;
+    }
+    let literal = a[1..end - 1].replace("''", "'");
+    array_literal_elements(&literal).map(Some)
+}
+
+/// The elements of a one-dimensional array literal (`{a,"b c",NULL}`):
+/// quoted elements with their backslash escapes undone, unquoted ones
+/// trimmed, and an unquoted `NULL` as `None`.
+fn array_literal_elements(literal: &str) -> Option<Vec<Option<String>>> {
+    let inner = literal.trim().strip_prefix('{')?.strip_suffix('}')?;
+    let mut out = Vec::new();
+    if inner.trim().is_empty() {
+        return Some(out);
+    }
+    let mut chars = inner.chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            let mut value = String::new();
+            loop {
+                match chars.next()? {
+                    '\\' => value.push(chars.next()?),
+                    '"' => break,
+                    c => value.push(c),
+                }
+            }
+            out.push(Some(value));
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+        } else {
+            let mut value = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == ',' {
+                    break;
+                }
+                if c == '{' || c == '"' {
+                    return None; // nested or malformed: not this reader's
+                }
+                value.push(c);
+                chars.next();
+            }
+            let value = value.trim().to_string();
+            out.push(if value.eq_ignore_ascii_case("NULL") { None } else { Some(value) });
+        }
+        match chars.next() {
+            Some(',') => continue,
+            None => break,
+            Some(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+/// `doc #>> ARRAY['a', '0']` and `doc #> ARRAY[…]` as the path literal
+/// `doc #>> '{a,0}'`, which every path reader here takes. A path written as an
+/// `ARRAY[…]` constructor failed in each of them: "unexpected character '['"
+/// in a `WHERE`, "Column '… #>> ARRAY[…]' not found" in a select list, and
+/// "function '' is not supported" once a driver's parameters were in it.
+///
+/// Only a constructor whose every element is a constant is rewritten: a
+/// string or an integer, optionally cast (`'a'::text`, `CAST('a' AS text)`,
+/// as SQL `EXECUTE` and parameter inlining write them). A path element that
+/// is a column or an expression, or `NULL`, is left as written. Not a `->`
+/// chain: in a path, `'0'` indexes into an array, where `-> '0'` would not.
+pub fn json_path_arrays(sql: &str) -> Cow<'_, str> {
+    if !sql.contains('#') || !contains_ignore_ascii_case(sql, b"ARRAY") {
+        return Cow::Borrowed(sql);
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' || b == b'"' {
+            i = quoted_end(bytes, i, b).max(i + 1);
+            continue;
+        }
+        if b == b'$' && !(i > 0 && is_identifier_byte(bytes[i - 1])) {
+            if let Some(end) = dollar_quote_end(bytes, i) {
+                i = end.max(i + 1);
+                continue;
+            }
+        }
+        if b == b'#' && bytes.get(i + 1) == Some(&b'>') {
+            let operator_end = if bytes.get(i + 2) == Some(&b'>') { i + 3 } else { i + 2 };
+            let mut at = operator_end;
+            while bytes.get(at).is_some_and(|c| c.is_ascii_whitespace()) {
+                at += 1;
+            }
+            let keyword = at + 5;
+            if sql.get(at..keyword).is_some_and(|w| w.eq_ignore_ascii_case("ARRAY")) {
+                let mut open = keyword;
+                while bytes.get(open).is_some_and(|c| c.is_ascii_whitespace()) {
+                    open += 1;
+                }
+                if bytes.get(open) == Some(&b'[')
+                    && let Some(close) = matching_close(sql, open)
+                {
+                    if let Some(path) = constant_path(&sql[open + 1..close]) {
+                        out.push_str(&sql[copied..operator_end]);
+                        out.push(' ');
+                        out.push_str(&path);
+                        copied = close + 1;
+                        i = close + 1;
+                        continue;
+                    }
+                    // Elements that are not constants (a column, an
+                    // expression): the function the operator stands for,
+                    // `jsonb_extract_path[_text](doc, k1, …)`, which every
+                    // clause reads as a call. A WHERE refused the `[`.
+                    if let Some(operand_from) = operand_start(sql, i).filter(|&f| f >= copied) {
+                        let function = if operator_end == i + 3 { "jsonb_extract_path_text" } else { "jsonb_extract_path" };
+                        out.push_str(&sql[copied..operand_from]);
+                        out.push_str(&format!(
+                            "{function}({}, {})",
+                            sql[operand_from..i].trim(),
+                            sql[open + 1..close].trim()
+                        ));
+                        copied = close + 1;
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
+            i = operator_end;
+            continue;
+        }
+        i += 1;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(sql);
+    }
+    out.push_str(&sql[copied..]);
+    Cow::Owned(out)
+}
+
+/// The path literal (`'{a,"b c",0}'`) for an `ARRAY[…]`'s elements, or `None`
+/// when one is not a constant.
+fn constant_path(elements: &str) -> Option<String> {
+    let mut keys = Vec::new();
+    for element in split_top_level(elements, b',') {
+        keys.push(constant_key(element)?);
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    let quoted: Vec<String> = keys
+        .iter()
+        .map(|k| {
+            let plain = !k.is_empty()
+                && !k.eq_ignore_ascii_case("NULL")
+                && !k.bytes().any(|c| c.is_ascii_whitespace() || matches!(c, b',' | b'{' | b'}' | b'"' | b'\\'));
+            if plain { k.clone() } else { format!("\"{}\"", k.replace('\\', "\\\\").replace('"', "\\\"")) }
+        })
+        .collect();
+    Some(format!("'{{{}}}'", quoted.join(",").replace('\'', "''")))
+}
+
+/// One path element's value: a string or integer constant, without the
+/// casts a driver or SQL `EXECUTE` wraps it in.
+fn constant_key(element: &str) -> Option<String> {
+    let mut e = element.trim();
+    loop {
+        // `( … )` around the whole element.
+        if e.starts_with('(') && matching_close(e, 0) == Some(e.len() - 1) {
+            e = e[1..e.len() - 1].trim();
+            continue;
+        }
+        // `CAST(x AS type)`.
+        if e.len() > 5 && e[..4].eq_ignore_ascii_case("CAST") && e[4..].trim_start().starts_with('(') {
+            let open = e.len() - e[4..].trim_start().len();
+            if matching_close(e, open) == Some(e.len() - 1) {
+                let inner = &e[open + 1..e.len() - 1];
+                let upper = inner.to_ascii_uppercase();
+                let mut cut = None;
+                let ib = inner.as_bytes();
+                let mut k = 0usize;
+                while k < ib.len() {
+                    if ib[k] == b'\'' || ib[k] == b'"' {
+                        k = quoted_end(ib, k, ib[k]).max(k + 1);
+                        continue;
+                    }
+                    if upper[k..].starts_with(" AS ") {
+                        cut = Some(k);
+                    }
+                    k += 1;
+                }
+                e = inner[..cut?].trim();
+                continue;
+            }
+        }
+        // `x::type`, the last cast outside quotes.
+        let eb = e.as_bytes();
+        let mut k = 0usize;
+        let mut cast = None;
+        while k + 1 < eb.len() {
+            if eb[k] == b'\'' || eb[k] == b'"' {
+                k = quoted_end(eb, k, eb[k]).max(k + 1);
+                continue;
+            }
+            if eb[k] == b':' && eb[k + 1] == b':' {
+                cast = Some(k);
+                k += 2;
+                continue;
+            }
+            k += 1;
+        }
+        if let Some(at) = cast {
+            let ty = e[at + 2..].trim();
+            if ty.is_empty() || !ty.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b' ' | b'(' | b')')) {
+                return None;
+            }
+            e = e[..at].trim();
+            continue;
+        }
+        break;
+    }
+    if e.len() >= 2 && e.starts_with('\'') && quoted_end(e.as_bytes(), 0, b'\'') == e.len() {
+        return Some(e[1..e.len() - 1].replace("''", "'"));
+    }
+    let digits = e.strip_prefix('-').or_else(|| e.strip_prefix('+')).unwrap_or(e);
+    if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
+        return Some(e.trim_start_matches('+').to_string());
+    }
+    None
+}
+
 /// Index of the bracket closing the one at `open` (`(` or `[`), skipping
 /// quoted runs and comments; `None` when it never closes.
 pub fn matching_close(text: &str, open: usize) -> Option<usize> {
@@ -2860,7 +3384,7 @@ pub fn fold_core_statement(sql: &str) -> Cow<'_, str> {
 /// would change no name; leaving them keeps the declarations stored as text
 /// (a CHECK, a partial index's predicate, a generated column) reading as
 /// written, `deleted_at IS NULL` rather than `deleted_at is null`.
-const RESERVED_WORDS: &[&str] = &[
+pub(crate) const RESERVED_WORDS: &[&str] = &[
     "ALL", "ANALYSE", "ANALYZE", "AND", "ANY", "ARRAY", "AS", "ASC", "ASYMMETRIC", "BETWEEN", "BOTH", "CASE",
     "CAST", "CHECK", "COLLATE", "COLUMN", "CONSTRAINT", "CREATE", "CROSS", "CURRENT_CATALOG", "CURRENT_DATE",
     "CURRENT_ROLE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER", "DEFAULT", "DEFERRABLE", "DESC",
@@ -3672,6 +4196,88 @@ mod tests {
 
     use super::*;
 
+    /// `percentile_cont(f) WITHIN GROUP (ORDER BY x)` as the ordered call.
+    #[test]
+    fn within_group_is_the_ordered_call() {
+        let r = |s: &str| within_group(s).into_owned();
+        assert_eq!(
+            r("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY t.v DESC NULLS LAST) AS m FROM t"),
+            "SELECT percentile_cont(t.v, 0.5 ORDER BY t.v DESC NULLS LAST) AS m FROM t"
+        );
+        assert_eq!(
+            r("SELECT g, PERCENTILE_DISC(0.9) within group (order by v) FROM t GROUP BY g"),
+            "SELECT g, PERCENTILE_DISC(v, 0.9 ORDER BY v) FROM t GROUP BY g"
+        );
+        assert_eq!(r("SELECT mode() WITHIN GROUP (ORDER BY k) FROM t"), "SELECT mode(k ORDER BY k) FROM t");
+        for sql in [
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a, b) FROM t",
+            "SELECT string_agg(s, ',') WITHIN GROUP (ORDER BY s) FROM t",
+            "SELECT 'percentile_cont(0.5) WITHIN GROUP (ORDER BY v)' FROM t",
+        ] {
+            assert_eq!(r(sql), sql, "{sql}");
+        }
+    }
+
+    /// `x LIKE ANY (array)` spelled out as one match per pattern, `ALL` as
+    /// their AND, the empty and NULL arrays as PostgreSQL answers them.
+    #[test]
+    fn a_like_over_an_array_is_one_match_per_pattern() {
+        let r = |s: &str| like_quantified_arrays(s).into_owned();
+        assert_eq!(
+            r(r#"SELECT 1 FROM t WHERE title ILIKE ANY('{"%a%","b c",NULL}') AND x = 1"#),
+            "SELECT 1 FROM t WHERE (title ILIKE '%a%' OR title ILIKE 'b c' OR title ILIKE NULL) AND x = 1"
+        );
+        assert_eq!(
+            r(r#"SELECT 1 FROM t WHERE "t"."d"::text NOT LIKE ALL (ARRAY['x%', 'it''s'])"#),
+            r#"SELECT 1 FROM t WHERE ("t"."d"::text NOT LIKE 'x%' AND "t"."d"::text NOT LIKE 'it''s')"#
+        );
+        assert_eq!(r("SELECT 1 FROM t WHERE a LIKE SOME (CAST('{p}' AS text[]))"), "SELECT 1 FROM t WHERE (a LIKE 'p')");
+        assert_eq!(r("SELECT 1 FROM t WHERE a ILIKE ANY('{}'::text[])"), "SELECT 1 FROM t WHERE (1 = 0)");
+        assert_eq!(r("SELECT 1 FROM t WHERE a ILIKE ALL('{}')"), "SELECT 1 FROM t WHERE (1 = 1)");
+        assert_eq!(r("SELECT 1 FROM t WHERE a ILIKE ANY(NULL)"), "SELECT 1 FROM t WHERE (a ILIKE NULL)");
+        // A quoted element's backslash escape: `{"q\"x"}` holds `q"x`.
+        assert_eq!(r(r#"SELECT 1 FROM t WHERE a ILIKE ANY('{"q\"x"}')"#), r#"SELECT 1 FROM t WHERE (a ILIKE 'q"x')"#);
+        // Not an array this can read, or not a pattern match: unchanged.
+        for sql in [
+            "SELECT 1 FROM t WHERE a ILIKE ANY(SELECT p FROM q)",
+            "SELECT 1 FROM t WHERE a ILIKE ANY(b.patterns)",
+            "SELECT 1 FROM t WHERE a = ANY('{1,2}')",
+            "SELECT 'x LIKE ANY(''{a}'')' FROM t",
+            "SELECT 1 FROM t WHERE a LIKE '%any%'",
+        ] {
+            assert_eq!(r(sql), sql, "{sql}");
+        }
+    }
+
+    /// `#>> ARRAY[…]` and `#> ARRAY[…]` of constants read as path literals;
+    /// anything that is not a constant path stays as written.
+    #[test]
+    fn a_json_path_array_of_constants_is_a_path_literal() {
+        let r = |s: &str| json_path_arrays(s).into_owned();
+        assert_eq!(r("SELECT data #>> ARRAY['0','related_row_id'] FROM t"), "SELECT data #>> '{0,related_row_id}' FROM t");
+        assert_eq!(r("SELECT d #> array[ 'a' , 1 ] FROM t"), "SELECT d #> '{a,1}' FROM t");
+        assert_eq!(
+            r("SELECT 1 FROM t WHERE d#>>ARRAY[CAST('0' AS text), 'k'::text] IN ('x') AND d #>> ARRAY[('b')::varchar] = 'y'"),
+            "SELECT 1 FROM t WHERE d#>> '{0,k}' IN ('x') AND d #>> '{b}' = 'y'"
+        );
+        // Keys that need quoting inside the array literal, and a quote.
+        assert_eq!(r(r#"SELECT d #>> ARRAY['a b', 'c,d', 'it''s', '', 'x"y'] FROM t"#), r#"SELECT d #>> '{"a b","c,d",it''s,"","x\"y"}' FROM t"#);
+        // Not constants, or not this operator: unchanged.
+        // Elements that are not constants: the function the operator stands for.
+        assert_eq!(r("SELECT d #>> ARRAY[k, 'a'] FROM t"), "SELECT jsonb_extract_path_text(d, k, 'a') FROM t");
+        assert_eq!(r("SELECT 1 FROM t WHERE t.d #> ARRAY[(id-1)::text] = x"), "SELECT 1 FROM t WHERE jsonb_extract_path(t.d, (id-1)::text) = x");
+        assert_eq!(r("SELECT d #>> ARRAY[NULL, 'a'] FROM t"), "SELECT jsonb_extract_path_text(d, NULL, 'a') FROM t");
+        assert_eq!(r("SELECT d #>> ARRAY[$1, 'a'] FROM t"), "SELECT jsonb_extract_path_text(d, $1, 'a') FROM t");
+        for sql in [
+            "SELECT d #>> '{a,b}' FROM t",
+            "SELECT ARRAY['a'] FROM t",
+            "SELECT '#>> ARRAY[''a'']' FROM t",
+            "SELECT d #- ARRAY['a'] FROM t",
+        ] {
+            assert_eq!(r(sql), sql, "{sql}");
+        }
+    }
+
     #[test]
     fn unquoted_words_fold_and_quoted_text_keeps_its_case() {
         let fold = |s: &str| fold_unquoted_identifiers(s).into_owned();
@@ -3941,8 +4547,8 @@ mod row_assignment_tests {
         assert_eq!(
             row_assignments("UPDATE d SET (a, b) = (SELECT max(n) AS m, 'z' FROM e WHERE e.k > d.id) WHERE id = 1").unwrap().as_deref(),
             Some(
-                "UPDATE d SET a = (SELECT __rdb_row1 FROM (SELECT max(n) AS __rdb_row1, 'z' AS __rdb_row2 FROM e WHERE e.k > d.id) AS __rdb_row), \
-                 b = (SELECT __rdb_row2 FROM (SELECT max(n) AS __rdb_row1, 'z' AS __rdb_row2 FROM e WHERE e.k > d.id) AS __rdb_row) WHERE id = 1"
+                "UPDATE d SET a = (SELECT __row_value1 FROM (SELECT max(n) AS __row_value1, 'z' AS __row_value2 FROM e WHERE e.k > d.id) AS __row_values), \
+                 b = (SELECT __row_value2 FROM (SELECT max(n) AS __row_value1, 'z' AS __row_value2 FROM e WHERE e.k > d.id) AS __row_values) WHERE id = 1"
             )
         );
         assert!(super::contains_aggregate_call("COUNT (*) + 1") && !super::contains_aggregate_call("'max(x)'") && !super::contains_aggregate_call("maxim(x)"));
@@ -4110,16 +4716,28 @@ mod branch_parentheses_tests {
         // A group decides the order of evaluation: a derived table.
         assert_eq!(
             plain("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 2"),
-            "SELECT * FROM (SELECT 1 UNION SELECT 2) __rdb_branch0 INTERSECT SELECT 2"
+            "SELECT * FROM (SELECT 1 UNION SELECT 2) __set_branch0 INTERSECT SELECT 2"
         );
         assert_eq!(
             plain("((SELECT 1) UNION (SELECT 2)) INTERSECT (SELECT 2)"),
-            "SELECT * FROM (SELECT 1 UNION SELECT 2) __rdb_branch0 INTERSECT SELECT 2"
+            "SELECT * FROM (SELECT 1 UNION SELECT 2) __set_branch0 INTERSECT SELECT 2"
         );
         assert_eq!(
             plain("SELECT 1 EXCEPT ALL (SELECT 1 UNION SELECT 2)"),
-            "SELECT 1 EXCEPT ALL SELECT * FROM (SELECT 1 UNION SELECT 2) __rdb_branch1"
+            "SELECT 1 EXCEPT ALL SELECT * FROM (SELECT 1 UNION SELECT 2) __set_branch1"
         );
+        // The names these rewrites make are not a catalogue's to the role
+        // guard, which reads the rewritten statement: it refused a client's
+        // `(SELECT 1 UNION SELECT 2) INTERSECT SELECT 2` as a read of "a
+        // system catalog" when the alias began `__rdb_`.
+        for sql in [
+            plain("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 2"),
+            plain("SELECT 1 EXCEPT ALL (SELECT 1 UNION SELECT 2)"),
+            row_assignments("UPDATE d SET (a, b) = (SELECT max(n) AS m, 'z' FROM e WHERE e.k > d.id) WHERE id = 1").unwrap().unwrap(),
+        ] {
+            assert!(!crate::core::rql::privileges::may_name_catalog(&sql), "{sql}");
+            assert_eq!(crate::core::rql::privileges::catalog_refusal(&sql), None, "{sql}");
+        }
     }
 
     #[test]
@@ -4158,7 +4776,7 @@ mod branch_parentheses_tests {
         // A group inside a group.
         assert_eq!(
             nested("SELECT a FROM t WHERE a IN ((SELECT 1) EXCEPT ((SELECT 2) UNION (SELECT 3)))"),
-            "SELECT a FROM t WHERE a IN (SELECT 1 EXCEPT SELECT * FROM (SELECT 2 UNION SELECT 3) __rdb_branch1)"
+            "SELECT a FROM t WHERE a IN (SELECT 1 EXCEPT SELECT * FROM (SELECT 2 UNION SELECT 3) __set_branch1)"
         );
         for sql in [
             "SELECT a FROM t WHERE (a = 1) AND ((b = 2) OR (c = 3))",

@@ -4,6 +4,14 @@ version = "1.0.0"
 edition = "2024"
 description = "A database console for RasterizedDB and PostgreSQL"
 license = "GPL-3.0"
+# Shipped as a binary (release-binaries.yml), never to crates.io; its
+# `enterprise` feature names an unpublished crate, which crates.io could not
+# resolve.
+publish = false
+
+[build-dependencies]
+# The icon and version resource of the Windows executable (build.rs).
+winresource = "0.1.34"
 
 [dependencies]
 iced = { version = "0.14.0", features = ["tokio", "canvas", "advanced"] }
@@ -11,6 +19,8 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "
 tokio-postgres = "0.7.18"
 # The native protocol (rastcp), the default for a RasterizedDB profile.
 rasterizeddb_client = { path = "../rasterizeddb_client", default-features = false }
+# The LEDGER page (licensed, sharding-plan.md §10 L8): only with `enterprise`.
+rdb_studio_enterprise = { path = "../rdb_studio_enterprise", optional = true }
 # The trait a wire result streams through, read row by row under the
 # editor's row limit (already in the tree through tokio-postgres).
 futures-core = "0.3"
@@ -28,3 +38,8 @@ dirs = "7"
 # elsewhere.
 keyring = "4.2.0"
 rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }
+
+[features]
+default = []
+# The enterprise pages: ledger tables and secret vaults.
+enterprise = ["dep:rdb_studio_enterprise"]

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use super::keyset::{Cursor, Direction, keys, order_sql, predicate};
 use super::relations::{Count, Eager, Includes, With};
+use super::shard_meta::{RouteHint, ShardKey, ShardTarget, Sharding};
 use super::{BoxFuture, Model, ident, select_list};
 use crate::executor::Executor;
 use crate::params::{push_ident, push_param};
@@ -60,9 +61,12 @@ impl<M, T> Column<M, T> {
         })
     }
 
-    /// `column = value`.
+    /// `column = value`. On a model's shard column this pins the shard a
+    /// router sends the statement to.
     pub fn eq(&self, value: impl ToSql) -> Expr {
-        self.compare(" = ", &value)
+        let mut e = self.compare(" = ", &value);
+        e.route = RouteHint::pin(self.name, &[value.to_param()]);
+        e
     }
 
     /// `column <> value`.
@@ -129,9 +133,16 @@ impl<M, T> Column<M, T> {
         })
     }
 
-    /// `col IN (…)`. An empty list matches nothing.
+    /// `col IN (…)`. An empty list matches nothing. On a model's shard
+    /// column this pins the shards a router sends the statement to.
     pub fn is_in<V: ToSql>(&self, values: impl IntoIterator<Item = V>) -> Expr {
-        self.in_list(values, false)
+        let values: Vec<V> = values.into_iter().collect();
+        let params: Vec<crate::Param<'_>> = values.iter().map(|v| v.to_param()).collect();
+        let route = RouteHint::pin(self.name, &params);
+        drop(params);
+        let mut e = self.in_list(values, false);
+        e.route = route;
+        e
     }
 
     /// `col NOT IN (…)`. An empty list matches every row.
@@ -179,6 +190,10 @@ impl<M, T> Column<M, T> {
 #[derive(Clone, Debug)]
 pub struct Expr {
     sql: std::result::Result<String, String>,
+    /// The shard key values it pins and the models its subqueries read,
+    /// for a router (`Column::eq`/`is_in` set it; `and` keeps it, `or` and
+    /// `not` drop the pins, `raw` has none).
+    pub(crate) route: RouteHint,
 }
 
 impl Expr {
@@ -186,18 +201,30 @@ impl Expr {
         let mut out = String::new();
         Expr {
             sql: f(&mut out).map(|()| out).map_err(|e| e.to_string()),
+            route: RouteHint::default(),
         }
     }
 
     fn raw_unchecked(sql: &str) -> Expr {
         Expr {
             sql: Ok(sql.to_string()),
+            route: RouteHint::default(),
         }
     }
 
     /// SQL this crate wrote itself, every value in it already a literal.
     pub(crate) fn trusted(sql: String) -> Expr {
-        Expr { sql: Ok(sql) }
+        Expr {
+            sql: Ok(sql),
+            route: RouteHint::default(),
+        }
+    }
+
+    /// A predicate whose subquery reads model rows sharded as `reads`
+    /// (`where_has`).
+    pub(crate) fn reading(mut self, reads: Sharding) -> Expr {
+        self.route.reads.push(reads);
+        self
     }
 
     /// A predicate that could not be built: its error surfaces when the
@@ -205,6 +232,7 @@ impl Expr {
     pub(crate) fn failed(error: Error) -> Expr {
         Expr {
             sql: Err(error.to_string()),
+            route: RouteHint::default(),
         }
     }
 
@@ -214,14 +242,17 @@ impl Expr {
     pub fn raw(sql: &str, params: &[&dyn ToSql]) -> Expr {
         Expr {
             sql: crate::params::render_dyn(sql, params).map_err(|e| e.to_string()),
+            route: RouteHint::default(),
         }
     }
 
     fn combine(self, op: &str, other: Expr) -> Expr {
+        let route = self.route.and(other.route);
         Expr {
             sql: self
                 .sql
                 .and_then(|a| other.sql.map(|b| format!("({a}) {op} ({b})"))),
+            route: if op == "AND" { route } else { route.unpinned() },
         }
     }
 
@@ -240,6 +271,7 @@ impl Expr {
     pub fn not(self) -> Expr {
         Expr {
             sql: self.sql.map(|s| format!("NOT ({s})")),
+            route: self.route.unpinned(),
         }
     }
 
@@ -322,6 +354,16 @@ impl Order {
         self.direction == "DESC"
     }
 
+    /// Whether NULLs sort first: as said, else PostgreSQL's default (first
+    /// when descending).
+    #[cfg(feature = "sharding")]
+    pub(crate) fn nulls_sort_first(&self) -> bool {
+        match self.nulls {
+            Some(n) => n.contains("FIRST"),
+            None => self.descending(),
+        }
+    }
+
     pub(crate) fn expression(
         sql: std::result::Result<String, String>,
         direction: &'static str,
@@ -387,6 +429,10 @@ pub struct Select<M> {
     keyset: Option<(Cursor, Direction)>,
     /// Which rows of a soft-deleting model it sees.
     scope: Scope,
+    /// Where it goes on a router.
+    pub(crate) target: ShardTarget,
+    /// A delete across shards was asked for (`split_across_shards`).
+    pub(crate) split: bool,
     _model: PhantomData<fn() -> M>,
 }
 
@@ -409,6 +455,8 @@ impl<M> Clone for Select<M> {
             includes: self.includes.clone(),
             keyset: self.keyset.clone(),
             scope: self.scope,
+            target: self.target.clone(),
+            split: self.split,
             _model: PhantomData,
         }
     }
@@ -444,8 +492,142 @@ impl<M: Model> Select<M> {
             includes: Vec::new(),
             keyset: None,
             scope: Scope::Live,
+            target: ShardTarget::Hint,
+            split: false,
             _model: PhantomData,
         }
+    }
+
+    /// On a router, run on the shard of `key` whatever the filter pins.
+    pub fn on_shard<'k>(mut self, key: impl Into<ShardKey<'k>>) -> Self {
+        self.target = ShardTarget::Key(key.into().into_owned());
+        self
+    }
+
+    /// On a router, run on every shard and merge the answers: rows
+    /// concatenated (or merged in `order_by` order, then cut to
+    /// `limit`/`offset`), counts summed, `exists` true if any is.
+    pub fn all_shards(mut self) -> Self {
+        self.target = ShardTarget::All;
+        self
+    }
+
+    /// On a router, let a delete reach several shards: each shard's delete
+    /// commits on its own, so a failure leaves the others applied
+    /// ([`Error::FanOutPartial`]).
+    pub fn split_across_shards(mut self) -> Self {
+        self.split = true;
+        self
+    }
+
+    #[cfg(feature = "sharding")]
+    /// The filter's route hint.
+    pub(crate) fn route(&self) -> RouteHint {
+        self.filter.as_ref().map(|f| f.route.clone()).unwrap_or_default()
+    }
+
+    #[cfg(feature = "sharding")]
+    /// The relations and counts loaded after the rows.
+    pub(crate) fn includes(&self) -> &Includes<M> {
+        &self.includes
+    }
+
+    #[cfg(feature = "sharding")]
+    pub(crate) fn offset_value(&self) -> Option<u64> {
+        self.offset
+    }
+
+    #[cfg(feature = "sharding")]
+    /// A copy with no limit and no offset, and `limit + offset` as its
+    /// limit: what each shard of a merged read is asked for.
+    pub(crate) fn widened(&self) -> Self {
+        let mut s = self.clone();
+        s.limit = match (self.limit, self.offset) {
+            (Some(l), o) => Some(l.saturating_add(o.unwrap_or(0))),
+            (None, _) => None,
+        };
+        s.offset = None;
+        s
+    }
+
+    /// Rows `order` of `rows` (all of them, in order before a cursor, when
+    /// `None`), with each relation loaded where its rows live: on the
+    /// parent's shard (`shard_db`) or the home shard (`home_db`).
+    #[cfg(feature = "sharding")]
+    pub(crate) async fn finish_on(
+        &self,
+        shard_db: &dyn SendSql,
+        home_db: &dyn SendSql,
+        rows: &Rows,
+        order: Option<&[usize]>,
+    ) -> Result<Vec<M>> {
+        let mut out: Vec<M> = match order {
+            None => {
+                let mut out: Vec<M> = super::decode_models(rows)?;
+                if self.keyset_direction() == Some(Direction::Before) {
+                    out.reverse();
+                }
+                out
+            }
+            Some(order) => order
+                .iter()
+                .map(|&i| {
+                    let mut m: M = rows.get(i).expect("in range").decode()?;
+                    m.__rdb_after_load();
+                    Ok(m)
+                })
+                .collect::<Result<_>>()?,
+        };
+        for include in &self.includes {
+            let db = match super::shard_meta::placement(M::SHARD, include.child()).map_err(Error::CrossShard)? {
+                super::shard_meta::Placement::Local => shard_db,
+                super::shard_meta::Placement::Home => home_db,
+            };
+            include.load(db, &mut out).await?;
+        }
+        Ok(out)
+    }
+
+    /// Whether it reads before a cursor (its rows arrive nearest first).
+    #[cfg(feature = "sharding")]
+    pub(crate) fn reads_before(&self) -> bool {
+        self.keyset_direction() == Some(Direction::Before)
+    }
+
+    /// How rows from several shards merge in this query's order, in the
+    /// order the statement sorts them: `(select-list position, descending,
+    /// NULLs first, compared as a number)`. Empty for no order.
+    #[cfg(feature = "sharding")]
+    pub(crate) fn merge_keys(&self) -> Result<Vec<(usize, bool, bool, bool)>> {
+        let numeric = |i: usize| {
+            let c = &M::COLUMNS[i];
+            c.read_as_text && c.sql_type.to_ascii_uppercase().starts_with("NUMERIC")
+        };
+        if self.keyset.is_some() {
+            let before = self.reads_before();
+            return Ok(keys::<M>(&self.order)?
+                .iter()
+                .map(|k| (k.position(), k.descending() != before, false, numeric(k.position())))
+                .collect());
+        }
+        self.order
+            .iter()
+            .map(|o| {
+                let name = o.column().ok_or_else(|| {
+                    Error::Unsupported(
+                        "rows from several shards merge by columns: an ORDER BY expression cannot be merged"
+                            .to_string(),
+                    )
+                })?;
+                let i = M::COLUMNS.iter().position(|c| c.name == name).ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "rows from several shards merge by {}'s columns; {name} is not one",
+                        M::TABLE
+                    ))
+                })?;
+                Ok((i, o.descending(), o.nulls_sort_first(), numeric(i)))
+            })
+            .collect()
     }
 
     /// Narrows the rows; several filters must all hold.
@@ -513,14 +695,14 @@ impl<M: Model> Select<M> {
     /// filters): `WHERE key IN (SELECT …)`.
     pub fn where_has<C: Model>(self, relation: impl Into<With<M, C>>) -> Self {
         let expr = relation.into().has_expr(false).unwrap_or_else(Expr::failed);
-        self.filter(expr)
+        self.filter(expr.reading(C::SHARD))
     }
 
     /// Only rows with no related row (matching the relation's filters):
     /// `WHERE key IS NULL OR key NOT IN (SELECT …)`.
     pub fn where_doesnt_have<C: Model>(self, relation: impl Into<With<M, C>>) -> Self {
         let expr = relation.into().has_expr(true).unwrap_or_else(Expr::failed);
-        self.filter(expr)
+        self.filter(expr.reading(C::SHARD))
     }
 
     pub(crate) fn has_order(&self) -> bool {
@@ -849,6 +1031,14 @@ pub struct Update<M> {
     select: Select<M>,
     /// Each assignment, with the column it assigns.
     sets: std::result::Result<Vec<(&'static str, String)>, String>,
+}
+
+#[cfg(feature = "sharding")]
+impl<M> Update<M> {
+    /// The rows it updates.
+    pub(crate) fn rows(&self) -> &Select<M> {
+        &self.select
+    }
 }
 
 impl<M: Model> Update<M> {

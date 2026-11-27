@@ -342,8 +342,12 @@ async fn try_run(db: &Arc<Database>, sql: &str) -> Vec<u8> {
 
 /// Uses up the reservation's block, small for the test, so the next `begin`
 /// has to raise the mark; returns the mark.
-fn exhaust_reservation(db: &Arc<Database>) -> TxId {
+/// Uses up every reserved id with the reservation failing, so the mark
+/// stays where it is (an early raise would otherwise keep it ahead) and the
+/// next `begin` is the one that must raise it. Leaves the failure armed.
+fn exhaust_reservation(db: &Arc<Database>, dir: &std::path::Path) -> TxId {
     db.transactions.set_reservation_block(4);
+    crate::core::mvcc::status::reservation_test_hooks::fail_in(dir);
     while db.transactions.next_id() < db.transactions.reserved_ids_below() {
         let id = db.transactions.begin();
         db.abort_transaction(id);
@@ -376,7 +380,7 @@ async fn a_write_is_refused_while_its_id_cannot_be_reserved_and_reads_go_on() {
     let db = open(&dir).await;
     create(&db).await;
     insert(&db, 1).await;
-    let mark = exhaust_reservation(&db);
+    let mark = exhaust_reservation(&db, &dir);
     let _healed = Healed(dir.clone());
     crate::core::mvcc::status::reservation_test_hooks::fail_in(&dir);
 
@@ -435,7 +439,7 @@ async fn writes_commit_again_once_the_reservation_can_be_written() {
     let db = open(&dir).await;
     create(&db).await;
     insert(&db, 1).await;
-    let mark = exhaust_reservation(&db);
+    let mark = exhaust_reservation(&db, &dir);
     let _healed = Healed(dir.clone());
     crate::core::mvcc::status::reservation_test_hooks::fail_in(&dir);
 

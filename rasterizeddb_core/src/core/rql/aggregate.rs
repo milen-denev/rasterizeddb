@@ -59,6 +59,19 @@ pub enum AggFunc {
     BoolAnd,
     BoolOr,
     Every,
+    /// `percentile_cont(f) WITHIN GROUP (ORDER BY x)`: the value at fraction
+    /// `f` of the ordered non-NULL values, interpolated between the two
+    /// around it, as `double precision`. Read as
+    /// `percentile_cont(x, f ORDER BY x)` (`sql_scan::within_group`), the
+    /// fraction in [`AggCall::delimiter`]'s place.
+    PercentileCont,
+    /// `percentile_disc(f) WITHIN GROUP (ORDER BY x)`: the first ordered
+    /// value whose position reaches fraction `f`, of `x`'s own type.
+    PercentileDisc,
+    /// `mode() WITHIN GROUP (ORDER BY x)`: the most frequent non-NULL value,
+    /// the first in the order among equally frequent ones, as PostgreSQL
+    /// picks. Read as `mode(x ORDER BY x)`.
+    Mode,
 }
 
 impl AggFunc {
@@ -76,6 +89,9 @@ impl AggFunc {
             "VAR_SAMP" => AggFunc::VarSamp,
             "VAR_POP" => AggFunc::VarPop,
             "STRING_AGG" => AggFunc::StringAgg,
+            "PERCENTILE_CONT" => AggFunc::PercentileCont,
+            "PERCENTILE_DISC" => AggFunc::PercentileDisc,
+            "MODE" => AggFunc::Mode,
             "ARRAY_AGG" => AggFunc::ArrayAgg,
             "JSON_AGG" => AggFunc::JsonAgg,
             "JSONB_AGG" => AggFunc::JsonbAgg,
@@ -102,7 +118,16 @@ impl AggFunc {
     /// done ([`Acc::Collect`]); the only ones an `ORDER BY` inside the call
     /// changes.
     pub fn collects(&self) -> bool {
-        matches!(self, AggFunc::StringAgg | AggFunc::ArrayAgg | AggFunc::JsonAgg | AggFunc::JsonbAgg)
+        matches!(
+            self,
+            AggFunc::StringAgg
+                | AggFunc::ArrayAgg
+                | AggFunc::JsonAgg
+                | AggFunc::JsonbAgg
+                | AggFunc::PercentileCont
+                | AggFunc::PercentileDisc
+                | AggFunc::Mode
+        )
     }
 
     /// Refuses an aggregate over a type PostgreSQL has no such aggregate
@@ -118,6 +143,17 @@ impl AggFunc {
             match self {
                 AggFunc::StringAgg if !matches!(f.db_type, DbType::STRING | DbType::CHAR) => {
                     return Err(format!("function string_agg({}, unknown) does not exist", shown()));
+                }
+                // Interpolation needs a number (PostgreSQL also takes an
+                // interval, which this does not).
+                AggFunc::PercentileCont
+                    if !matches!(
+                        f.db_type,
+                        DbType::I8 | DbType::U8 | DbType::I16 | DbType::U16 | DbType::I32 | DbType::U32 | DbType::I64
+                            | DbType::U64 | DbType::F32 | DbType::F64 | DbType::DECIMAL
+                    ) =>
+                {
+                    return Err(format!("function percentile_cont(double precision ORDER BY {}) does not exist", shown()));
                 }
                 AggFunc::BoolAnd | AggFunc::BoolOr | AggFunc::Every if f.db_type != DbType::BOOL => {
                     return Err(format!("function {}({}) does not exist", self.name(), shown()));
@@ -201,6 +237,9 @@ impl AggFunc {
             AggFunc::VarSamp => "var_samp",
             AggFunc::VarPop => "var_pop",
             AggFunc::StringAgg => "string_agg",
+            AggFunc::PercentileCont => "percentile_cont",
+            AggFunc::PercentileDisc => "percentile_disc",
+            AggFunc::Mode => "mode",
             AggFunc::ArrayAgg => "array_agg",
             AggFunc::JsonAgg => "json_agg",
             AggFunc::JsonbAgg => "jsonb_agg",
@@ -258,6 +297,8 @@ impl AggFunc {
                 _ => DbType::DECIMAL,
             },
             AggFunc::StringAgg => DbType::STRING,
+            AggFunc::PercentileCont => DbType::F64,
+            AggFunc::PercentileDisc | AggFunc::Mode => arg.cloned().unwrap_or(DbType::F64),
             // One array type here, described as `text[]`; its text is
             // PostgreSQL's whatever the element type.
             AggFunc::ArrayAgg => DbType::ARRAY,
@@ -335,6 +376,10 @@ pub struct AggCall {
     /// `string_agg(s, ',' ORDER BY k DESC)`: the order the values are kept
     /// in, keys evaluated per row.
     pub order: Vec<AggOrderKey>,
+    /// The argument column's nondeterministic collation: `min`/`max` pick by
+    /// its order and a DISTINCT keeps one value per key
+    /// (`core::rql::collation::compare`).
+    pub collation: Option<crate::core::rql::collation::Strength>,
 }
 
 /// One key of an `ORDER BY` inside an aggregate call.
@@ -409,6 +454,21 @@ pub(crate) fn build_call(
     parse_key: &mut dyn FnMut(&str) -> Result<(crate::core::rql::expr::Expr, Vec<SchemaField>), String>,
 ) -> Result<Option<Box<AggCall>>, String> {
     let delimiter = match (func, second) {
+        (AggFunc::PercentileCont | AggFunc::PercentileDisc, None) => {
+            return Err(format!("{}(…) needs WITHIN GROUP (ORDER BY …)", func.name()));
+        }
+        // The fraction, a constant between 0 and 1, kept as its text.
+        (AggFunc::PercentileCont | AggFunc::PercentileDisc, Some(text)) => {
+            let fraction: f64 = text
+                .trim()
+                .trim_matches('\'')
+                .parse()
+                .map_err(|_| format!("{} with the fraction {text}, not a constant number, is not supported yet", func.name()))?;
+            if !(0.0..=1.0).contains(&fraction) {
+                return Err(format!("percentile value {fraction} is not between 0 and 1"));
+            }
+            Some(fraction.to_string())
+        }
         (AggFunc::StringAgg, None) => return Err("function string_agg(text) does not exist".to_string()),
         (AggFunc::StringAgg, Some(text)) => {
             if text.eq_ignore_ascii_case("NULL") {
@@ -448,7 +508,7 @@ pub(crate) fn build_call(
     if delimiter.is_none() && keys.is_empty() && !(func == AggFunc::StringAgg && second.is_some()) {
         return Ok(None);
     }
-    Ok(Some(Box::new(AggCall { delimiter, order: keys })))
+    Ok(Some(Box::new(AggCall { delimiter, order: keys, collation: None })))
 }
 
 /// The `FILTER (WHERE …)` attached to one aggregate.
@@ -1117,6 +1177,23 @@ pub fn is_row_count_only(plan: &AggregatePlan) -> bool {
         })
 }
 
+/// Whether this session's next fold takes part in a cluster fan-out
+/// (sharding-plan.md B1c), so a shortcut that skips the fold must not run.
+pub fn cluster_fold_pending() -> bool {
+    #[cfg(feature = "sharding")]
+    {
+        use crate::core::cancel::Fold;
+        if let Some(session) = crate::pgwire::current_session_cancel() {
+            return match &*session.fold.lock().unwrap_or_else(|e| e.into_inner()) {
+                Fold::Normal => false,
+                Fold::Partial(out) => out.is_none(),
+                Fold::Coordinator { consumed, .. } => !consumed,
+            };
+        }
+    }
+    false
+}
+
 /// The answer to a plan [`is_row_count_only`] admits, given how many rows
 /// matched: [`row_count_result`] when every item is a bare count, and
 /// otherwise the fold's own emit over accumulators that each hold the
@@ -1220,6 +1297,8 @@ pub(crate) enum Acc {
         best: Option<Vec<u8>>,
         ty: DbType,
         want_max: bool,
+        /// Text under a nondeterministic collation, compared by its key.
+        collation: Option<crate::core::rql::collation::Strength>,
     },
     /// An aggregate over DISTINCT values: the set of values seen, and the
     /// accumulator of the function it feeds them into once each.
@@ -1236,6 +1315,10 @@ pub(crate) enum Acc {
         template: Box<Acc>,
         ty: DbType,
         null: bool,
+        /// Text under a nondeterministic collation: one value per key, the
+        /// keys seen kept here.
+        collation: Option<crate::core::rql::collation::Strength>,
+        keys: std::collections::HashSet<Vec<u8>>,
     },
     /// `string_agg`, `array_agg`, `json_agg`: every value of the group (NULL
     /// as `None`) with the keys of the call's `ORDER BY`, kept until the
@@ -1277,12 +1360,18 @@ impl Acc {
                 *order = keys.iter().map(|k| (k.descending, k.nulls_first)).collect();
             }
         }
+        let collation = call.and_then(|c| c.collation).filter(|s| !s.is_binary());
+        if let Acc::Extreme { collation: c, .. } = &mut plain {
+            *c = collation;
+        }
         match (distinct, arg) {
             (true, Some(field)) => Acc::Distinct {
                 seen: std::collections::HashSet::new(),
                 template: Box::new(plain),
                 ty: field.db_type.clone(),
                 null: false,
+                collation,
+                keys: std::collections::HashSet::new(),
             },
             _ => plain,
         }
@@ -1291,7 +1380,7 @@ impl Acc {
     /// The function's own accumulator over the distinct values, for a
     /// [`Acc::Distinct`]; `None` for every other kind.
     fn resolve(&self) -> Option<Acc> {
-        let Acc::Distinct { seen, template, ty, null } = self else {
+        let Acc::Distinct { seen, template, ty, null, collation, .. } = self else {
             return None;
         };
         let mut acc = (**template).clone();
@@ -1299,7 +1388,10 @@ impl Acc {
         // (`string_agg(DISTINCT s, …)`) answers the same every time, as
         // PostgreSQL's sorted DISTINCT does.
         let mut values: Vec<&Vec<u8>> = seen.iter().collect();
-        values.sort_by(|a, b| compare_values(a, b, ty));
+        match collation {
+            Some(strength) => values.sort_by(|a, b| crate::core::rql::collation::compare(a, b, *strength)),
+            None => values.sort_by(|a, b| compare_values(a, b, ty)),
+        }
         for value in values {
             acc.accumulate(Some(value), Some(ty));
         }
@@ -1314,7 +1406,13 @@ impl Acc {
     pub(crate) fn new(func: AggFunc, arg: Option<&SchemaField>) -> Self {
         match func {
             AggFunc::Count => Acc::Count(0),
-            AggFunc::StringAgg | AggFunc::ArrayAgg | AggFunc::JsonAgg | AggFunc::JsonbAgg => Acc::Collect {
+            AggFunc::StringAgg
+            | AggFunc::ArrayAgg
+            | AggFunc::JsonAgg
+            | AggFunc::JsonbAgg
+            | AggFunc::PercentileCont
+            | AggFunc::PercentileDisc
+            | AggFunc::Mode => Acc::Collect {
                 values: Vec::new(),
                 order: Vec::new(),
                 by_value_descending: None,
@@ -1328,6 +1426,7 @@ impl Acc {
                 best: None,
                 ty: arg.map(|f| f.db_type.clone()).unwrap_or(DbType::I64),
                 want_max: func == AggFunc::Max,
+                collation: None,
             },
             AggFunc::Stddev
             | AggFunc::StddevSamp
@@ -1468,9 +1567,16 @@ impl Acc {
             }
             _ => {}
         }
-        if let Acc::Distinct { seen, ty: own, template, null } = self {
+        if let Acc::Distinct { seen, ty: own, template, null, collation, keys } = self {
             if bytes.is_none() && matches!(**template, Acc::Collect { .. }) {
                 *null = true;
+            }
+            if let (Some(value), Some(strength)) = (bytes, *collation) {
+                // One value per key: the first seen stands for the others.
+                if keys.insert(crate::core::rql::collation::key_bytes(value, strength)) {
+                    seen.insert(value.to_vec());
+                }
+                return;
             }
             if let Some(value) = bytes {
                 // -0.0 and 0.0 are one value to `=`, and so to DISTINCT.
@@ -1662,6 +1768,7 @@ impl Acc {
                 best,
                 ty: acc_ty,
                 want_max,
+                collation,
             } => {
                 let Some(b) = bytes else { return };
                 // A NULL arrives as `None` (its cell retyped from the
@@ -1676,7 +1783,10 @@ impl Acc {
                 match best {
                     None => *best = Some(b.to_vec()),
                     Some(current) => {
-                        let ord = compare_values(b, current, acc_ty);
+                        let ord = match collation {
+                            Some(strength) => crate::core::rql::collation::compare(b, current, *strength),
+                            None => compare_values(b, current, acc_ty),
+                        };
                         // A NUMERIC carrying its own scale ties to the later
                         // value, as `numeric_larger`/`numeric_smaller` return
                         // their second argument: max(1.5, 1.50) is 1.50.
@@ -1704,10 +1814,25 @@ impl Acc {
     /// Exact totals add checked, as `accumulate` does: an overflow in either
     /// part, or in the sum of the two, is reported by `finish`.
     pub(crate) fn merge(&mut self, other: &Acc) {
-        if let (Acc::Distinct { seen, null, .. }, Acc::Distinct { seen: theirs, null: their_null, .. }) =
-            (&mut *self, other)
+        if let (
+            Acc::Distinct { seen, null, collation, keys, .. },
+            Acc::Distinct { seen: theirs, null: their_null, .. },
+        ) = (&mut *self, other)
         {
-            seen.extend(theirs.iter().cloned());
+            match collation {
+                Some(strength) => {
+                    // In a fixed order, so which spelling stands for a key
+                    // does not depend on how the rows were split.
+                    let mut theirs: Vec<&Vec<u8>> = theirs.iter().collect();
+                    theirs.sort();
+                    for value in theirs {
+                        if keys.insert(crate::core::rql::collation::key_bytes(value, *strength)) {
+                            seen.insert(value.clone());
+                        }
+                    }
+                }
+                None => seen.extend(theirs.iter().cloned()),
+            }
             *null |= *their_null;
             return;
         }
@@ -1825,13 +1950,16 @@ impl Acc {
             }
             (
                 Acc::Extreme {
-                    best, ty, want_max, ..
+                    best, ty, want_max, collation,
                 },
                 Acc::Extreme { best: Some(b2), .. },
             ) => match best {
                 None => *best = Some(b2.clone()),
                 Some(current) => {
-                    let ord = compare_values(b2, current, ty);
+                    let ord = match collation {
+                        Some(strength) => crate::core::rql::collation::compare(b2, current, *strength),
+                        None => compare_values(b2, current, ty),
+                    };
                     let replace = if *want_max {
                         ord == std::cmp::Ordering::Greater
                     } else {
@@ -1935,6 +2063,51 @@ impl Acc {
                 .ok_or_else(|| format!("a {} value could not be rendered for {}", crate::core::value_codec::pg_input_type_name(&ty), func.name()))
         };
         match func {
+            // The longest run of equal values in the call's order (equal
+            // values sort together); a tie goes to the run met first.
+            AggFunc::Mode => {
+                let present: Vec<&Vec<u8>> = values.iter().filter_map(|(_, v)| v.as_ref()).collect();
+                let mut best: Option<(&Vec<u8>, usize)> = None;
+                let mut i = 0;
+                while i < present.len() {
+                    let mut j = i + 1;
+                    while j < present.len() && present[j] == present[i] {
+                        j += 1;
+                    }
+                    if best.is_none_or(|(_, n)| j - i > n) {
+                        best = Some((present[i], j - i));
+                    }
+                    i = j;
+                }
+                Ok(best.map(|(v, _)| v.clone()))
+            }
+            // Over the non-NULL values, in the call's order: NULL when there
+            // are none, as in PostgreSQL.
+            AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                let present: Vec<&Vec<u8>> = values.iter().filter_map(|(_, v)| v.as_ref()).collect();
+                if present.is_empty() {
+                    return Ok(None);
+                }
+                let fraction: f64 = delimiter.as_deref().unwrap_or("0").parse().unwrap_or(0.0);
+                let n = present.len();
+                if func == AggFunc::PercentileDisc {
+                    // The first value whose cumulative share reaches the
+                    // fraction: position ceil(f * n), 1-based, at least 1.
+                    let at = ((fraction * n as f64).ceil() as usize).clamp(1, n) - 1;
+                    return Ok(Some(present[at].clone()));
+                }
+                let number = |bytes: &[u8]| -> Result<f64, String> {
+                    element(bytes)?
+                        .trim()
+                        .parse::<f64>()
+                        .map_err(|e| format!("percentile_cont could not read a value as a number: {e}"))
+                };
+                let position = fraction * (n - 1) as f64;
+                let (lo, hi) = (position.floor() as usize, position.ceil() as usize);
+                let low = number(present[lo])?;
+                let value = if lo == hi { low } else { low + (position - lo as f64) * (number(present[hi])? - low) };
+                Ok(Some(value.to_le_bytes().to_vec()))
+            }
             AggFunc::StringAgg => {
                 let present: Vec<&Vec<u8>> = values.iter().filter_map(|(_, v)| v.as_ref()).collect();
                 if present.is_empty() {
@@ -3550,6 +3723,70 @@ impl<'p> Folder<'p> {
         }
     }
 
+    /// This folder's groups as a partial for a coordinator shard
+    /// (`core::shard::merge`, sharding-plan.md B1c): each group's key, what
+    /// it shows, and its accumulators' running state, unfinished.
+    #[cfg(feature = "sharding")]
+    pub fn export_partial(&self) -> Vec<u8> {
+        use crate::core::shard::merge::{PARTIAL_V1, encode_acc, put_bytes, put_opt_bytes, put_u32};
+        let mut out = Vec::with_capacity(16 + self.accs.len() * 24);
+        out.push(PARTIAL_V1);
+        put_u32(&mut out, self.stride as u32);
+        put_u32(&mut out, self.keys.len() as u32);
+        for (g, key) in self.keys.iter().enumerate() {
+            put_bytes(&mut out, key);
+            put_opt_bytes(&mut out, self.shown.as_ref().map(|s| &*s[g]));
+            for acc in &self.accs[g * self.stride..(g + 1) * self.stride] {
+                encode_acc(acc, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Adds a shard's [`Self::export_partial`] into this folder, as
+    /// [`Self::merge`] adds another folder's groups: each accumulator is
+    /// rebuilt from this folder's own template (the coordinator's plan) and
+    /// merged. A partial made under another plan is refused (`XX000`).
+    #[cfg(feature = "sharding")]
+    pub fn merge_partial(&mut self, partial: &[u8]) -> Result<(), String> {
+        use crate::core::shard::merge::{PARTIAL_V1, Reader, decode_acc};
+        let mut r = Reader::new(partial);
+        if r.u8()? != PARTIAL_V1 {
+            return Err("XX000: a shard's partial aggregate has a layout this build does not know".to_string());
+        }
+        if r.u32()? as usize != self.stride {
+            return Err("XX000: a shard's partial aggregate has another number of aggregates than this plan".to_string());
+        }
+        let groups = r.u32()?;
+        for _ in 0..groups {
+            let key = r.bytes()?;
+            let shown = r.opt_bytes()?;
+            if shown.is_some() != self.shown.is_some() {
+                return Err("XX000: a shard's partial aggregate keys its groups another way than this plan".to_string());
+            }
+            let mut theirs = Vec::with_capacity(self.stride);
+            for t in &self.template {
+                theirs.push(decode_acc(t, &mut r)?);
+            }
+            self.key.clear();
+            self.key.extend_from_slice(&key);
+            if let Some(shown) = shown {
+                self.plain.clear();
+                self.plain.extend_from_slice(&shown);
+            }
+            let byte_cell = self.byte_slot.and_then(|_| one_byte_cell(&key));
+            let at = self.group_for_key(byte_cell);
+            let ours = &mut self.accs[at * self.stride..(at + 1) * self.stride];
+            for (acc, their) in ours.iter_mut().zip(&theirs) {
+                acc.merge(their);
+            }
+        }
+        if !r.done() {
+            return Err("XX000: a shard's partial aggregate has trailing bytes".to_string());
+        }
+        Ok(())
+    }
+
     /// [`Folder::finish`], serialized onto `out`.
     ///
     /// Without an `ORDER BY` each group's row is built, serialized and dropped,
@@ -3557,6 +3794,10 @@ impl<'p> Folder<'p> {
     /// 100k-group result was 156 MB of `Row` for 10 MB of answer. With one, the
     /// rows have to exist together to be sorted, and `finish` builds them.
     pub fn finish_into(mut self, out: &mut Vec<u8>) -> Result<(), String> {
+        #[cfg(feature = "sharding")]
+        if self.cluster_fold()? {
+            return Ok(());
+        }
         let plan = self.plan;
         if !plan.order_by.is_empty() {
             for row in self.finish()? {
@@ -3594,8 +3835,48 @@ impl<'p> Folder<'p> {
         Ok(())
     }
 
+    /// A cluster fan-out's part in this fold (sharding-plan.md B1c), as the
+    /// session's [`crate::core::cancel::Fold`] says: on a peer, the partial is
+    /// handed over and `true` returned (nothing to emit); on the coordinator,
+    /// the peers' partials are merged in and the fold finishes as usual. Only
+    /// the session's first fold takes part: the mode is taken when read.
+    #[cfg(feature = "sharding")]
+    fn cluster_fold(&mut self) -> Result<bool, String> {
+        use crate::core::cancel::Fold;
+        let Some(session) = crate::pgwire::current_session_cancel() else {
+            return Ok(false);
+        };
+        let mut slot = session.fold.lock().unwrap_or_else(|e| e.into_inner());
+        match &mut *slot {
+            Fold::Normal => Ok(false),
+            Fold::Partial(out) => {
+                if out.is_none() {
+                    *out = Some(self.export_partial());
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            Fold::Coordinator { partials, consumed } => {
+                if *consumed {
+                    return Ok(false);
+                }
+                let parts = std::mem::take(partials);
+                *consumed = true;
+                drop(slot);
+                for p in &parts {
+                    self.merge_partial(p)?;
+                }
+                Ok(false)
+            }
+        }
+    }
+
     /// Emits the groups: HAVING, the select list, ORDER BY, OFFSET, LIMIT.
     pub fn finish(mut self) -> Result<Vec<Row>, String> {
+        #[cfg(feature = "sharding")]
+        if self.cluster_fold()? {
+            return Ok(Vec::new());
+        }
         let plan = self.plan;
         // A bare aggregate over an empty table still produces one row —
         // `COUNT(*)` of nothing is 0, not "no rows".
@@ -4260,16 +4541,23 @@ fn sort_output(plan: &AggregatePlan, out: &mut [Row]) {
     // Each key is the position of an output column plus its direction,
     // placement and type, resolved once so the label lookup stays out of the
     // comparator.
-    let sort_keys: Vec<(usize, bool, bool, DbType)> = plan
+    let sort_keys: Vec<(usize, bool, bool, DbType, Option<crate::core::rql::collation::Strength>)> = plan
         .order_by
         .iter()
         .filter_map(|(label, descending, nulls_first)| {
             let idx = plan.items.iter().position(|i| i.label() == label)?;
+            // The spelling of a group of a nondeterministic column (or its
+            // min/max) sorts by the collation.
+            let collation = match &plan.items[idx] {
+                SelectItem::Aggregate { func: AggFunc::Min | AggFunc::Max, call: Some(call), .. } => call.collation,
+                _ => None,
+            };
             Some((
                 idx,
                 *descending,
                 nulls_first.unwrap_or(*descending),
                 plan.items[idx].result_type(),
+                collation,
             ))
         })
         .collect();
@@ -4278,7 +4566,7 @@ fn sort_output(plan: &AggregatePlan, out: &mut [Row]) {
     }
     out.sort_by(|a, b| {
         use std::cmp::Ordering;
-        for (idx, descending, nulls_first, ty) in sort_keys.iter() {
+        for (idx, descending, nulls_first, ty, collation) in sort_keys.iter() {
             let (ac, bc) = (a.columns.get(*idx), b.columns.get(*idx));
             let is_null = |c: Option<&Column>| c.is_none_or(|c| c.column_type == DbType::NULL);
             let ord = match (is_null(ac), is_null(bc)) {
@@ -4298,11 +4586,14 @@ fn sort_output(plan: &AggregatePlan, out: &mut [Row]) {
                     }
                 }
                 (false, false) => {
-                    let ord = compare_values(
+                    let (x, y) = (
                         ac.map(|c| c.data.into_slice()).unwrap_or(&[]),
                         bc.map(|c| c.data.into_slice()).unwrap_or(&[]),
-                        ty,
                     );
+                    let ord = match collation {
+                        Some(strength) => crate::core::rql::collation::compare(x, y, *strength),
+                        None => compare_values(x, y, ty),
+                    };
                     if *descending { ord.reverse() } else { ord }
                 }
             };

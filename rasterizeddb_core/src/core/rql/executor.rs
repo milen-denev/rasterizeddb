@@ -1,5 +1,6 @@
 use rclite::Arc;
 
+use crate::core::row::identifying_key::{IdentifyingKey, identifying_key};
 use log::{debug, error, info, warn};
 
 use crate::core::mvcc::table_locks::TableMode;
@@ -655,8 +656,20 @@ async fn run_subquery_scaled_body(
 
     let mut rows = crate::core::row::row::vec_into_rows(&response[1..])
         .map_err(|e| format!("subquery result could not be read: {}", e))?;
-    let scales = recognize_query_purpose(sql)
-        .and_then(|purpose| query_output_scales(&purpose, database));
+    // The scales are the select list's and the table's: read off the query
+    // without its row filter, which decides none of them and is parsed with
+    // it otherwise. A filter decorrelated into `id IN (4,000 keys)` was
+    // parsed a second time here, after the run, for every subquery.
+    let unfiltered = if ["UNION", "INTERSECT", "EXCEPT"].iter().any(|w| crate::core::rql::join::find_keyword(sql, w, 0).is_some()) {
+        None
+    } else {
+        crate::pgwire::without_where(sql)
+    };
+    let scales = unfiltered
+        .as_deref()
+        .and_then(recognize_query_purpose)
+        .and_then(|purpose| query_output_scales(&purpose, database))
+        .or_else(|| recognize_query_purpose(sql).and_then(|purpose| query_output_scales(&purpose, database)));
     if let Some(scales) = scales.as_ref().filter(|_| normalize) {
         normalize_decimal_scales(&mut rows, scales);
     }
@@ -1230,7 +1243,8 @@ pub(crate) fn correlated_in_as_exists(sql: &str) -> Option<String> {
         let outer = outer_relation_names(&current);
         let reads_outer = subquery::outer_refs(inner)
             .iter()
-            .any(|(qualifier, _)| outer.iter().any(|o| o.eq_ignore_ascii_case(qualifier)));
+            .any(|(qualifier, _)| outer.iter().any(|o| o.eq_ignore_ascii_case(qualifier)))
+            || subquery::from_list_reads_outer(inner, &outer);
         if !reads_outer {
             continue;
         }
@@ -1303,9 +1317,15 @@ pub(crate) fn correlated_in_as_exists(sql: &str) -> Option<String> {
         // Every pair equal; and no pair definitely unequal (each equal, or
         // either side NULL) — what makes a row comparison not false.
         let all_equal = pairs.iter().map(|(i, c)| format!("{i} = {c}")).collect::<Vec<_>>().join(" AND ");
+        // A constant on the left is never NULL, and `'x' IS NULL` is no
+        // condition a subquery's WHERE takes.
+        let constant = |c: &str| {
+            let v = c.trim().trim_start_matches('(').trim_end_matches(')').trim();
+            (v.starts_with('\'') && v.ends_with('\'')) || v.parse::<f64>().is_ok()
+        };
         let maybe_equal = pairs
             .iter()
-            .map(|(i, c)| format!("({i} = {c} OR {i} IS NULL OR {c} IS NULL)"))
+            .map(|(i, c)| if constant(c) { format!("({i} = {c} OR {i} IS NULL)") } else { format!("({i} = {c} OR {i} IS NULL OR {c} IS NULL)") })
             .collect::<Vec<_>>()
             .join(" AND ");
         let rest = &inner[from_at..];
@@ -1361,10 +1381,37 @@ fn left_operand_start(text: &str) -> Option<usize> {
             b'(' => depth -= 1,
             b',' if depth == 0 => break,
             b'+' | b'-' | b'*' | b'/' | b'%' | b',' => {}
+            // A string constant, back to the quote that opens it (`''` inside
+            // it is one quote): `'a' IN (SELECT …)` had no left side here,
+            // and its correlated subquery was run on its own.
+            b'\'' => {
+                let mut j = i - 1;
+                loop {
+                    while j > 0 && bytes[j - 1] != b'\'' {
+                        j -= 1;
+                    }
+                    if j == 0 {
+                        return None;
+                    }
+                    j -= 1;
+                    if j > 0 && bytes[j - 1] == b'\'' {
+                        j -= 1;
+                        continue;
+                    }
+                    break;
+                }
+                i = j;
+                start = Some(j);
+                continue;
+            }
             _ if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'"') => {
                 let end = i;
                 let mut j = i;
                 while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || matches!(bytes[j - 1], b'_' | b'.' | b'"')) {
+                    j -= 1;
+                }
+                // `$1`: a parameter.
+                if j > 0 && bytes[j - 1] == b'$' && text[j..end].bytes().all(|b| b.is_ascii_digit()) {
                     j -= 1;
                 }
                 if depth == 0 && BOUNDARIES.iter().any(|k| text[j..end].eq_ignore_ascii_case(k)) {
@@ -1422,6 +1469,13 @@ fn qualify_bare_columns(text: &str, alias: impl Fn() -> Option<String>) -> Optio
                 out.push(bytes[i] as char);
                 i += 1;
             }
+            continue;
+        }
+        // A string constant is no column, whatever words it holds.
+        if c == b'\'' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            out.push_str(&text[i..end]);
+            i = end;
             continue;
         }
         out.push(c as char);
@@ -1488,7 +1542,7 @@ fn decides_the_where(sql: &str, at: usize) -> bool {
             || head.ends_with('(')
             || ["AND", "OR"].iter().any(|k| {
                 head.len() >= k.len()
-                    && head[head.len() - k.len()..].eq_ignore_ascii_case(k)
+                    && head.as_bytes()[head.len() - k.len()..].eq_ignore_ascii_case(k.as_bytes())
                     && head[..head.len() - k.len()].ends_with(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             })
     };
@@ -1529,6 +1583,131 @@ fn single_outer_alias(sql: &str) -> Option<String> {
     Some(name.trim_matches('"').to_string())
 }
 
+/// `sql` with each subquery that is one set-returning function and no
+/// `FROM` — `x IN (SELECT jsonb_array_elements_text(t.tags))`, `EXISTS
+/// (SELECT unnest(t.a))` — written with the function in its `FROM`
+/// (`table_functions::select_list_form`), which is what the passes that run
+/// a subquery read. `None` when nothing changes. It was a column named for
+/// the whole call ("column "jsonb_array_elements_text(t.tags)" does not
+/// exist").
+pub(crate) fn subquery_select_list_functions(sql: &str) -> Option<String> {
+    if !crate::core::sql_scan::contains_ignore_ascii_case(sql, b"(select") && !crate::core::sql_scan::contains_ignore_ascii_case(sql, b"( select") {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, bytes[i]);
+                continue;
+            }
+            b'(' => {
+                let inner_at = i + 1;
+                if crate::core::sql_scan::starts_with_keyword(sql[inner_at..].trim_start(), "SELECT") {
+                    if let Some(close) = crate::core::rql::expr::matching_paren(sql, i) {
+                        // After IN, EXISTS, ANY, ALL or SOME the subquery is
+                        // read by its value, not by its column's name.
+                        let before = sql[..i].trim_end();
+                        let word_at = before.char_indices().rev().find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |(p, c)| p + c.len_utf8());
+                        let by_value = ["IN", "EXISTS", "ANY", "ALL", "SOME"].iter().any(|k| before[word_at..].eq_ignore_ascii_case(k));
+                        if let Some(form) = crate::core::rql::table_functions::select_list_form_as(&sql[inner_at..close], !by_value) {
+                            out.push_str(&sql[copied..inner_at]);
+                            out.push_str(&form);
+                            copied = close;
+                            i = close;
+                            continue;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
+}
+
+/// `sql` with the bare column names in the arguments of a function that
+/// opens a subquery's `FROM` qualified by the statement's one outer
+/// relation: `EXISTS (SELECT 1 FROM jsonb_array_elements(tags) e …)` over
+/// `t` as `… jsonb_array_elements(t.tags) e …`. `None` when nothing changes.
+///
+/// Such a function has nothing before it in its own `FROM` to read a column
+/// of, so a bare name there is the outer row's, as PostgreSQL resolves it.
+/// The passes that run a subquery for each outer row find that row's columns
+/// by their qualifier; bare, the subquery was run alone ("column "tags" does
+/// not exist"). Only with one outer relation, where the qualifier is not a
+/// guess, and not inside the statement's own `FROM` list.
+pub(crate) fn qualify_outer_function_args(sql: &str) -> Option<String> {
+    use crate::core::rql::join::find_keyword;
+    if !crate::core::sql_scan::contains_ignore_ascii_case(sql, b"(select") && !crate::core::sql_scan::contains_ignore_ascii_case(sql, b"( select") {
+        return None;
+    }
+    let alias = single_outer_alias(sql)?;
+    // The statement's own FROM list: a derived table there is no subquery
+    // of a row.
+    let own_from = find_keyword(sql, "FROM", 0).map(|from| {
+        let end = ["WHERE", "GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "RETURNING", "UNION", "INTERSECT", "EXCEPT"]
+            .iter()
+            .filter_map(|kw| find_keyword(sql, kw, from + 4))
+            .min()
+            .unwrap_or(sql.len());
+        from..end
+    });
+    let bytes = sql.as_bytes();
+    let mut inserts: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, bytes[i]);
+                continue;
+            }
+            b'(' if !own_from.as_ref().is_some_and(|r| r.contains(&i)) => {
+                let inner_at = i + 1 + (sql[i + 1..].len() - sql[i + 1..].trim_start().len());
+                if crate::core::sql_scan::starts_with_keyword(&sql[inner_at..], "SELECT") {
+                    if let Some(close) = crate::core::rql::expr::matching_paren(sql, i) {
+                        let inner = &sql[inner_at..close];
+                        // `FROM name(args)`: the function opening the list.
+                        if let Some(from) = find_keyword(inner, "FROM", 0) {
+                            let rest = &inner[from + 4..];
+                            let name_at = rest.len() - rest.trim_start().len();
+                            let name_len = rest[name_at..].bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count();
+                            let open = name_at + name_len + (rest[name_at + name_len..].len() - rest[name_at + name_len..].trim_start().len());
+                            if name_len > 0 && rest.as_bytes().get(open) == Some(&b'(') && !rest[name_at..name_at + name_len].eq_ignore_ascii_case("VALUES") {
+                                if let Some(args_close) = crate::core::rql::expr::matching_paren(rest, open) {
+                                    let base = inner_at + from + 4 + open + 1;
+                                    for (_, at) in crate::core::rql::lateral::bare_names(&rest[open + 1..args_close]) {
+                                        inserts.push(base + at);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if inserts.is_empty() {
+        return None;
+    }
+    let mut out = sql.to_string();
+    inserts.sort_unstable();
+    for at in inserts.into_iter().rev() {
+        out.insert_str(at, &format!("{alias}."));
+    }
+    Some(out)
+}
+
 /// `sql` with each `[NOT] EXISTS (…)` that compares an outer column by
 /// anything but `=` written as the count it asks about: `(SELECT count(*)
 /// FROM … WHERE …) > 0`, or `= 0`. `None` when it has none.
@@ -1566,11 +1745,19 @@ pub(crate) fn exists_as_counts(sql: &str) -> Option<String> {
         // `IN` can stand in for: as the count, a number the cast and the
         // arithmetic read. It was refused ("a correlated EXISTS used as a
         // value … is not supported").
+        // A function in its FROM over the outer row's column
+        // (`EXISTS (SELECT 1 FROM jsonb_array_elements(t.doc) e WHERE …)`)
+        // reads that row whatever the WHERE compares, and no `IN` runs a
+        // function once for every row: counted, it is a LATERAL item, which
+        // does. It was taken for uncorrelated and run on its own ("missing
+        // FROM-clause entry for table t").
+        let function_over_outer = subquery::from_list_reads_outer(body.inner_sql.trim(), &outer);
         let goes = bounds.limit != Some(0)
             && bounds.offset == 0
-            && subquery::uncorrelated_exists(&body, &outer).is_none()
-            && (exists_used_as_value(&current, clause.start, clause.end)
-                || subquery::exists_to_in(&body, &outer).is_err_and(|e| only_equalities_refusal(&e)));
+            && (function_over_outer
+                || (subquery::uncorrelated_exists(&body, &outer).is_none()
+                    && (exists_used_as_value(&current, clause.start, clause.end)
+                        || subquery::exists_to_in(&body, &outer).is_err_and(|e| only_equalities_refusal(&e)))));
         if !goes {
             continue;
         }
@@ -1599,6 +1786,10 @@ pub(crate) fn exists_as_counts(sql: &str) -> Option<String> {
 /// subquery, after an `EXISTS` that compares the row by anything but `=` is
 /// counted (`exists_as_counts`); `None` when it holds none.
 fn correlated_write_where(sql: &str, database: &Arc<Database>, delete: bool) -> Option<Result<WriteWhere, String>> {
+    let in_from = subquery_select_list_functions(sql);
+    let sql = in_from.as_deref().unwrap_or(sql);
+    let qualified = qualify_outer_function_args(sql);
+    let sql = qualified.as_deref().unwrap_or(sql);
     let split = exists_over_set_operation(sql);
     let sql = split.as_deref().unwrap_or(sql);
     let as_exists = correlated_in_as_exists(sql).or(split.clone());
@@ -4662,6 +4853,8 @@ fn rewrite_definition(
             })
             .collect(),
         is_immutable: false,
+        special: crate::core::row::schema::SpecialTable::None,
+        ledger_policy: Vec::new(),
         if_not_exists: false,
         foreign_keys: table_schema.foreign_keys.iter().cloned().collect(),
         defaults: table_schema.defaults.iter().cloned().collect(),
@@ -7100,10 +7293,18 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
     // Rows told apart by a column with a nondeterministic collation are
     // refused (`collation::refuse_in_set_op`).
     let compares = parts.ops.iter().any(|op| !(op.all && op.kind == crate::core::rql::join::SetKind::Union));
+    // Rows are told apart under each column's collation
+    // (`collation::set_op_collations`): 'Abc' and 'abc' are one row of a
+    // case-insensitive column.
     let fields = |table: &str| database.schema_view(table).map(|v| v.schema().fields.to_vec());
-    if let Err(e) = crate::core::rql::collation::refuse_in_set_op(&parts.branches, compares, &fields) {
-        return ddl_error(&e);
-    }
+    let collations = if compares {
+        match crate::core::rql::collation::set_op_collations(&parts.branches, &fields) {
+            Ok(c) => c,
+            Err(e) => return ddl_error(&e),
+        }
+    } else {
+        Vec::new()
+    };
 
     // A document column compares by value, so `{"a":1}` and `{"a":1.0}` are
     // one row. A position is a document column when any branch says so
@@ -7139,6 +7340,7 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
         Ok(combined) => combined,
         Err(e) => return ddl_error(&e),
     };
+    combined.set_collations(collations);
     // A NUMERIC column whose branches keep different scales: each cell at
     // its own (`set_ops::union_decimal_scales`).
     {
@@ -10374,6 +10576,189 @@ async fn execute_lock_table(
     ddl_ok(0)
 }
 
+/// A ledger statement (`ledger_hooks::is_ledger_statement`): the special
+/// tables it names (or every one), their visible rows for `VERIFY` and the
+/// vault statements, handed to the installed hooks; the policy records they
+/// return appended to each table's sidecar and the rows they return
+/// inserted in this statement's transaction, before the reply goes out.
+///
+/// Who may run what: `VERIFY` and `SHOW` anyone who may read the table;
+/// `ALTER LEDGER TABLE` its owner or a superuser; `ACKNOWLEDGE LEDGER
+/// ROLLBACK` a superuser; a vault's reads `SELECT` on it, its writes
+/// `INSERT`, and `PURGE`, `ROTATE KEY` and `AUDIT` its owner or a
+/// superuser. A statement whose role the front end did not say is refused
+/// all but `VERIFY` and `SHOW`.
+#[inline(never)]
+async fn execute_ledger_statement(sql: &str, database: &Arc<Database>, depth: usize, tx: TxId) -> Result<Vec<String>, String> {
+    use crate::core::database::relation::Relation;
+    let words: Vec<&str> = sql.trim().trim_end_matches(';').split_whitespace().collect();
+    let up = |i: usize| words.get(i).map(|w| w.to_ascii_uppercase()).unwrap_or_default();
+    let (verb, op) = (up(0), up(2));
+    let reads_rows = verb == "VERIFY" || verb == "VAULT";
+    let named: Option<&str> = match verb.as_str() {
+        // `SHOW LEDGER RECEIPT <table> <row stamp>`.
+        "SHOW" if op == "RECEIPT" => Some(*words.get(3).ok_or("42601: SHOW LEDGER RECEIPT needs a table and a row stamp")?),
+        "SHOW" if op == "HISTORY" => Some(*words.get(3).ok_or("42601: SHOW LEDGER HISTORY needs a table and a row stamp")?),
+        "VERIFY" | "SHOW" => words.get(2).copied().filter(|w| !matches!(w.to_ascii_uppercase().as_str(), "FULL" | "SINCE")),
+        "ALTER" => Some(*words.get(3).ok_or("42601: ALTER LEDGER TABLE needs a table name")?),
+        "VAULT" => Some(*words.get(1).ok_or("42601: VAULT needs a vault name")?),
+        _ => None,
+    };
+    let session = crate::core::ledger_hooks::session();
+    let (role, superuser) = session.clone().unwrap_or_default();
+    // The privilege each statement needs, checked before anything is read.
+    let needs: Option<&str> = match (verb.as_str(), op.as_str()) {
+        ("VERIFY", _) | ("SHOW", _) => None,
+        ("VAULT", "GET" | "LIST" | "VERSIONS" | "ENCRYPT" | "DECRYPT" | "SIGN" | "VERIFY" | "PUBLIC") => Some("SELECT"),
+        ("VAULT", "SET" | "DISABLE" | "ENABLE" | "DELETE" | "RECOVER") => Some("INSERT"),
+        _ => Some("OWNER"),
+    };
+    if needs.is_some() && session.is_none() {
+        return Err("42501: this statement needs a session whose role is known".to_string());
+    }
+    if verb == "ACKNOWLEDGE" && !superuser {
+        return Err("42501: ACKNOWLEDGE LEDGER ROLLBACK needs a superuser".to_string());
+    }
+    // A legal hold is set by the table's owner, and released only by a
+    // superuser: the owner is whom a hold may be about, and releasing it
+    // needed no more than owning the table.
+    if verb == "ALTER"
+        && !superuser
+        && words.windows(3).any(|w| {
+            w[0].eq_ignore_ascii_case("RELEASE") && w[1].eq_ignore_ascii_case("LEGAL") && w[2].eq_ignore_ascii_case("HOLD")
+        })
+    {
+        return Err("42501: RELEASE LEGAL HOLD needs a superuser".to_string());
+    }
+    let names: Vec<String> = match named {
+        Some(n) => vec![database.resolve_key(n).ok_or_else(|| format!("42P01: relation \"{n}\" does not exist"))?],
+        None => database
+            .relation_names()
+            .into_iter()
+            .filter(|n| database.schema_view(n).is_some_and(|r| r.schema().special.is_special()))
+            .collect(),
+    };
+    if let (Some(privilege), false) = (needs, superuser) {
+        let acl = crate::core::rql::privileges::load(database, Some(tx)).await?;
+        for name in &names {
+            let ok = match privilege {
+                "OWNER" => crate::core::rql::privileges::owns(&acl, &role, name),
+                p => crate::core::rql::privileges::allows(&acl, &role, name, p),
+            };
+            if !ok {
+                return Err(format!(
+                    "42501: permission denied for {} \"{name}\"{}",
+                    if verb == "VAULT" { "vault" } else { "ledger table" },
+                    if privilege == "OWNER" { " (needs its owner or a superuser)".to_string() } else { format!(" ({privilege})") }
+                ));
+            }
+        }
+    }
+    // Held for the statement: a policy change (holds, retention) is not
+    // raced by a write it would refuse, and the rows read are the table's.
+    let mode = match verb.as_str() {
+        "ALTER" | "ACKNOWLEDGE" => crate::core::mvcc::table_locks::TableMode::Share,
+        "VAULT" => crate::core::mvcc::table_locks::TableMode::RowExclusive,
+        _ => crate::core::mvcc::table_locks::TableMode::AccessShare,
+    };
+    let mut held = Vec::new();
+    for name in &names {
+        let Some(relation) = database.relation_for(name, crate::core::mvcc::owner::ensure(), mode).await? else { continue };
+        let kind = relation.schema().special;
+        if !kind.is_special() || (verb == "VAULT" && kind != crate::core::row::schema::SpecialTable::Vault) {
+            return Err(format!(
+                "42809: \"{name}\" is not a {}",
+                if verb == "VAULT" { "vault" } else { "ledger table or vault" }
+            ));
+        }
+        let rows = match (&relation, reads_rows) {
+            (_, false) => Vec::new(),
+            (Relation::Plain(table), true) => table.ledger_rows().await.map_err(|e| e.to_string())?,
+            (Relation::Partitioned(_), true) => {
+                return Err(format!("0A000: \"{name}\" is partitioned; ledger statements on partitioned tables are not supported yet"));
+            }
+        };
+        held.push((relation, rows));
+    }
+    // `SHOW LEDGER HISTORY <table> <stamp>`: every version of one row.
+    let mut versions = Vec::new();
+    if verb == "SHOW" && op == "HISTORY" {
+        let ts: i64 = words.get(4).and_then(|w| w.parse().ok()).ok_or("42601: SHOW LEDGER HISTORY <table> <row stamp>")?;
+        if let Some((Relation::Plain(table), _)) = held.first() {
+            versions = table.ledger_versions(ts).await.map_err(|e| e.to_string())?;
+        }
+    }
+    let request = crate::core::ledger_hooks::LedgerRequest {
+        sql,
+        tables: held.iter().map(|(r, rows)| (r.schema(), rows.clone())).collect(),
+        versions,
+        role: &role,
+        superuser,
+        tx,
+        aborted: Some(&|t| database.transactions.outcome(t) == crate::core::mvcc::TxOutcome::Aborted),
+    };
+    let reply = crate::core::ledger_hooks::statement(&database.ledger_store(), request)?;
+    for insert in &reply.inserts {
+        let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(insert)
+            .ok_or_else(|| "XX000: a vault write could not be read back as an INSERT".to_string())?;
+        let result = crate::core::ledger_hooks::as_vault_write(Box::pin(execute_with_context(
+            purpose,
+            database.clone(),
+            depth + 1,
+            tx,
+        )))
+        .await;
+        if result.first() == Some(&3) {
+            return Err(String::from_utf8_lossy(&result[1..]).into_owned());
+        }
+    }
+    for (name, record) in &reply.records {
+        let Some((Relation::Plain(table), _)) = held.iter().find(|(r, _)| &r.schema().name == name) else {
+            return Err(format!("0A000: a policy record for \"{name}\" has no plain table to go to"));
+        };
+        let mut writes = crate::core::torn_tail::SidecarWrites::default();
+        crate::core::ledger_hooks::policy_sidecar::stage(&*table.io_schema, &mut writes, record);
+        writes.commit(&*table.io_schema).await.map_err(|e| e.to_string())?;
+        crate::core::ledger_hooks::records_written(&database.ledger_store(), std::slice::from_ref(record))?;
+    }
+    Ok(reply.lines)
+}
+
+/// A `CREATE LEDGER TABLE` or `CREATE VAULT` (`ledger_ddl`) as the plain
+/// `CREATE TABLE` to run, with the kind and first policy record its table
+/// gets; any other statement as it came. The policy comes from the installed
+/// ledger hooks, so a build without them refuses here, before anything is
+/// locked or written.
+#[inline(never)]
+///
+/// The statement as written comes back too: it is what replicates. The
+/// plain `CREATE TABLE` used to, and a replica (or a shard's Raft follower)
+/// made an ordinary table of a ledger table or vault, which took UPDATE and
+/// DELETE and kept them after a failover made it the primary.
+fn special_create(
+    query: QueryPurpose,
+    database: &Database,
+) -> Result<(QueryPurpose, Option<(crate::core::row::schema::SpecialTable, Vec<u8>, String)>), String> {
+    let QueryPurpose::CreateTable(sql) = &query else {
+        return Ok((query, None));
+    };
+    let Some(split) = crate::core::rql::ledger_ddl::split(sql) else {
+        return Ok((query, None));
+    };
+    let split = split?;
+    // `IF NOT EXISTS` over a table that is there changes nothing, so asks
+    // the hooks for nothing: the policy would open a vault's key provider,
+    // and `mlkem:…;create` made a key file no vault would ever use.
+    if split.create_sql.starts_with("CREATE TABLE IF NOT EXISTS ")
+        && database.schema_view(&crate::core::sql_scan::bare_name(&split.name)).is_some()
+    {
+        return Ok((QueryPurpose::CreateTable(split.create_sql), None));
+    }
+    let policy = crate::core::ledger_hooks::create_policy(split.kind, &split.name, &split.clauses)?;
+    let written = sql.clone();
+    Ok((QueryPurpose::CreateTable(split.create_sql), Some((split.kind, policy, written))))
+}
+
 /// `TRUNCATE` (`rql::truncate`): every named table's rows deleted, as one
 /// statement of transaction `tx`, under ACCESS EXCLUSIVE on each.
 ///
@@ -10428,6 +10813,16 @@ async fn execute_truncate(database: &Arc<Database>, sql: &str, depth: usize, tx:
             tables.push(child);
         }
         at += 1;
+    }
+    // A ledger table or vault, named or reached by CASCADE, is truncated
+    // only if its policy admits it (`ledger_hooks`), before anything is
+    // locked or deleted.
+    for name in &tables {
+        if let Some(view) = database.schema_view(name) {
+            if let Err(e) = crate::core::ledger_hooks::admit(view.schema(), crate::core::ledger_hooks::WriteKind::Truncate) {
+                return ddl_error(&e);
+            }
+        }
     }
     for table in &tables {
         if let Err(e) = Box::pin(database.relation_for(table, owner(), TableMode::AccessExclusive)).await {
@@ -10852,6 +11247,15 @@ fn fold_constants_in_predicate(text: &str) -> String {
 /// Otherwise (the `SET` of one conflict's update) it is computed once here.
 fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>, per_row: bool) -> String {
     fn fold_operand(operand: &str, refused: &mut Option<String>, per_row: bool) -> String {
+        fold_operand_as(operand, refused, per_row, false)
+    }
+
+    /// [`fold_operand`]; `pattern`: the operand is a `LIKE` pattern, which
+    /// is text whatever it is made of, so strings concatenated there are one
+    /// string. A comparison's operand is not folded so: `d <> 'x' || ''` is
+    /// a date against text (PostgreSQL's 42883), where the literal `'x'`
+    /// alone would be read as a date.
+    fn fold_operand_as(operand: &str, refused: &mut Option<String>, per_row: bool, pattern: bool) -> String {
         // The statement's own `;` is not part of its last operand: left on
         // it, `id <= 5 + 100;` (as pgbench and many drivers send it) and
         // `ts < NOW();` were never folded.
@@ -10896,7 +11300,16 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>, pe
         // too, at the exact decimal the evaluator computes. Left as text it
         // was evaluated against the column, and a NUMERIC column refused the
         // result's width: "operand size does not match".
-        if trimmed.is_empty() || !(crate::core::rql::expr::needs_evaluation(trimmed) || literal_arithmetic(trimmed)) {
+        // Strings concatenated (`'%' || 'x' || '%'`, as a string `+` of an
+        // inlined parameter arrives): it opens with a quote, which
+        // `needs_evaluation` takes for one literal.
+        let concatenation = pattern
+            && trimmed.starts_with('\'')
+            && trimmed.contains("||")
+            && crate::core::sql_scan::quoted_end(trimmed.as_bytes(), 0, b'\'') != trimmed.len();
+        if trimmed.is_empty()
+            || !(crate::core::rql::expr::needs_evaluation(trimmed) || literal_arithmetic(trimmed) || concatenation)
+        {
             return operand.to_string();
         }
         let expr = match crate::core::rql::expr::parse(trimmed, &[]) {
@@ -11087,7 +11500,31 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>, pe
                         if let Some(e) = constant_refusal(term.trim().trim_end_matches(';').trim_end()) {
                             refused.get_or_insert(e);
                         }
-                        out.push_str(term)
+                        // A pattern computed from constants (`c LIKE '%' ||
+                        // 'x' || '%'`) is folded as a comparison's operand
+                        // is: the scan reads a pattern that is a literal,
+                        // and refused this one ("unexpected character '|'").
+                        // Bare, whatever it ends in: a pattern is matched
+                        // as written, never blank-padded.
+                        let pattern = ["LIKE", "ILIKE"]
+                            .iter()
+                            .filter_map(|w| crate::core::rql::join::find_keyword(term, w, 0).map(|at| at + w.len()))
+                            .min();
+                        match pattern {
+                            Some(start) => {
+                                let end = crate::core::rql::join::find_keyword(term, "ESCAPE", start).unwrap_or(term.len());
+                                let folded = fold_operand_as(&term[start..end], refused, per_row, true);
+                                let body = folded.trim_end();
+                                let folded = match body.strip_suffix("::text") {
+                                    Some(bare) if bare.ends_with('\'') => format!("{bare}{}", &folded[body.len()..]),
+                                    _ => folded,
+                                };
+                                out.push_str(&term[..start]);
+                                out.push_str(&folded);
+                                out.push_str(&term[end..]);
+                            }
+                            None => out.push_str(term),
+                        }
                     }
                 }
             }
@@ -12458,6 +12895,15 @@ fn supply_generated_values(
 
     let mut computed: Vec<(String, String)> = Vec::with_capacity(generated.len());
     for g in &generated {
+        // A collation's key companion (`__ci_x = __rdb_ci_key(x)`, its GUID
+        // order's, …): the key of the column's value, made directly. Each
+        // row's value was written into the expression's text and the text
+        // parsed again, which over long text was most of a bulk copy into a
+        // case-insensitive table.
+        if let Some(literal) = companion_key_literal(&g.column, &g.expression, &values) {
+            computed.push((g.column.clone(), literal));
+            continue;
+        }
         let substituted = match substitute_columns(&g.expression, &values) {
             Ok(text) => text,
             Err(reason) => return Some(Err(reason)),
@@ -12996,6 +13442,74 @@ fn expression_columns(
 /// `tax_amount` had the shorter name substituted inside the longer one, leaving
 /// arithmetic over a fragment — the same prefix-matching mistake that once
 /// deleted a column and a predicate elsewhere in this parser.
+/// The literal of a collation key companion's value (`column` generated as
+/// `expression`), computed from its base column's literal in `values` as
+/// the expression would (`collation::key`, quoted as a text value is);
+/// `None` when `column` is no companion, the expression is not its own, or
+/// the base's literal is not a plain quoted text or NULL (then it is
+/// computed the general way).
+fn companion_key_literal(column: &str, expression: &str, values: &[(String, String)]) -> Option<String> {
+    let (base, strength) = crate::core::rql::collation::companion_of(column)?;
+    let own = crate::core::rql::collation::companion_expression(base, strength)?;
+    if !own.eq_ignore_ascii_case(expression.trim()) {
+        return None;
+    }
+    let (_, literal) = values.iter().find(|(name, _)| name.eq_ignore_ascii_case(base))?;
+    let literal = literal.trim();
+    if literal.eq_ignore_ascii_case("NULL") {
+        return Some("NULL".to_string());
+    }
+    // Exactly one quoted string: `'a' || 'b'` also begins and ends with a
+    // quote, and keyed as the text `a' || 'b` it was a wrong key where the
+    // general way evaluates it. And quoted the one way a text is (its
+    // quotes doubled), so the text read back is the value.
+    if literal.len() < 2
+        || !literal.starts_with('\'')
+        || crate::core::sql_scan::quoted_end(literal.as_bytes(), 0, b'\'') != literal.len()
+    {
+        return None;
+    }
+    let text = crate::core::value_codec::unquote_sql(literal);
+    if crate::core::value_codec::quote_sql(&text) != literal {
+        return None;
+    }
+    Some(crate::core::value_codec::quote_sql(&crate::core::rql::collation::key(&text, strength)))
+}
+
+#[cfg(test)]
+mod companion_key_literal_tests {
+    use super::companion_key_literal;
+
+    /// A companion's literal made directly is the one the general way makes
+    /// (`__rdb_ci_key` evaluated, the text quoted).
+    #[test]
+    fn a_companion_key_is_the_expressions_value() {
+        let values = vec![("name".to_string(), "'O''Brien ÉTÉ'".to_string()), ("n".to_string(), "NULL".to_string())];
+        assert_eq!(companion_key_literal("__ci_name", "__rdb_ci_key(name)", &values).as_deref(), Some("'o''brien été'"));
+        assert_eq!(companion_key_literal("__cia_name", "__rdb_ci_ai_key(name)", &values).as_deref(), Some("'o''brien ete'"));
+        assert_eq!(companion_key_literal("__ci_n", "__rdb_ci_key(n)", &values).as_deref(), Some("NULL"));
+        // Not a companion's own expression, or not a plain literal: the
+        // general way.
+        assert_eq!(companion_key_literal("__ci_name", "__rdb_ci_key(n)", &values), None);
+        assert_eq!(companion_key_literal("total", "price * 2", &values), None);
+        let cast = vec![("name".to_string(), "'x'::text".to_string())];
+        assert_eq!(companion_key_literal("__ci_name", "__rdb_ci_key(name)", &cast), None);
+        // Quoted at both ends but not one string: an expression, or an
+        // unterminated run.
+        for text in ["'a' || 'b'", "'a' || name || 'b'", "'a''", "'it''s' || 'x'"] {
+            let v = vec![("name".to_string(), text.to_string())];
+            assert_eq!(companion_key_literal("__ci_name", "__rdb_ci_key(name)", &v), None, "{text}");
+        }
+        let escaped = vec![("name".to_string(), "'It''S'".to_string())];
+        assert_eq!(companion_key_literal("__ci_name", "__rdb_ci_key(name)", &escaped).as_deref(), Some("'it''s'"));
+        let g = vec![("g".to_string(), "'01000000-0000-0000-0000-000000000000'".to_string())];
+        assert_eq!(
+            companion_key_literal("__gs_g", "__rdb_guid_key(g)", &g).as_deref(),
+            Some("'00000000000000000000000000000001'")
+        );
+    }
+}
+
 fn substitute_columns(expression: &str, values: &[(String, String)]) -> Result<String, String> {
     // A byte of a multi-byte character is part of a name, so `naïve` is found
     // whole. It was not, and each of its bytes outside a word was pushed as a
@@ -13024,6 +13538,23 @@ fn substitute_columns(expression: &str, values: &[(String, String)]) -> Result<S
                 i += 1;
             }
             out.push_str(&expression[start..i]);
+            continue;
+        }
+        // A quoted name (`"K"`, a relation copy's column) is one name: its
+        // quotes were copied and the word inside them substituted, leaving
+        // `"('…')"`, which named nothing.
+        if bytes[i] == b'"' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+            let name = expression[i + 1..end.saturating_sub(1).max(i + 1)].replace("\"\"", "\"");
+            match values.iter().find(|(n, _)| *n == name || n.eq_ignore_ascii_case(&name)) {
+                Some((_, literal)) => {
+                    out.push('(');
+                    out.push_str(literal.trim());
+                    out.push(')');
+                }
+                None => out.push_str(&expression[i..end]),
+            }
+            i = end;
             continue;
         }
         if !is_word_byte(bytes[i]) {
@@ -13395,7 +13926,14 @@ async fn run_conversion(
     };
     let table = conversion.table.clone();
     match database.relation_for(&table, owner(), TableMode::AccessExclusive).await {
-        Ok(Some(crate::core::database::relation::Relation::Plain(_))) => {}
+        // A ledger table or vault is never converted: the partitioned table
+        // it became was a plain one (`rewrite_definition` builds no ledger
+        // kind), which took UPDATE, DELETE and DROP inside its retention.
+        Ok(Some(relation @ crate::core::database::relation::Relation::Plain(_))) => {
+            if let Err(e) = crate::core::ledger_hooks::admit(relation.schema(), crate::core::ledger_hooks::WriteKind::Alter("PARTITION BY")) {
+                return ddl_error(&e);
+            }
+        }
         Ok(Some(crate::core::database::relation::Relation::Partitioned(_))) => {
             return ddl_error(&format!("table \"{table}\" is already partitioned (not supported)"));
         }
@@ -13792,8 +14330,16 @@ async fn add_foreign_key(
         Err(e) => return ddl_error(&e),
     };
     let visible = crate::core::rql::nullable::visible_fields(&schema.fields);
-    if let Some(missing) =
-        fk.columns.iter().find(|c| !visible.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(c)))
+    // A case-insensitive column's key is its companion
+    // (`collation::constraint_on_keys`), hidden as it is.
+    let companion = |c: &str| {
+        crate::core::rql::collation::is_companion(c)
+            && schema.fields.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(c))
+    };
+    if let Some(missing) = fk
+        .columns
+        .iter()
+        .find(|c| !companion(c) && !visible.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(c)))
     {
         return ddl_error(&format!("column \"{}\" referenced in foreign key constraint does not exist", missing));
     }
@@ -16514,6 +17060,18 @@ async fn existing_rows_break_unique(
     Ok(None)
 }
 
+/// Whether an `ALTER COLUMN … TYPE` keeps the column text (`varchar(n)`,
+/// `text`, `character varying`, `bpchar`): its case-insensitive key
+/// companion reads it the same way after, so the retype keeps it.
+fn retypes_to_text(detail: &str) -> bool {
+    let upper = detail.trim().to_ascii_uppercase();
+    let Some(at) = upper.find("TYPE") else { return false };
+    let ty = upper[at + 4..].trim_start();
+    ["TEXT", "VARCHAR", "CHARACTER VARYING", "NVARCHAR", "CITEXT"]
+        .iter()
+        .any(|t| ty.starts_with(t) && !ty[t.len()..].trim_start().starts_with("[]"))
+}
+
 /// Applies every action in an `ALTER TABLE`.
 ///
 /// A statement may carry a comma-separated action list, and each action is
@@ -16525,22 +17083,57 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
     // A column given a nondeterministic collation here would compare by its
     // bytes: refused until ALTER can make its key companion.
     if crate::core::rql::collation::declares_nondeterministic(sql) {
-        return ddl_error("ALTER TABLE giving a column a case-insensitive collation is not supported yet; declare it in CREATE TABLE");
+        // `ADD COLUMN c text COLLATE <ci>`: the column, then its key
+        // companion (`collation::add_column_statements`).
+        return match crate::core::rql::collation::add_column_statements(sql) {
+            Some(Ok(statements)) => {
+                let mut last = Vec::new();
+                for statement in statements {
+                    last = Box::pin(execute_alter_table(&statement, database, tx)).await;
+                    // A status-0 frame is success; anything else ends it.
+                    if last.first() != Some(&0) {
+                        return last;
+                    }
+                }
+                last
+            }
+            Some(Err(e)) => ddl_error(&e),
+            None => ddl_error(
+                "ALTER TABLE giving a column a case-insensitive collation is not supported yet, other than \
+                 ADD COLUMN; declare it in CREATE TABLE",
+            ),
+        };
     }
 
-    let plans = match lexer_alter::parse_alter_table_actions_tagged(sql) {
+    let mut plans = match lexer_alter::parse_alter_table_actions_tagged(sql) {
         Ok(p) => p,
         Err(e) => {
             error!("Cannot parse ALTER TABLE: {}", e);
             return ddl_error(&e);
         }
     };
+    // A UNIQUE or FOREIGN KEY added over a column with a nondeterministic
+    // collation keys its companion, as one declared in CREATE TABLE does
+    // (`collation::constraint_on_keys`).
+    for (plan, _) in plans.iter_mut() {
+        if let lexer_alter::AlterAction::ConstraintClause { drop: false, description } = &mut plan.action
+            && let Some(view) = database.schema_view(&plan.table_name)
+        {
+            let fields_of = |table: &str| database.schema_view(table).map(|v| v.schema().fields.to_vec());
+            match crate::core::rql::collation::constraint_on_keys(description, &view.schema().fields, &fields_of) {
+                Ok(Some(rewritten)) => *description = rewritten,
+                Ok(None) => {}
+                Err(e) => return ddl_error(&e),
+            }
+        }
+    }
 
     // Retyping a column with a nondeterministic collation would rebuild it
     // without its key companion, comparing by its bytes after: refused.
     for (plan, _) in &plans {
         if let lexer_alter::AlterAction::AlterColumn { name, detail } = &plan.action
             && detail.to_ascii_uppercase().contains("TYPE")
+            && !retypes_to_text(detail)
             && database
                 .schema_view(&plan.table_name)
                 .is_some_and(|v| !crate::core::rql::collation::of(name, &v.schema().fields).is_binary())
@@ -17651,7 +18244,15 @@ fn sequences_named_elsewhere(
 /// `UPDATE t SET g = DEFAULT`, which recomputes it from each row exactly as an
 /// UPDATE of its inputs would.
 async fn compute_generated_column(database: &Arc<Database>, table_name: &str, column: &str, tx: TxId) -> Vec<u8> {
-    let sql = format!("UPDATE {} SET {} = DEFAULT", table_name, column);
+    // A case-insensitive column's key companion is hidden, so no statement
+    // names it: writing its column recomputes it.
+    let sql = match crate::core::rql::collation::companion_of(column) {
+        Some((base, _)) => {
+            let base = crate::core::rql::collation::ident(base);
+            format!("UPDATE {} SET {base} = {base}", table_name)
+        }
+        None => format!("UPDATE {} SET {} = DEFAULT", table_name, column),
+    };
     let Some(purpose) = recognize_query_purpose(&sql) else {
         return ddl_error(&format!("could not compute the generated column \"{}\"", column));
     };
@@ -17795,6 +18396,86 @@ async fn add_check_constraint(
     }
 }
 
+/// `ALTER TABLE … RECOMPRESS` (and `VACUUM (FULL, RECOMPRESS)`): every row
+/// rewritten under the table's compression as it stands, so rows written
+/// before a `SET COMPRESSION` (or under an older level, or compressed and no
+/// longer wanted) are stored as the table now asks. A dictionary is trained
+/// for each compressed column, and for the row tail, from the values the
+/// table holds, and kept where it pays (`compression::train`); the old ones
+/// are retired with the old files.
+async fn recompress(database: &Arc<Database>, table_name: &str, schema: &crate::core::row::schema::TableSchema, tx: TxId) -> Result<(), String> {
+    use crate::core::compression::{train, MIN_VALUE_BYTES};
+    use crate::core::rql::type_modifier::{dictionary_marker, DICTIONARY_MARKER};
+    // At most this much of a column's values feeds its training: zstd's
+    // trainer is superlinear, and a sample this size already says what the
+    // dictionary will be.
+    const SAMPLE_VALUES: usize = 4096;
+    const SAMPLE_BYTES: usize = 8 * 1024 * 1024;
+    let columns: Vec<(String, i32)> = schema
+        .compression
+        .columns
+        .iter()
+        .filter_map(|c| {
+            let field = schema.fields.iter().find(|f| f.write_order == c.write_order && !f.is_deleted)?;
+            Some((field.name.clone(), c.codec.level))
+        })
+        .collect();
+    let row_level = schema.compression.row.as_ref().map(|c| c.level);
+    let mut string_columns: Vec<(u64, String)> = schema
+        .fields
+        .iter()
+        .filter(|f| !f.is_deleted && f.db_type.physical() == crate::core::db_type::DbType::STRING)
+        .map(|f| (f.write_order, f.name.clone()))
+        .collect();
+    string_columns.sort();
+    rewrite_rows(database, table_name, tx, move |definition, versions| {
+        definition.type_modifiers.retain(|m| !m.column.starts_with(DICTIONARY_MARKER));
+        if !crate::core::compression::ENABLED {
+            return Ok(versions);
+        }
+        for (name, level) in &columns {
+            let mut taken = 0usize;
+            let samples: Vec<&[u8]> = versions
+                .iter()
+                .filter_map(|v| v.values.iter().find(|(n, _, _)| n == name).map(|(_, b, _)| b.into_slice()))
+                .filter(|b| b.len() >= MIN_VALUE_BYTES)
+                .take_while(|b| {
+                    taken += b.len();
+                    taken <= SAMPLE_BYTES
+                })
+                .take(SAMPLE_VALUES)
+                .collect();
+            if let Some(dictionary) = train(&samples, *level) {
+                definition.type_modifiers.push(dictionary_marker(name, Some(dictionary.id)));
+            }
+        }
+        if let Some(level) = row_level {
+            // A row's tail: its strings' bytes in write_order, as
+            // `RowPointer::build_row_data` lays them out.
+            let tails: Vec<Vec<u8>> = versions
+                .iter()
+                .take(SAMPLE_VALUES)
+                .map(|v| {
+                    let mut tail = Vec::new();
+                    for (_, name) in &string_columns {
+                        if let Some((_, b, _)) = v.values.iter().find(|(n, _, _)| n == name) {
+                            tail.extend_from_slice(b.into_slice());
+                        }
+                    }
+                    tail
+                })
+                .filter(|t| t.len() >= MIN_VALUE_BYTES)
+                .collect();
+            let samples: Vec<&[u8]> = tails.iter().map(Vec::as_slice).collect();
+            if let Some(dictionary) = train(&samples, level) {
+                definition.type_modifiers.push(dictionary_marker("", Some(dictionary.id)));
+            }
+        }
+        Ok(versions)
+    })
+    .await
+}
+
 async fn execute_alter_table_action(
     plan: crate::core::rql::lexer_alter::AlterTable,
     database: &Arc<Database>,
@@ -17827,6 +18508,14 @@ async fn execute_alter_table_action(
         // from it, because `Table` owns its schema by value.
         (table.schema.clone(), table.io_schema.clone(), row_count)
     };
+    // A ledger table or vault takes only the ALTERs its policy admits
+    // (`ledger_hooks`), before anything is locked or written.
+    if let Err(e) = crate::core::ledger_hooks::admit(
+        &schema,
+        crate::core::ledger_hooks::WriteKind::Alter(plan.action.ledger_label()),
+    ) {
+        return ddl_error(&e);
+    }
 
     // The rest of the action's complete lock set (§7 step 1, finding L11):
     // the RENAME target, the FK children whose sidecars it rewrites, the
@@ -17866,6 +18555,51 @@ async fn execute_alter_table_action(
                 plan.table_name, reason
             );
             return ddl_ok(0);
+        }
+        // `SET (row_compression = …)` / `RESET (row_compression)`: the
+        // table's tail marker, for rows written from now on. Accepted and
+        // ignored by a build that cannot compress.
+        AlterAction::SetRowCompression { level } => {
+            use crate::core::rql::type_modifier::{dictionary_marker, dictionary_of, row_compression_marker, row_compression_of};
+            if !crate::core::compression::ENABLED || row_compression_of(&schema.type_modifiers) == level {
+                return ddl_ok(0);
+            }
+            if level.is_some() {
+                if let Err(e) = database.require_compressed_values() {
+                    return ddl_error(&format!(
+                        "the database could not be marked for compressed values ({}): {e}",
+                        crate::core::database::incompat::COMPRESSED_VALUES_V1
+                    ));
+                }
+            }
+            let mut records = vec![row_compression_marker(level)];
+            // A tail dictionary trained for another level or method is
+            // retired with it; RECOMPRESS trains one for the new setting.
+            if dictionary_of("", &schema.type_modifiers).is_some() {
+                records.push(dictionary_marker("", None));
+            }
+            return match database
+                .reload_atomic(&plan.table_name, |old| async move {
+                    let io = old.io_schema.clone();
+                    let mut writes = crate::core::torn_tail::SidecarWrites::default();
+                    for record in &records {
+                        crate::core::rql::type_modifier::stage(&*io, &mut writes, record).map_err(|e| e.to_string())?;
+                    }
+                    writes.commit(&*io).await.map_err(|e| e.to_string())
+                })
+                .await
+            {
+                Ok(()) => ddl_ok(0),
+                Err(failure) => reload_failed(failure, ""),
+            };
+        }
+        AlterAction::Recompress => {
+            // Boxed: the rewrite's state would otherwise sit in this
+            // statement's future, which is near its stack limit.
+            return match Box::pin(recompress(database, &plan.table_name, &schema, tx)).await {
+                Ok(()) => ddl_ok(0),
+                Err(e) => ddl_error(&e),
+            };
         }
         // A foreign key's rows checked now, as `ADD` would have checked
         // them without `NOT VALID` (23503 for the first orphan, nothing
@@ -18045,9 +18779,19 @@ async fn execute_alter_table_action(
             json,
             modifier,
             generated,
+            compression,
             text_typmod,
         } => {
-            if nullable::is_hidden(&name) {
+            // A case-insensitive column's key companion, as
+            // `collation::add_column_statements` adds it: its expression is
+            // the key of its column, and nothing else may take the name.
+            let companion = crate::core::rql::collation::companion_of(&name).is_some_and(|(base, strength)| {
+                generated.as_deref().is_some_and(|g| {
+                    crate::core::rql::collation::companion_expression(base, strength)
+                        .is_some_and(|e| e.eq_ignore_ascii_case(g.trim()))
+                })
+            });
+            if nullable::is_hidden(&name) && !companion && !nullable::is_tick_digit(&name) {
                 return ddl_error("column names beginning with __null_ are reserved");
             }
             // A dropped column keeps its slot in the row layout but is no
@@ -18167,6 +18911,21 @@ async fn execute_alter_table_action(
                 Err(e) => return ddl_error(&e),
             }
 
+            // `COMPRESSION zstd(9)`: the column's marker, with the column, on either path (a
+            // populated table's rewrite, or the reload below), fenced first as `SET COMPRESSION` fences it. A
+            // build that cannot compress accepts the clause, as at CREATE.
+            let compression_record = match compression.filter(|_| crate::core::compression::ENABLED) {
+                Some(level) => {
+                    if let Err(e) = database.require_compressed_values() {
+                        return ddl_error(&format!(
+                            "the database could not be marked for compressed values ({}): {e}",
+                            crate::core::database::incompat::COMPRESSED_VALUES_V1
+                        ));
+                    }
+                    Some(crate::core::rql::type_modifier::compression_marker(&name, Some(level)))
+                }
+                None => None,
+            };
             if row_count > 0 {
                 if !is_nullable && !fills_existing {
                     // The existing rows have no value to put there. PostgreSQL
@@ -18246,6 +19005,7 @@ async fn execute_alter_table_action(
                             text_typmod,
                             &schema.type_modifiers,
                         ))
+                        .chain(compression_record.clone())
                         .collect(),
                     new_generated.into_iter().collect(),
                     tx,
@@ -18348,6 +19108,10 @@ async fn execute_alter_table_action(
                         if !record.is_deleted {
                             schema.type_modifiers.push(record);
                         }
+                    }
+                    if let Some(record) = &compression_record {
+                        crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, record)
+                            .map_err(|e| e.to_string())?;
                     }
                     if let Some(entry) = &new_generated {
                         crate::core::rql::generated::stage(&*io_schema, &mut writes, entry)
@@ -19022,6 +19786,54 @@ async fn execute_alter_table_action(
             else {
                 return ddl_error(&format!("column '{}' does not exist", name));
             };
+
+            // `SET COMPRESSION zstd(9)` / `lz4` / `pglz` / `default`: the
+            // column's marker (`type_modifier::COMPRESSION_MARKER`). As in
+            // PostgreSQL it applies to values written from now on; a row
+            // already stored keeps its bytes until it is next written.
+            if upper.starts_with("SET COMPRESSION") {
+                let method = detail["SET COMPRESSION".len()..].trim();
+                let level = match crate::core::compression::parse_method(method) {
+                    Ok(level) => level,
+                    Err(e) => return ddl_error(&e),
+                };
+                if level.is_some() && field.db_type.physical() != crate::core::db_type::DbType::STRING {
+                    return ddl_error(&format!(
+                        "column data type {} does not support compression",
+                        field.literal_type().to_string().to_ascii_lowercase()
+                    ));
+                }
+                // Accepted and ignored by a build that cannot compress, as
+                // `pg_dump` output carries the clause.
+                if !crate::core::compression::ENABLED {
+                    return ddl_ok(0);
+                }
+                if crate::core::rql::type_modifier::compression_of(&field.name, &schema.type_modifiers) == level {
+                    return ddl_ok(0);
+                }
+                // Fenced before the record that needs it is written.
+                if level.is_some() {
+                    if let Err(e) = database.require_compressed_values() {
+                        return ddl_error(&format!(
+                            "the database could not be marked for compressed values ({}): {e}",
+                            crate::core::database::incompat::COMPRESSED_VALUES_V1
+                        ));
+                    }
+                }
+                let record = crate::core::rql::type_modifier::compression_marker(&field.name, level);
+                return match database
+                    .reload_atomic(&plan.table_name, |old| async move {
+                        let io = old.io_schema.clone();
+                        let mut writes = crate::core::torn_tail::SidecarWrites::default();
+                        crate::core::rql::type_modifier::stage(&*io, &mut writes, &record).map_err(|e| e.to_string())?;
+                        writes.commit(&*io).await.map_err(|e| e.to_string())
+                    })
+                    .await
+                {
+                    Ok(()) => ddl_ok(0),
+                    Err(failure) => reload_failed(failure, ""),
+                };
+            }
 
             // `TYPE t`. sea-orm's `modify_column` restates the whole column
             // definition even when only nullability moves, so the type it names
@@ -19762,7 +20574,8 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
                 // calls equal and ordered (`collation`). Not a full-text
                 // index, whose lexemes have no case.
                 Some(f) => match crate::core::rql::collation::companion(&f.name, &table.schema.fields) {
-                    Some((key, _)) if !statement.method.is_some_and(|m| m.is_gin()) => {
+                    // A `uuid` in SQL Server's order is found by its value.
+                    Some((key, strength)) if !strength.orders_only() && !statement.method.is_some_and(|m| m.is_gin()) => {
                         columns.push(key.write_order as u32);
                         types.push(key.db_type.clone());
                     }
@@ -20069,10 +20882,17 @@ pub(crate) fn replication_of(query: &QueryPurpose) -> Replicated {
             Replicated::Local("a filter setting is this node's own; run it on each node that should have it")
         }
         QueryPurpose::Replication(_) => Replicated::Local("replication settings are each node's own"),
+        // A ledger's chain and policy records are each node's own; a replica
+        // verifies its own copy.
+        QueryPurpose::Ledger(_) => Replicated::Local("a ledger statement acts on this node's ledger; run it on each node"),
         #[cfg(feature = "kv_cache")]
         // Its writes travel on the same stream, as the store's own effects
         // (`core::kv_cache::repl`) rather than as this statement's text.
         QueryPurpose::KvCache(_) => Replicated::NotAWrite,
+        // The broker's logs are this node's own until broker replication
+        // ships (docs/broker.md §9, phase 5).
+        #[cfg(feature = "broker")]
+        QueryPurpose::Broker(_) => Replicated::Local("the broker's topics are this node's own; run it on each node"),
         #[cfg(feature = "storage_pools")]
         QueryPurpose::Storage(_) => {
             Replicated::Local("STORAGE statements place this node's files; run it on each node that should have it")
@@ -20104,7 +20924,7 @@ fn query_sql(query: &QueryPurpose) -> String {
         | QueryPurpose::DropColumn(s)
         | QueryPurpose::RenameColumn(s) => s.clone(),
         QueryPurpose::Vacuum(_) => String::new(),
-        QueryPurpose::FilterControl(sql) | QueryPurpose::Replication(sql) => sql.clone(),
+        QueryPurpose::FilterControl(sql) | QueryPurpose::Replication(sql) | QueryPurpose::Ledger(sql) => sql.clone(),
         #[cfg(feature = "storage_pools")]
         QueryPurpose::Storage(sql) => sql.clone(),
         QueryPurpose::Introspect(_) => String::new(),
@@ -20114,6 +20934,9 @@ fn query_sql(query: &QueryPurpose) -> String {
         // token), so the text is not kept.
         #[cfg(feature = "kv_cache")]
         QueryPurpose::KvCache(_) => String::new(),
+        // A published message may be a secret, as a KV value may.
+        #[cfg(feature = "broker")]
+        QueryPurpose::Broker(_) => String::new(),
         #[cfg(feature = "s3_backup")]
         QueryPurpose::Backup(_) => String::new(),
         #[cfg(feature = "s3_backup")]
@@ -20958,97 +21781,7 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
     Ok(Some(rows))
 }
 
-/// The columns that identify one row, for the statements that need to name
-/// rows they have already chosen (`docs/partitioning.md` §1b).
-///
-/// `FOR UPDATE` locks a row by them, a writer checks the same lock, and
-/// `UPDATE … FROM` and `DELETE … USING` write each joined row back by them.
-/// Only an inline `UNIQUE` used to count, so a table whose key is written
-/// `PRIMARY KEY` or as a table-level `UNIQUE (id)` — the ordinary way an ORM
-/// emits one — was refused as having no unique column at all, though it
-/// plainly had one. And only one column counted, so a composite key, which is
-/// the only kind a partitioned table has (every unique key holds every
-/// partition-key column), refused all four statements.
-struct IdentifyingKey {
-    /// In the key's declared order, which is the order the framed tuple and
-    /// the write-back predicate use.
-    fields: Vec<crate::core::row::schema::SchemaField>,
-    /// Each field's declared `NUMERIC` scale (`type_modifier::scale_of`),
-    /// the scale every key cell this is given is at.
-    scales: Vec<u32>,
-}
-
 impl IdentifyingKey {
-    fn names(&self) -> impl Iterator<Item = &str> {
-        self.fields.iter().map(|f| f.name.as_str())
-    }
-
-    /// The bytes one row is locked and deduplicated by, from its key cells in
-    /// [`Self::fields`] order: one column's stored bytes, exactly what a
-    /// one-column key always used, or the framed tuple of several (each
-    /// component `encode_canonical`, which is length-prefixed, so `(1, 23)`
-    /// and `(12, 3)` cannot meet). The same function on every side — the
-    /// locker, the writer that checks, the deadlock detector's blockers — so
-    /// they name one row one way.
-    ///
-    /// `Err` for a row whose key holds a NULL: it names no row (a unique key
-    /// admits any number of NULLs), and the bytes a NULL travels as would
-    /// name every NULL row at once.
-    ///
-    /// **Every cell must be at its column's declared scale**, never rescaled:
-    /// the select pipeline's, and `run_subquery_scaled` with `normalize`
-    /// false. A sixteen-byte decimal does not say its scale, and the paths
-    /// differ: `NUMERIC(10,2)`'s 1.50 is 150 in the pipeline and was
-    /// 1500000000 through a normalising subquery, so a lock keyed by one and
-    /// checked by the other never met; normalising also rounds past nine
-    /// places, so two `NUMERIC(20,12)` keys became one. A decimal is keyed by
-    /// its value: the unscaled integer with trailing zeros stripped, and the
-    /// scale left (a seventeen-byte cell's own scale where it carries one).
-    fn row_key(&self, cells: &[&crate::core::row::row::Column]) -> Result<Vec<u8>, String> {
-        if let Some((field, _)) =
-            self.fields.iter().zip(cells).find(|(_, c)| c.column_type == crate::core::db_type::DbType::NULL)
-        {
-            return Err(format!(
-                "a row whose key column '{}' is NULL cannot be identified by its key",
-                field.name
-            ));
-        }
-        let value = |i: usize, cell: &crate::core::row::row::Column| -> Vec<u8> {
-            let bytes = cell.data.into_slice();
-            if self.fields[i].db_type != crate::core::db_type::DbType::DECIMAL {
-                return bytes.to_vec();
-            }
-            let Some((mut v, own)) = crate::core::value_codec::split_decimal_cell(bytes) else {
-                return bytes.to_vec();
-            };
-            let mut scale = own.unwrap_or(self.scales[i]);
-            while scale > 0 && v % 10 == 0 {
-                v /= 10;
-                scale -= 1;
-            }
-            if v == 0 {
-                scale = 0;
-            }
-            let mut out = v.to_le_bytes().to_vec();
-            out.push(scale as u8);
-            out
-        };
-        if let [only] = cells {
-            return Ok(value(0, only));
-        }
-        let mut out = Vec::new();
-        for (i, (field, cell)) in self.fields.iter().zip(cells).enumerate() {
-            let bytes = value(i, cell);
-            let canonical = field.db_type != crate::core::db_type::DbType::DECIMAL
-                && crate::core::index::key::encode_canonical(&field.db_type, &bytes, &mut out).is_some();
-            if !canonical {
-                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                out.extend_from_slice(&bytes);
-            }
-        }
-        Ok(out)
-    }
-
     /// `a = 1 AND b = 'x'`: the predicate that names the one row these key
     /// cells (in [`Self::fields`] order) belong to. On a partitioned table it
     /// pins every partition-key column, so the write it guards is routed to
@@ -21056,7 +21789,7 @@ impl IdentifyingKey {
     ///
     /// A decimal is written at its declared scale, every place kept, so the
     /// predicate names exactly the stored value.
-    fn predicate(&self, cells: &[&crate::core::row::row::Column]) -> Result<String, String> {
+    pub(crate) fn predicate(&self, cells: &[&crate::core::row::row::Column]) -> Result<String, String> {
         let literals = self.literals(cells)?;
         let terms: Vec<String> =
             self.fields.iter().zip(&literals).map(|(field, literal)| format!("{} = {}", field.name, literal)).collect();
@@ -21211,69 +21944,6 @@ impl RowMarker {
     }
 }
 
-/// The key that identifies `schema`'s rows, chosen as PostgreSQL names a row
-/// by its key, or `None` when the table has none to name a row by.
-///
-/// 1. The primary key: one column (`schema.primary_key`), or a composite one,
-///    which is the table-level key named `<table>_pkey` (`lexer_ct` records
-///    only a one-column primary key as such).
-/// 2. Else a `UNIQUE` key, inline or table-level, whose every column is
-///    `NOT NULL`: the fewest columns, then the first declared.
-/// 3. Else, as before composite keys counted, a one-column `UNIQUE` that may
-///    hold NULL. Its NULL rows cannot be named, and [`IdentifyingKey::row_key`]
-///    refuses them one by one rather than naming every NULL row at once.
-///
-/// A primary key's rows hold no NULL in PostgreSQL. Here a column of a
-/// table-level `PRIMARY KEY (a, b)` written without `NOT NULL` is nullable,
-/// so the same refusal covers such a row. A partial key is never chosen:
-/// rows outside its predicate share its values, and writing back by it would
-/// reach every one of them.
-fn identifying_key(schema: &crate::core::row::schema::TableSchema) -> Option<IdentifyingKey> {
-    let live = |name: &str| {
-        schema
-            .fields
-            .iter()
-            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
-            .cloned()
-    };
-    let resolve = |columns: &[String]| columns.iter().map(|c| live(c)).collect::<Option<Vec<_>>>();
-    let whole = || schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none());
-
-    let key = |fields: Vec<crate::core::row::schema::SchemaField>| {
-        let scales = fields
-            .iter()
-            .map(|f| u32::from(crate::core::rql::type_modifier::scale_of(&f.name, &schema.type_modifiers)))
-            .collect();
-        IdentifyingKey { fields, scales }
-    };
-    if let Some(field) = schema.primary_key.as_deref().and_then(live) {
-        return Some(key(vec![field]));
-    }
-    // A composite primary key, by its mark or its name
-    // (`unique_key::primary_key_of`).
-    if let Some(fields) = crate::core::rql::unique_key::primary_key_of(schema).and_then(|pk| resolve(&pk.columns)) {
-        return Some(key(fields));
-    }
-
-    let candidates = || {
-        schema
-            .fields
-            .iter()
-            .filter(|f| f.is_unique && !f.is_deleted)
-            .map(|f| vec![f.clone()])
-            .chain(whole().filter_map(|k| resolve(&k.columns)))
-    };
-    let not_null = |fields: &Vec<crate::core::row::schema::SchemaField>| {
-        fields.iter().all(|f| !crate::core::rql::nullable::is_nullable(&f.name, &schema.fields))
-    };
-    let mut best: Option<Vec<crate::core::row::schema::SchemaField>> = None;
-    for fields in candidates().filter(not_null) {
-        if best.as_ref().is_none_or(|b| fields.len() < b.len()) {
-            best = Some(fields);
-        }
-    }
-    best.or_else(|| candidates().find(|fields| fields.len() == 1)).map(key)
-}
 
 /// [`identifying_key`] as the columns (by write order) and scales a row
 /// lock's key is framed from: what must not change under a transaction's
@@ -21815,8 +22485,32 @@ pub async fn execute_with_sync(
     .await
 }
 
+/// Whether `query` runs with key/value-store row commits deferred to its
+/// end (`defer_kv_commits`): the statements that write rows. Not DDL, whose
+/// files have to be stored before the catalogue names them.
+fn defers_kv_commits(query: &QueryPurpose) -> bool {
+    matches!(
+        query,
+        QueryPurpose::InsertRow(_) | QueryPurpose::UpdateRow(_) | QueryPurpose::DeleteRow(_) | QueryPurpose::QueryRows(_)
+    )
+}
+
 /// [`execute_with_sync`] inside its owner scope.
 async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: bool) -> Vec<u8> {
+    if !defers_kv_commits(&query) {
+        return Box::pin(execute_autocommit_body(query, database, wait)).await;
+    }
+    // The commit settles the queue before the outcome; this settles whatever
+    // a failed or rowless statement left in it.
+    let (response, settled) =
+        crate::core::storage_providers::defer_kv_commits(Box::pin(execute_autocommit_body(query, database, wait))).await;
+    if let Err(e) = settled {
+        error!("A statement's key/value rows could not be stored after it ended: {e}");
+    }
+    response
+}
+
+async fn execute_autocommit_body(query: QueryPurpose, database: Arc<Database>, wait: bool) -> Vec<u8> {
     // Autocommit: a statement arriving outside an explicit transaction still
     // gets one. It has to. A DELETE has to stamp `xmax` with an id that other
     // snapshots can order themselves against, and reclamation reads a bare
@@ -22061,7 +22755,13 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
     // commit, not after: once committed, any session's root flush can carry
     // this outcome to disk, and it must not get there ahead of them. In both
     // `wait` modes — see `Database::commit_written_transaction`.
-    let family = match database.commit_written_transaction(tx) {
+    // A key/value table's rows, which the statement's scope queued, go to
+    // the store first for the same reason (`defer_kv_commits`).
+    let committed = match crate::core::storage_providers::settle_kv_commits().await {
+        Ok(()) => database.commit_written_transaction(tx),
+        Err(e) => Err(e),
+    };
+    let family = match committed {
         Ok(family) => family,
         Err(e) => {
             error!("Could not make the written rows durable: {}", e);
@@ -22245,8 +22945,21 @@ pub(crate) async fn insert_loaded_row(
 
 #[inline]
 fn note_write(database: &Arc<Database>, tx: TxId, depth: usize, sql: &str, table: Option<&str>) {
+    if table.is_some_and(|t| t == crate::core::rql::privileges::ACL_TABLE) {
+        crate::core::rql::privileges::note_catalogue_write(database.id, tx);
+    }
     if depth == 0 {
         database.replication.note_statement(tx, sql, table);
+        // A shard's Raft group carries schema changes as statements, in
+        // order with the row images (sharding-plan.md B3, Schema entries).
+        #[cfg(feature = "sharding_raft")]
+        if crate::core::shard::capture::active() && crate::core::shard::capture::is_ddl(sql) {
+            crate::core::shard::capture::record(
+                database.id,
+                tx,
+                crate::core::shard::capture::Op::Ddl { sql: sql.to_string() },
+            );
+        }
     }
 }
 
@@ -22322,6 +23035,31 @@ pub async fn execute_in_txn(query: QueryPurpose, database: Arc<Database>, tx: Tx
 }
 
 async fn execute_in_txn_inner(query: QueryPurpose, database: Arc<Database>, tx: TxId) -> Vec<u8> {
+    if !defers_kv_commits(&query) {
+        return Box::pin(execute_in_txn_body(query, database, tx)).await;
+    }
+    // Settled as the statement ends, so a block's COMMIT finds its rows
+    // stored. A failure fails the statement: the block cannot commit rows
+    // the store does not hold.
+    let (response, settled) =
+        crate::core::storage_providers::defer_kv_commits(Box::pin(execute_in_txn_body(query, database, tx))).await;
+    match settled {
+        Ok(()) => response,
+        Err(e) => {
+            error!("A statement's key/value rows could not be stored: {e}");
+            if response.first() == Some(&3) {
+                return response;
+            }
+            let mut failed = vec![3u8];
+            failed.extend_from_slice(
+                format!("could not commit: the rows written could not be made durable ({e})").as_bytes(),
+            );
+            failed
+        }
+    }
+}
+
+async fn execute_in_txn_body(query: QueryPurpose, database: Arc<Database>, tx: TxId) -> Vec<u8> {
     let retry_sql = query_sql(&query);
     // `InsertRow` for the same reason the autocommit path replays it: the
     // uniqueness check runs before the row is written, so a statement it
@@ -22364,6 +23102,9 @@ async fn execute_in_txn_inner(query: QueryPurpose, database: Arc<Database>, tx: 
         // Every attempt runs under the same transaction, so under the same
         // owner: a block's root, or the statement's O its transaction acts for.
         crate::owner_probe!(crate::core::mvcc::owner::probe::Site::InTxnAttempt, tx, database);
+        // A replayed attempt applied nothing, but may have noted a ledger
+        // row's deletion for the chain before its write met the conflict.
+        let ledger_mark = crate::core::ledger_hooks::pending_mark(tx);
         // See `execute_with_sync`: a prepared `SELECT` skips the box sized for
         // every statement arm.
         let (response, blocker) = match query {
@@ -22386,7 +23127,7 @@ async fn execute_in_txn_inner(query: QueryPurpose, database: Arc<Database>, tx: 
         // Until the transaction that won ends: a real wait, in the graph.
         let waiter = database.row_locks.owner_of(tx);
         match pacing.pause(&database, waiter, blocker, MAX_CONFLICT_RETRIES).await {
-            crate::core::rql::conflict_wait::Pause::Retry => {}
+            crate::core::rql::conflict_wait::Pause::Retry => crate::core::ledger_hooks::rewind_pending(tx, ledger_mark),
             crate::core::rql::conflict_wait::Pause::GiveUp => return strip_conflict_marker(response),
             crate::core::rql::conflict_wait::Pause::Fail(message) => return ddl_error(&message),
         }
@@ -23087,9 +23828,104 @@ fn execute_in_statement_scope(
     })
 }
 
+tokio::task_local! {
+    /// Set while a task's outermost statement runs: the statements it runs
+    /// in turn (subqueries, key actions, a CTE's parts) are not guarded or
+    /// decrypted again (`column_crypto`).
+    static OUTERMOST_STATEMENT: ();
+}
+
+/// A statement as `column_crypto` sees it: guarded and planned before it
+/// runs, its literals for encrypted columns encrypted, and its rows'
+/// ciphertext decrypted for a role holding the vault's `SELECT` once it
+/// has run. Only for a task's outermost statement, and only when the
+/// licensed cipher is installed: otherwise the statement runs as it is.
+pub(crate) async fn execute_with_need(
+    query: QueryPurpose,
+    database: Arc<Database>,
+    depth: usize,
+    tx: TxId,
+    need: SubqueryNeed,
+) -> Vec<u8> {
+    if !crate::core::column_crypto::installed() || OUTERMOST_STATEMENT.try_with(|_| ()).is_ok() {
+        return execute_with_need_inner(query, database, depth, tx, need).await;
+    }
+    OUTERMOST_STATEMENT.scope((), Box::pin(execute_encrypted(query, database, depth, tx, need))).await
+}
+
+#[inline(never)]
+async fn execute_encrypted(query: QueryPurpose, database: Arc<Database>, depth: usize, tx: TxId, need: SubqueryNeed) -> Vec<u8> {
+    let text = statement_lock_text(&query).map(str::to_string);
+    let plan = match text.as_deref().map(|sql| crate::core::column_crypto::plan(&database, sql)) {
+        Some(Err(e)) => return ddl_error(&e),
+        Some(Ok(p)) => p,
+        None => None,
+    };
+    let session = crate::core::ledger_hooks::session();
+    let mut query = query;
+    let mut token = None;
+    if let Some(plan) = plan {
+        // Encrypting under a vault's key is using it: `SELECT` on the vault,
+        // as `VAULT … ENCRYPT` needs.
+        if let Some((role, false)) = &session {
+            if !plan.vaults.is_empty() {
+                let acl = match crate::core::rql::privileges::load(&database, Some(tx)).await {
+                    Ok(acl) => acl,
+                    Err(e) => return ddl_error(&e),
+                };
+                for vault in &plan.vaults {
+                    if !crate::core::rql::privileges::allows(&acl, role, vault, "SELECT") {
+                        return ddl_error(&format!(
+                            "42501: permission denied for vault \"{vault}\" (SELECT): its key encrypts this column"
+                        ));
+                    }
+                }
+            }
+        }
+        if plan.declares {
+            if let Some(root) = database.location.as_deref() {
+                if let Err(e) = crate::core::database::incompat::require(std::path::Path::new(root), crate::core::database::incompat::ENCRYPTED_VALUES_V1) {
+                    return ddl_error(&format!("could not mark the directory as holding encrypted columns: {e}"));
+                }
+            }
+        }
+        if let Some(sql) = plan.sql {
+            match crate::core::rql::lexer_s1::recognize_query_purpose(&sql) {
+                Some(p) => query = p,
+                None => return ddl_error("internal error: the encrypted statement did not parse"),
+            }
+        }
+        token = plan.token;
+    }
+    let response = Box::pin(execute_with_need_inner(query, database.clone(), depth, tx, need)).await;
+    if let Some(t) = token {
+        crate::core::column_crypto::finish(&database, t, response.first() != Some(&3));
+    }
+    if response.first() != Some(&2) || !crate::core::column_crypto::active(&database) {
+        return response;
+    }
+    // Who may read the plaintext: an in-process caller (no session) and a
+    // superuser always; a role, for the vaults it may `SELECT`.
+    let vaults = crate::core::column_crypto::vaults_in(&database, &response);
+    if vaults.is_empty() {
+        return response;
+    }
+    let allowed: Vec<String> = match &session {
+        None | Some((_, true)) => vaults,
+        Some((role, false)) => match crate::core::rql::privileges::load(&database, Some(tx)).await {
+            Ok(acl) => vaults.into_iter().filter(|v| crate::core::rql::privileges::allows(&acl, role, v, "SELECT")).collect(),
+            Err(_) => Vec::new(),
+        },
+    };
+    match crate::core::column_crypto::decrypt_response(&database, response, &allowed) {
+        Ok(r) => r,
+        Err(e) => ddl_error(&e),
+    }
+}
+
 /// [`execute_with_context`] for a statement whose caller needs only part of
 /// its result. See [`SubqueryNeed`].
-pub(crate) async fn execute_with_need(
+async fn execute_with_need_inner(
     query: QueryPurpose,
     database: Arc<Database>,
     depth: usize,
@@ -23202,6 +24038,15 @@ pub(crate) async fn execute_with_need(
         // rest of this match keeps its table-oriented shape.
         // Cluster control, like the filter statements above: no table, no
         // transaction, and a result set of text rather than rows of a relation.
+        QueryPurpose::Ledger(sql) => {
+            return match Box::pin(execute_ledger_statement(sql, &database, depth, tx)).await {
+                Ok(lines) => crate::replication::sql::text_result(&lines),
+                Err(e) => {
+                    error!("ledger statement failed: {}", e);
+                    ddl_error(&e)
+                }
+            };
+        }
         QueryPurpose::Replication(sql) => {
             // The structured forms return rows rather than lines; everything
             // else in this surface is text meant to be read.
@@ -23254,6 +24099,12 @@ pub(crate) async fn execute_with_need(
         QueryPurpose::KvCache(sql) => {
             return crate::core::kv_cache::sql::execute(sql, &database.kv_cache).await;
         }
+        // The broker: no table, no transaction. Who may run its DDL was
+        // decided by the session's guard (`pgwire::catalogue_guard`).
+        #[cfg(feature = "broker")]
+        QueryPurpose::Broker(sql) => {
+            return crate::core::broker::sql::execute(sql, &database.broker, true).await;
+        }
         QueryPurpose::FilterControl(sql) => {
             return match crate::core::filter::sql::execute(sql) {
                 Ok(lines) => {
@@ -23278,9 +24129,21 @@ pub(crate) async fn execute_with_need(
                     return Box::pin(execute_create_table_as(&database, statement, tx)).await;
                 }
             }
+            // `CREATE LEDGER TABLE` / `CREATE VAULT`: the plain create they
+            // stand for, and the kind and policy its header and sidecar get.
+            let (query, special) = match special_create(query, &database) {
+                Ok(split) => split,
+                Err(e) => return ddl_error(&e),
+            };
             // Handle create table
-            let (parsed, partition, rejection) =
+            let (mut parsed, partition, rejection) =
                 crate::core::rql::lexer_ct::create_table_with_partition(&query);
+            let mut replicated: Option<String> = None;
+            if let (Some(ct), Some((kind, policy, written))) = (parsed.as_mut(), special) {
+                ct.special = kind;
+                ct.ledger_policy = policy;
+                replicated = Some(written);
+            }
             if let Some(reason) = rejection {
                 error!("Cannot create table: {}", reason);
                 return ddl_error(&reason);
@@ -23359,7 +24222,7 @@ pub(crate) async fn execute_with_need(
                     !matches!(e.kind(), std::io::ErrorKind::InvalidInput | std::io::ErrorKind::AlreadyExists)
                 }) && database.has_table(&created_name)
                 {
-                    note_write(&database, tx, depth, &query_sql(&query), None);
+                    note_write(&database, tx, depth, &replicated.take().unwrap_or_else(|| query_sql(&query)), None);
                 }
                 if let Err(e) = &added {
                     // The guards in `add_table` say why a name is refused; a
@@ -23378,7 +24241,7 @@ pub(crate) async fn execute_with_need(
                     // last-writer-wins comparison is about row data, and a
                     // `CREATE TABLE` dropped as "superseded" would leave every
                     // statement after it with nowhere to go.
-                    note_write(&database, tx, depth, &query_sql(&query), None);
+                    note_write(&database, tx, depth, &replicated.take().unwrap_or_else(|| query_sql(&query)), None);
                     let mut result: [u8; 1] = [0u8; 1];
                     result[0] = 0;
                     return result.to_vec();
@@ -24108,6 +24971,23 @@ pub(crate) async fn execute_with_need(
                     names
                 }
             };
+
+            // `VACUUM (FULL, RECOMPRESS)`: each table rewritten as `ALTER
+            // TABLE … RECOMPRESS` rewrites it, under the same locks. A rewrite
+            // lays every row out afresh, so it is a VACUUM FULL as well.
+            if request.recompress {
+                for name in names {
+                    let sql = format!("ALTER TABLE {} RECOMPRESS", crate::core::value_codec::double_quoted(&name));
+                    let Some(purpose) = recognize_query_purpose(&sql) else {
+                        return ddl_error(&format!("cannot parse {sql}"));
+                    };
+                    let response = Box::pin(execute(purpose, database.clone())).await;
+                    if response.first() == Some(&3u8) {
+                        return response;
+                    }
+                }
+                return ddl_ok(0);
+            }
 
             let mut reclaimed: u64 = 0;
             // Tables compacted whose space could not be given back.
@@ -25297,7 +26177,10 @@ async fn execute_query_rows_body(
         // it rejects `COUNT(*) FILTER (WHERE …)`, whose `arg` is `None`
         // exactly like a bare `COUNT(*)` and which would otherwise be
         // answered with the unfiltered count.
-        if crate::core::rql::aggregate::is_row_count_only(&plan) {
+        // A cluster fan-out's part (or its coordinator) needs the fold
+        // itself: the count path never reaches it, so no partial is
+        // handed over or merged.
+        if crate::core::rql::aggregate::is_row_count_only(&plan) && !crate::core::rql::aggregate::cluster_fold_pending() {
             match source
                 .count(
                     &query_row.where_clause,

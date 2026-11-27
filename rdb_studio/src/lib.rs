@@ -10,6 +10,7 @@ pub mod conn;
 pub mod dialect;
 pub mod export;
 pub mod files;
+pub mod icon;
 pub mod import;
 pub mod model;
 pub mod profiles;

@@ -665,12 +665,25 @@ async fn relation_columns(
     scales: Option<&[u32]>,
     database: &Arc<Database>,
 ) -> Result<Vec<RelationColumn>, usize> {
-    let described: Vec<DbType> = match Box::pin(crate::pgwire::describe_query(database, query)).await {
-        Ok(Some((fields, _))) if fields.len() == labels.len() => {
-            fields.into_iter().map(|(_, ty)| ty).collect()
-        }
-        _ => Vec::new(),
+    // Described without its row filter first: the types are the select
+    // list's and the relations', which a WHERE decides none of, and
+    // describing one runs the subqueries it holds. A copy filtered by an
+    // EXISTS ran that EXISTS once more to learn its columns' types, each
+    // copy. (One SELECT only: a set operation's WHERE is a branch's.)
+    let unfiltered = if ["UNION", "INTERSECT", "EXCEPT"].iter().any(|w| crate::core::rql::join::find_keyword(query, w, 0).is_some()) {
+        None
+    } else {
+        crate::pgwire::without_where(query)
     };
+    let mut described: Vec<DbType> = Vec::new();
+    for text in unfiltered.as_deref().into_iter().chain(std::iter::once(query)) {
+        if let Ok(Some((fields, _))) = Box::pin(crate::pgwire::describe_query(database, text)).await {
+            if fields.len() == labels.len() {
+                described = fields.into_iter().map(|(_, ty)| ty).collect();
+                break;
+            }
+        }
+    }
     // A typed array is described as `DbType::ARRAYOF`, the wire's word for
     // it: here it is the `ARRAY` it is stored as, of that element type. Left
     // as it was, no relation type matched it and the column became `TEXT`,
@@ -691,6 +704,30 @@ async fn relation_columns(
     // it compares blank-padded with a `character(n)` one there as it does in
     // its table; declared TEXT, `WHERE a = b` over a CTE compared exactly.
     let declared_fields = declared_fields_among(query, labels, database, &[]);
+    // A text column with a nondeterministic collation keeps it in the
+    // relation: copied as plain TEXT, `WHERE name = 'BOB'` over the copy
+    // compared bytes, and a LATERAL over a CI-filtered table (its outer
+    // table is copied to carry the join key) silently lost the row.
+    //
+    // A body of several relations keeps them as well, each plain column's
+    // read from the relation it names (`joined_collations`). That is also a
+    // body with a select-list subquery, which is a join by the time it is
+    // copied: left plain, `FROM (SELECT d.id, (SELECT …) …) AS q ORDER BY
+    // q.id` sorted a SQL Server uniqueidentifier by its bytes, while the
+    // same rows through a one-table body sorted in its own order.
+    let collations: Vec<Option<&'static str>> = if crate::core::rql::join::statement_has_join(query) {
+        joined_collations(query, labels, database)
+    } else {
+        let source = source_relation_fields(query, database);
+        declared_fields
+            .iter()
+            .map(|f| {
+                let (f, fields) = (f.as_ref()?, source.as_deref()?);
+                let strength = crate::core::rql::collation::order_of(&f.name, fields);
+                (!strength.is_binary()).then(|| strength.name())
+            })
+            .collect()
+    };
     let varying: Vec<Option<u32>> = {
         use crate::core::rql::type_modifier::TextTypmod;
         declared_fields
@@ -781,6 +818,17 @@ async fn relation_columns(
             }
             Some(t) => sql_type_of(t).ok_or(index)?.to_string(),
             None => "TEXT".to_string(),
+        };
+        let sql_type = match collations.get(index).copied().flatten() {
+            // A text column's collation, and a `uuid`'s SQL Server order
+            // (`rdb_guid_order`): its copy sorted by the bytes.
+            Some(name)
+                if matches!(declared, Some(DbType::STRING))
+                    || (matches!(declared, Some(DbType::UUID)) && name == crate::core::rql::collation::GUID_NAME) =>
+            {
+                format!("{sql_type} COLLATE {name}")
+            }
+            _ => sql_type,
         };
         columns.push(RelationColumn {
             sql_type,
@@ -1101,6 +1149,70 @@ pub(crate) fn relation_labels(relation: &str, database: &Arc<Database>) -> Optio
     Some(fields.into_iter().map(|f| f.name).collect())
 }
 
+/// The hidden columns of `relation` that a copy of its rows carries with
+/// them: each time column's 100 ns digit (`nullable::TICK_DIGIT_PREFIX`),
+/// which the SQL Server front end reads beside the column, by name. A copy
+/// made of the visible columns alone (the outer item of a `LATERAL` join,
+/// a relation with a computed join operand) answered `column
+/// d.__t7_saleexpiration does not exist` for a `datetime2` selected beside
+/// a correlated subquery. The other hidden columns are the copy's own to
+/// make: its NULL flags and collation keys.
+pub(crate) fn carried_hidden_columns(relation: &str, database: &Database) -> Vec<String> {
+    let Some(view) = database.schema_view(relation) else {
+        return Vec::new();
+    };
+    let mut fields: Vec<_> =
+        view.schema().fields.iter().filter(|f| !f.is_deleted && crate::core::rql::nullable::is_tick_digit(&f.name)).cloned().collect();
+    fields.sort_by_key(|f| f.write_order);
+    fields.into_iter().map(|f| f.name).collect()
+}
+
+/// [`relation_labels`] and [`carried_hidden_columns`]: every column a copy
+/// of `relation` holds.
+pub(crate) fn relation_labels_carried(relation: &str, database: &Arc<Database>) -> Option<Vec<String>> {
+    let mut labels = relation_labels(relation, database)?;
+    labels.extend(carried_hidden_columns(relation, database));
+    Some(labels)
+}
+
+/// `body`, a derived table that is the whole rows of its one relation
+/// (`SELECT a.* FROM t a …`, `SELECT * FROM t …`), naming the hidden columns
+/// a copy carries ([`carried_hidden_columns`]) after the star; `None` when
+/// it is not that, or the relation has none.
+pub(crate) fn whole_rows_with_hidden(body: &str, database: &Database) -> Option<String> {
+    use crate::core::rql::join::find_keyword;
+    if crate::core::rql::join::statement_has_join(body) {
+        return None;
+    }
+    let star = select_list_of(body)?.trim();
+    let from = find_keyword(body, "FROM", 0)?;
+    let from_end = crate::core::rql::lateral::clause_end_of_from(body);
+    if from_end <= from {
+        return None;
+    }
+    let items = crate::core::rql::lateral::items_before(body, from_end);
+    let [(alias, relation)] = items.as_slice() else {
+        return None;
+    };
+    if relation.trim_start().starts_with('(') {
+        return None;
+    }
+    let qualifier = star.strip_suffix(".*").map(|q| q.trim().trim_matches('"'));
+    if !(star == "*" || qualifier.is_some_and(|q| q == alias)) {
+        return None;
+    }
+    let hidden = carried_hidden_columns(relation.trim().trim_matches('"'), database);
+    if hidden.is_empty() {
+        return None;
+    }
+    let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    // Read as a value and named as it was: a hidden column is not a select
+    // item by its name ("column d.__t7_at does not exist").
+    let extra: Vec<String> =
+        hidden.iter().map(|c| format!("CAST({}.{} AS smallint) AS {}", quoted(alias), quoted(c), quoted(c))).collect();
+    Some(format!("{}, {} {}", body[..from].trim_end(), extra.join(", "), &body[from..]))
+}
+
 /// A `LATERAL` item's relation (`lateral::materialize`): each of `runs` is the
 /// item with one tuple of outer values substituted and those values' keys;
 /// its rows are written with the keys after its own columns, as
@@ -1108,17 +1220,28 @@ pub(crate) fn relation_labels(relation: &str, database: &Arc<Database>) -> Optio
 /// NULL of its type) describes it, so the relation has its columns' types
 /// even when no run returns a row. `labels` renames the item's columns.
 /// The temporary is named in `temps` as soon as it exists.
+///
+/// `batch` is the item as one query for every outer value
+/// (`lateral::batched_body`): its own columns, then the outer value a row is
+/// for, as text; and the most rows it may return. The first row of each
+/// value is that value's row. When it cannot be run, or returns more, the
+/// runs are made instead. Returns whether the batch filled the relation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_keyed_relation(
     described: &str,
     temp: &str,
     labels: Option<&[String]>,
     runs: &[(String, Vec<String>)],
+    batch: Option<(&str, usize)>,
+    // How many key columns each run carries: known with no run at all (an
+    // outer relation whose WHERE keeps no row), when the relation still
+    // needs them for the join back.
+    key_count: usize,
     alias: &str,
     database: &Arc<Database>,
     tx: crate::core::mvcc::transaction::TxId,
     temps: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let subject = format!("the LATERAL item '{alias}'");
     let own = match select_labels(described, database).await {
         Some(own) => own,
@@ -1147,7 +1270,7 @@ pub(crate) async fn build_keyed_relation(
     // are copied out.
     let mut nested_temps: Vec<String> = Vec::new();
     let filled = fill_keyed_relation(
-        runs, width, &own, &mut names, described, temp, &subject, &mut nested_temps, database, tx, temps,
+        runs, batch, key_count, width, &own, &mut names, described, temp, &subject, &mut nested_temps, database, tx, temps,
     )
     .await;
     drop_temps(database, &nested_temps, tx).await;
@@ -1159,6 +1282,8 @@ pub(crate) async fn build_keyed_relation(
 #[allow(clippy::too_many_arguments)]
 async fn fill_keyed_relation(
     runs: &[(String, Vec<String>)],
+    batch: Option<(&str, usize)>,
+    key_count: usize,
     width: usize,
     own: &[String],
     names: &mut Vec<String>,
@@ -1169,11 +1294,56 @@ async fn fill_keyed_relation(
     database: &Arc<Database>,
     tx: crate::core::mvcc::transaction::TxId,
     temps: &mut Vec<String>,
-) -> Result<(), String> {
-    let key_count = runs.first().map_or(0, |(_, keys)| keys.len());
+) -> Result<bool, String> {
+    // With no run there are no keys to count; an empty relation still has
+    // its key columns (`Column '__lat_k1' not found` otherwise).
+    let key_count = runs.first().map_or(key_count, |(_, keys)| keys.len());
     let mut rows: Vec<crate::core::row::row::Row> = Vec::new();
     let mut scales: Option<Vec<u32>> = None;
-    for (body, keys) in runs {
+    // Every outer value's rows at once, the first of each kept. Refused,
+    // failed or past its cap, the item is run a value at a time below.
+    let mut batched = false;
+    if let Some((body, cap)) = batch.filter(|_| key_count == 1) {
+        let nested = Box::pin(materialize_derived(body, database, tx)).await.ok().flatten();
+        let text = match &nested {
+            Some(m) => m.rewritten.as_str(),
+            None => body,
+        };
+        let got = crate::core::rql::executor::run_query_rows_scaled(text, database, tx).await;
+        if let Some(m) = nested {
+            nested_temps.extend(m.temps);
+        }
+        match got {
+            Ok((got, got_scales)) if got.len() <= cap && got.iter().all(|row| row.columns.len() == width + 1) => {
+                let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::with_capacity(got.len());
+                for mut row in got {
+                    let Some(key) = row.columns.pop() else { continue };
+                    // A NULL in the item's column joins no outer value.
+                    if key.column_type == DbType::NULL {
+                        continue;
+                    }
+                    let mut text = Vec::with_capacity(key.data.into_slice().len() + 1);
+                    text.push(b'v');
+                    text.extend_from_slice(key.data.into_slice());
+                    if !seen.insert(text.clone()) {
+                        continue;
+                    }
+                    let mut block = crate::memory_pool::MEMORY_POOL.acquire(text.len());
+                    block.into_slice_mut().copy_from_slice(&text);
+                    row.columns.push(crate::core::row::row::Column { schema_id: 0, data: block, column_type: DbType::STRING });
+                    rows.push(row);
+                }
+                scales = got_scales.map(|mut scales| {
+                    scales.truncate(width);
+                    scales
+                });
+                batched = true;
+            }
+            Ok(_) => {}
+            Err(e) => log::debug!("{subject}: asked for every outer value at once it failed ({e}); run for each"),
+        }
+    }
+    for (body, keys) in runs.iter().filter(|_| !batched) {
         let nested = Box::pin(materialize_derived(body, database, tx)).await?;
         let text = match nested {
             Some(m) => {
@@ -1249,7 +1419,7 @@ async fn fill_keyed_relation(
         .await
         .map_err(|e| format!("could not fill {subject}: {e}"))?;
     }
-    Ok(())
+    Ok(batched)
 }
 
 fn temp_name(cte: &str, statement: &str, index: usize) -> String {
@@ -2062,6 +2232,195 @@ pub(crate) fn blank_padded_columns(query: &str, database: &Arc<Database>) -> Vec
 }
 
 /// [`declared_types_among`]'s fields.
+/// The fields of the one table `query` selects from (no join, no derived
+/// table), as [`declared_fields_among`] finds it.
+fn source_relation_fields(query: &str, database: &Arc<Database>) -> Option<Vec<SchemaField>> {
+    if crate::core::rql::join::statement_has_join(query) {
+        return None;
+    }
+    let at = crate::core::rql::join::find_keyword(query, "FROM", 0)?;
+    let rest = query[at + "FROM".len()..].trim_start();
+    let name = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(|c: char| c == ';' || c == ',')
+        .trim_matches('"');
+    if name.is_empty() || name.contains('(') {
+        return None;
+    }
+    Some(database.schema_view(name)?.schema().fields.to_vec())
+}
+
+/// The collation of each of `query`'s outputs (`labels`), where it reads
+/// several relations: that of the column an item names (`q.c`, `c`, with or
+/// without `AS`), in the relation of the `FROM` it belongs to, and of each
+/// column a `q.*` or `*` stands for. `None` for anything else: an
+/// expression, a relation with no schema here, a name two relations could
+/// own, a set operation.
+fn joined_collations(query: &str, labels: &[String], database: &Arc<Database>) -> Vec<Option<&'static str>> {
+    use crate::core::rql::join::find_keyword;
+    let none = vec![None; labels.len()];
+    if ["UNION", "INTERSECT", "EXCEPT"].iter().any(|word| find_keyword(query, word, 0).is_some()) {
+        return none;
+    }
+    let Some(list) = select_list_of(query) else {
+        return none;
+    };
+    let items = crate::core::sql_scan::split_top_level(list, b',');
+    let Some(from) = find_keyword(query, "FROM", 0) else {
+        return none;
+    };
+    let from_end = crate::core::rql::lateral::clause_end_of_from(query);
+    if from_end <= from {
+        return none;
+    }
+    // Every item of the FROM, or an unqualified name is not looked for: one
+    // the walk stopped before could own it too.
+    let clause = &query[from + "FROM".len()..from_end];
+    let expected = crate::core::sql_scan::split_top_level(clause, b',').len().max(1) + {
+        let (mut count, mut at) = (0usize, 0usize);
+        while let Some(found) = find_keyword(clause, "JOIN", at) {
+            count += 1;
+            at = found + "JOIN".len();
+        }
+        count
+    };
+    let relations: Vec<(String, Option<Vec<SchemaField>>)> = crate::core::rql::lateral::items_before(query, from_end)
+        .into_iter()
+        .map(|(alias, relation)| {
+            let name = relation.trim();
+            let fields = (!name.starts_with('('))
+                .then(|| database.schema_view(name.trim_matches('"')))
+                .flatten()
+                .map(|view| view.schema().fields.to_vec());
+            (alias, fields)
+        })
+        .collect();
+    let whole = relations.len() == expected && relations.iter().all(|(_, fields)| fields.is_some());
+    let collation_of = |field: &SchemaField, fields: &[SchemaField]| -> Option<&'static str> {
+        let strength = crate::core::rql::collation::order_of(&field.name, fields);
+        (!strength.is_binary()).then(|| strength.name())
+    };
+    let in_fields = |fields: &[SchemaField], column: &str| -> Option<Option<&'static str>> {
+        let field = fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))?;
+        Some(collation_of(field, fields))
+    };
+    let owner = |qualifier: &str| -> Option<&[SchemaField]> {
+        let mut owners = relations.iter().filter(|(alias, _)| alias.eq_ignore_ascii_case(qualifier));
+        let (_, fields) = owners.next()?;
+        if owners.next().is_some() {
+            return None;
+        }
+        fields.as_deref()
+    };
+    // A star's columns: the relation's own, in its order, each under the
+    // name the output has at that place (checked below).
+    let starred = |fields: &[SchemaField], out: &mut Vec<(Option<String>, Option<&'static str>)>| {
+        let mut visible: Vec<&SchemaField> =
+            fields.iter().filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name)).collect();
+        visible.sort_by_key(|f| f.write_order);
+        for field in visible {
+            out.push((Some(field.name.clone()), collation_of(field, fields)));
+        }
+    };
+    // Each output: the name a star's column must have there, and the
+    // collation.
+    let mut out: Vec<(Option<String>, Option<&'static str>)> = Vec::with_capacity(labels.len());
+    for (index, item) in items.iter().enumerate() {
+        let item = item.trim();
+        if item == "*" {
+            if !whole {
+                return none;
+            }
+            for (_, fields) in &relations {
+                starred(fields.as_deref().unwrap_or_default(), &mut out);
+            }
+            continue;
+        }
+        if let Some(qualifier) = item.strip_suffix(".*") {
+            let Some(fields) = plain_reference(qualifier.trim()).filter(|(q, _)| q.is_none()).and_then(|(_, name)| owner(&name)) else {
+                return none;
+            };
+            starred(fields, &mut out);
+            continue;
+        }
+        let (expr, _) = crate::core::rql::join::split_expr_alias(item);
+        let mut expr = expr.trim();
+        if index == 0 {
+            // The list's `DISTINCT` / `ALL` before its first item.
+            for word in ["DISTINCT ", "ALL "] {
+                if expr.get(..word.len()).is_some_and(|head| head.eq_ignore_ascii_case(word)) {
+                    expr = expr[word.len()..].trim();
+                }
+            }
+        }
+        let collation = plain_reference(expr).and_then(|(qualifier, column)| match qualifier {
+            Some(qualifier) => in_fields(owner(&qualifier)?, &column)?,
+            None if whole => {
+                let mut found = relations.iter().filter_map(|(_, fields)| in_fields(fields.as_deref()?, &column));
+                let only = found.next()?;
+                if found.next().is_some() {
+                    return None;
+                }
+                only
+            }
+            None => None,
+        });
+        out.push((None, collation));
+    }
+    if out.len() != labels.len() {
+        return none;
+    }
+    out.into_iter()
+        .zip(labels)
+        .map(|((name, collation), label)| match name {
+            Some(name) if !name.eq_ignore_ascii_case(label) => None,
+            _ => collation,
+        })
+        .collect()
+}
+
+/// `expr` as a column reference and nothing else: `c` or `q.c`, either
+/// part quoted or a plain word. Its qualifier and column, unquoted.
+fn plain_reference(expr: &str) -> Option<(Option<String>, String)> {
+    let bytes = expr.as_bytes();
+    let mut parts: Vec<String> = Vec::new();
+    let mut at = 0usize;
+    loop {
+        match bytes.get(at)? {
+            b'"' => {
+                let end = crate::core::sql_scan::quoted_end(bytes, at, b'"');
+                let inner = expr.get(at + 1..end.checked_sub(1)?)?;
+                if inner.is_empty() || inner.contains('"') {
+                    return None;
+                }
+                parts.push(inner.to_string());
+                at = end;
+            }
+            b if b.is_ascii_alphabetic() || *b == b'_' || *b >= 0x80 => {
+                let start = at;
+                while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_' || bytes[at] >= 0x80) {
+                    at += 1;
+                }
+                parts.push(expr[start..at].to_string());
+            }
+            _ => return None,
+        }
+        match bytes.get(at) {
+            None => break,
+            Some(b'.') => at += 1,
+            Some(_) => return None,
+        }
+    }
+    let column = parts.pop()?;
+    match parts.len() {
+        0 => Some((None, column)),
+        1 => Some((parts.pop(), column)),
+        _ => None,
+    }
+}
+
 fn declared_fields_among(
     query: &str,
     labels: &[String],
@@ -2087,14 +2446,33 @@ fn declared_fields_among(
     if name.is_empty() || name.contains('(') {
         return none;
     }
+    // Each output's column: by its label, or the column an alias names
+    // (`g AS d`), whose collation the copy keeps (a uniqueidentifier sorted
+    // through `FROM (SELECT g AS d …)` sorted by its bytes).
+    let items: Vec<String> = select_list_of(query)
+        .map(|list| crate::core::sql_scan::split_top_level(list, b',').iter().map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
     let types_in = |fields: &[SchemaField]| -> Vec<Option<SchemaField>> {
         labels
             .iter()
-            .map(|label| {
-                fields
-                    .iter()
-                    .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(label))
-                    .cloned()
+            .enumerate()
+            .map(|(k, label)| {
+                let named = |n: &str| fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(n)).cloned();
+                named(label).or_else(|| {
+                    let item = items.get(k).filter(|_| items.len() == labels.len())?;
+                    let (expr, alias) = crate::core::rql::join::split_expr_alias(item);
+                    alias?;
+                    // The list's `DISTINCT` / `ALL` before its first item.
+                    let expr = expr.trim();
+                    let expr = ["DISTINCT ", "ALL "]
+                        .iter()
+                        .find_map(|w| expr.get(..w.len()).filter(|h| h.eq_ignore_ascii_case(w)).map(|_| expr[w.len()..].trim()))
+                        .unwrap_or(expr);
+                    let column = expr.rsplit('.').next()?.trim_matches('"');
+                    (!column.is_empty() && column.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80))
+                        .then(|| named(column))
+                        .flatten()
+                })
             })
             .collect()
     };
@@ -2893,6 +3271,28 @@ async fn materialize_derived_inner(
         found_any = true;
     }
 
+    // A window over a join, as the window over the join's derived table
+    // (`rql::window_join`). The top level rewrites its own here too, and a
+    // derived table's or a CTE's body never passed there either: EF Core's
+    // `ROW_NUMBER() OVER (PARTITION BY … ORDER BY …)` over joined
+    // navigations inside `FROM (…) AS s WHERE s.row <= 1` failed with "could
+    // not be read as an expression over this join".
+    let columns_of = |name: &str| -> Option<Vec<String>> {
+        let view = database.schema_view(name)?;
+        Some(
+            view.schema()
+                .fields
+                .iter()
+                .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+                .map(|f| f.name.clone())
+                .collect(),
+        )
+    };
+    if let Some(rewritten) = crate::core::rql::window_join::rewrite_statement(&current, &columns_of) {
+        current = rewritten;
+        found_any = true;
+    }
+
     // `SELECT generate_series(1, 3)`: the `FROM` form it means.
     if let Some(form) = crate::core::rql::table_functions::select_list_form(&current) {
         current = form;
@@ -2951,6 +3351,15 @@ async fn materialize_derived_inner(
         found_any = true;
         crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Derived, tx, database);
 
+        // Built for the rows the statement can use: the keys of a relation
+        // it joins that is built already, and its own WHERE over literals
+        // (`derived_pushdown`).
+        let inner = match crate::core::rql::derived_pushdown::narrowed(&current, start, end, &inner, &alias, temps, database, tx).await {
+            Some(narrowed) => narrowed,
+            None => inner,
+        };
+        // A copy of whole rows carries the hidden columns read by name.
+        let inner = whole_rows_with_hidden(&inner, database).unwrap_or(inner);
         let temp = materialize_query(&inner, &alias, &current, database, tx).await?;
         temps.push(temp.clone());
         current = format!("{}{} {}{}", &current[..start], temp, alias, &current[end..]);

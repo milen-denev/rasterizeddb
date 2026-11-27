@@ -169,6 +169,17 @@ pub(super) fn write_intent(path: &Path, text: &str) -> io::Result<()> {
 }
 
 /// Removes the intent durably.
+/// [`remove_intent`] without its directory sync: for a caller removing
+/// several in one directory, which syncs it once after.
+pub(super) fn remove_intent_unsynced(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Unlink(path));
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 pub(super) fn remove_intent(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Unlink(path));
@@ -364,6 +375,9 @@ impl Database {
             // Between the fence and the first field record that needs it.
             point(self, "after_numeric_fence").map_err(io::Error::other)?;
         }
+        if crate::core::rql::type_modifier::declares_compression(&create.type_modifiers) {
+            self.require_compressed_values()?;
+        }
         if create.foreign_keys.iter().any(|fk| fk.is_composite()) {
             self.require_composite_foreign_keys()?;
         }
@@ -439,7 +453,27 @@ impl Database {
         self.reload_plain_with_instance(table_name, |old| ungated(Ungated::SchemaRewrite, async move {
             // After the lock and the retirement: every committed write is in
             // the files, and nothing writes them now.
-            let (create, plan) = read(old).await?;
+            // A ledger table or vault stays one: the rewrite's definition is
+            // built from the columns, and would otherwise create a plain
+            // table under the guarded one's name.
+            // Its policy as the sidecar holds it now, not as the table was
+            // opened with: an ALTER LEDGER TABLE (a legal hold, a raised
+            // retention) appends a record without reloading the table, and a
+            // rewrite from the opened bytes dropped it at the next restart.
+            let policy = if old.schema.special.is_special() {
+                match crate::core::ledger_hooks::policy_sidecar::load(&old.io_schema).await {
+                    Ok(bytes) if !bytes.is_empty() => bytes,
+                    _ => old.schema.ledger_policy.clone(),
+                }
+            } else {
+                Vec::new()
+            };
+            let kept = (old.schema.special, policy);
+            let (mut create, plan) = read(old).await?;
+            if kept.0.is_special() {
+                create.special = kept.0;
+                create.ledger_policy = kept.1;
+            }
             if create.table_name != table_name {
                 return Err(format!(
                     "internal error: a rewrite of \"{table_name}\" defined \"{}\"",

@@ -36,6 +36,10 @@ pub enum AlterAction {
         /// `GENERATED ALWAYS AS (…) STORED`'s expression. Dropped before, so
         /// the column was added and never given a value.
         generated: Option<String>,
+        /// `COMPRESSION zstd(9)`: the level, `None` for none, absent or
+        /// `default`. Not read before, so the clause was accepted and the
+        /// column stored its values uncompressed.
+        compression: Option<i32>,
         /// A declared `character(n)` / `character varying(n)` length
         /// (`type_modifier::TextTypmod`).
         text_typmod: Option<crate::core::rql::type_modifier::TextTypmod>,
@@ -102,6 +106,17 @@ pub enum AlterAction {
         from: String,
         to: String,
     },
+    /// `SET (row_compression = 'zstd(9)')` / `RESET (row_compression)`: the
+    /// table stores each row's variable-width values as one frame
+    /// (`core::compression`), at this level, or stops (`None`). Values
+    /// written from then on.
+    SetRowCompression {
+        level: Option<i32>,
+    },
+    /// `RECOMPRESS`: every row rewritten under the table's compression as it
+    /// stands now, with dictionaries trained from the values the table holds
+    /// (`core::compression::train`).
+    Recompress,
     /// Accepted and not acted on, with the reason.
     ///
     /// PostgreSQL storage tuning — `SET COMPRESSION`, `SET (autovacuum_…)` —
@@ -122,13 +137,7 @@ pub struct AlterTable {
 
 /// Strips quoting and any schema qualification from a relation or column name.
 fn bare_name(raw: &str) -> String {
-    raw.trim()
-        .trim_end_matches(&[',', ';'][..])
-        .split('.')
-        .next_back()
-        .unwrap_or(raw)
-        .trim_matches('"')
-        .to_string()
+    crate::core::sql_scan::bare_name(raw.trim().trim_end_matches(&[',', ';'][..]))
 }
 
 /// `ALTER INDEX [IF EXISTS] name RENAME TO new`: the index, whether `IF
@@ -177,6 +186,31 @@ fn token_at(s: &str, from: usize) -> Option<(&str, usize)> {
 /// or inside a quoted identifier or default expression is data, not a
 /// separator, which is why `split_definitions` does the work rather than
 /// `split(',')`.
+impl AlterAction {
+    /// The clause as a ledger policy is asked about it
+    /// (`ledger_hooks::WriteKind::Alter`). An `ADD COLUMN` says whether the
+    /// column is nullable with no default, the only kind that leaves every
+    /// existing row's digest as it was.
+    pub fn ledger_label(&self) -> &'static str {
+        match self {
+            AlterAction::AddColumn { nullable: true, default: None, generated: None, .. } => "ADD COLUMN NULL",
+            AlterAction::AddColumn { .. } => "ADD COLUMN",
+            AlterAction::DropColumn { .. } => "DROP COLUMN",
+            AlterAction::RenameColumn { .. } => "RENAME COLUMN",
+            AlterAction::ConstraintClause { .. } => "CONSTRAINT",
+            AlterAction::RenameTable { .. } => "RENAME",
+            AlterAction::AlterColumn { .. } => "ALTER COLUMN",
+            AlterAction::SetDefault { .. } => "SET DEFAULT",
+            AlterAction::ValidateConstraint { .. } => "VALIDATE CONSTRAINT",
+            AlterAction::RenameConstraint { .. } => "RENAME CONSTRAINT",
+            AlterAction::RenameIndex { .. } => "RENAME INDEX",
+            AlterAction::SetRowCompression { .. } => "SET COMPRESSION",
+            AlterAction::Recompress => "RECOMPRESS",
+            AlterAction::NoOp { .. } => "NO-OP",
+        }
+    }
+}
+
 pub fn parse_alter_table_actions(sql: &str) -> Result<Vec<AlterTable>, String> {
     Ok(parse_alter_table_actions_tagged(sql)?.into_iter().map(|(action, _)| action).collect())
 }
@@ -415,7 +449,19 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                     create the table with the identity column instead"
             .to_string());
     }
-    let (remainder, default) = crate::core::rql::column_default::split_clause(&remainder);
+    // `SET COMPRESSION default` names a method, not a DEFAULT clause: split
+    // off, `default` left a bare `SET COMPRESSION`.
+    let sets_compression = remainder
+        .to_ascii_uppercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w == ["SET", "COMPRESSION"]);
+    let (remainder, default) = if sets_compression {
+        (remainder, None)
+    } else {
+        crate::core::rql::column_default::split_clause(&remainder)
+    };
     let rest: Vec<&str> = remainder.split_whitespace().collect();
     if rest.is_empty() {
         return Err("ALTER TABLE has no action".to_string());
@@ -515,6 +561,17 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             let constraints = rest_upper[i + used..].join(" ");
             let nullable =
                 !(constraints.contains("NOT NULL") || constraints.contains("PRIMARY KEY"));
+            let compression = match crate::core::compression::clause_in(&rest[i + used..]) {
+                Some(Err(reason)) => return Err(reason),
+                Some(Ok(level)) => level,
+                None => None,
+            };
+            if compression.is_some() && db_type.physical() != DbType::STRING {
+                return Err(format!(
+                    "column data type {} does not support compression",
+                    phrase.to_ascii_lowercase()
+                ));
+            }
             let declared = written;
             let text_typmod = match crate::core::rql::type_modifier::parse_text_typmod(&declared)
                 .or_else(|| crate::core::rql::type_modifier::parse_time_precision(&declared))
@@ -547,6 +604,7 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                 json,
                 modifier,
                 generated,
+                compression,
                 text_typmod,
             }
         }
@@ -664,12 +722,29 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
         // Storage tuning and constraint validation: accepted, not acted on.
         // `SET` here is the *table-level* form — `ALTER COLUMN … SET DEFAULT`
         // was matched earlier and still does what it says.
+        // `SET (…)` / `RESET (…)`: `row_compression` is acted on, the
+        // other storage options accepted and ignored.
+        "SET" | "RESET" if rest.get(1).is_some_and(|t| t.starts_with('(')) => {
+            let group = rest[1..].join(" ");
+            let inner = group.trim().trim_end_matches(';').trim();
+            let inner = inner.strip_prefix('(').and_then(|g| g.strip_suffix(')')).ok_or_else(|| {
+                format!("syntax error at or near \"{}\": a storage option list is parenthesised", rest[1])
+            })?;
+            match crate::core::compression::row_compression_option(inner)? {
+                Some(level) if rest_upper[0] == "SET" => AlterAction::SetRowCompression { level },
+                Some(_) => AlterAction::SetRowCompression { level: None },
+                None => AlterAction::NoOp {
+                    reason: "table storage options: RasterizedDB manages its own storage",
+                },
+            }
+        }
         "SET" => AlterAction::NoOp {
             reason: "table storage options: RasterizedDB manages its own storage",
         },
         "RESET" => AlterAction::NoOp {
             reason: "table storage options: RasterizedDB manages its own storage",
         },
+        "RECOMPRESS" if rest.len() == 1 => AlterAction::Recompress,
         "VALIDATE" if rest_upper.get(1).map(String::as_str) == Some("CONSTRAINT") => {
             // The name read as every constraint name is (bare or quoted, cut
             // to its stored form).
@@ -921,7 +996,7 @@ pub fn expand_multi_drop(sql: &str) -> Option<Vec<String>> {
     let mut suffix = "";
     for option in ["CASCADE", "RESTRICT"] {
         if rest.len() > option.len()
-            && rest[rest.len() - option.len()..].eq_ignore_ascii_case(option)
+            && rest.as_bytes()[rest.len() - option.len()..].eq_ignore_ascii_case(option.as_bytes())
             && rest[..rest.len() - option.len()].ends_with(char::is_whitespace)
         {
             suffix = option;
@@ -1480,6 +1555,23 @@ mod tests {
         );
     }
 
+    /// `ADD COLUMN … COMPRESSION` is read, not passed over: the clause was
+    /// accepted and the column stored its values uncompressed.
+    #[test]
+    fn add_column_reads_its_compression() {
+        let level = |sql: &str| match parse_alter_table(sql).map(|a| a.action) {
+            Ok(AlterAction::AddColumn { compression, .. }) => Ok(compression),
+            Ok(other) => panic!("{sql}: {other:?}"),
+            Err(e) => Err(e),
+        };
+        assert_eq!(level("ALTER TABLE d ADD COLUMN body TEXT COMPRESSION zstd(9)"), Ok(Some(9)));
+        assert!(matches!(level("ALTER TABLE d ADD COLUMN body TEXT NOT NULL DEFAULT '' COMPRESSION zstd"), Ok(Some(_))));
+        assert_eq!(level("ALTER TABLE d ADD COLUMN body TEXT COMPRESSION none"), Ok(None));
+        assert_eq!(level("ALTER TABLE d ADD COLUMN body TEXT"), Ok(None));
+        assert!(level("ALTER TABLE d ADD COLUMN n INT COMPRESSION zstd").unwrap_err().contains("does not support compression"));
+        assert!(level("ALTER TABLE d ADD COLUMN body TEXT COMPRESSION gzip").is_err());
+    }
+
     #[test]
     fn parses_add_column() {
         let a = parse_alter_table(r#"ALTER TABLE "users" ADD COLUMN "nickname" TEXT"#).unwrap();
@@ -1496,6 +1588,7 @@ mod tests {
                 json: false,
                 modifier: None,
                 generated: None,
+                compression: None,
                 text_typmod: None,
             }
         );

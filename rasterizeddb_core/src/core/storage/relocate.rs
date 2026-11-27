@@ -121,8 +121,9 @@ fn where_it_is(backend: &TableBackend) -> String {
 
 /// What the table gained or lost by arriving where it did.
 ///
-/// Backup, the write-ahead log, relocation and the free-space policy are
-/// features *about files*. Crossing that line in either direction is the part
+/// The write-ahead log (and with it a backup's point-in-time replay),
+/// relocation and the free-space policy are features *about files*; a backup
+/// copies a table on a store too, as of each snapshot (kv-storage.md §9). Crossing that line in either direction is the part
 /// of a move that is invisible afterwards: the rows read back identically, and
 /// the next snapshot is the first hint that the table is no longer in one.
 fn consequences(from: &TableBackend, to: &TableBackend) -> Vec<String> {
@@ -134,14 +135,15 @@ fn consequences(from: &TableBackend, to: &TableBackend) -> Vec<String> {
                 .to_string(),
         ),
         TableBackend::KeyValue(_) => lines.push(
-            "it is durable in the store, but it is no longer covered by backups or by \
-             STORAGE REBALANCE, and it has no write-ahead log — its durability is \
-             the delta object written at each commit"
+            "it is durable in the store, with no write-ahead log — its durability is \
+             the delta object written at each commit; a backup copies it as of each \
+             snapshot, with no point-in-time replay, and STORAGE REBALANCE leaves it \
+             where it is"
                 .to_string(),
         ),
         TableBackend::Directory(_) if !from.is_file_based() => lines.push(
-            "it is a file-backed table again: backups include it, the write-ahead log \
-             covers it, and the free-space policy counts it"
+            "it is a file-backed table again: the write-ahead log covers it, so a \
+             backup restores it to any point in time, and the free-space policy counts it"
                 .to_string(),
         ),
         TableBackend::Directory(_) => {}
@@ -429,49 +431,9 @@ async fn plan_partitions(database: &Arc<Database>, pool: &StorageManager) -> Res
     Ok(plan)
 }
 
-/// Gives one moved table's ACCESS EXCLUSIVE back when dropped, unless the
-/// statement's owner held it before the move (a block that locked the table
-/// itself keeps it, and keeps any other mode it held: the manager holds a
-/// mode set per owner). Taken before the request, so a failed or cancelled
-/// wait gives back nothing it did not get.
-struct MoveRelease<'a> {
-    database: &'a Database,
-    owner: Option<crate::core::mvcc::table_locks::LockOwner>,
-    table: String,
-}
-
-impl<'a> MoveRelease<'a> {
-    fn before(database: &'a Database, table: &str) -> Self {
-        use crate::core::mvcc::table_locks::TableMode;
-        let key = database.lock_key(table).into_owned();
-        let owner = crate::core::mvcc::owner::ensure()
-            .map(|o| o.owner)
-            .filter(|&o| {
-                !database
-                    .row_locks
-                    .table_locks()
-                    .holds(o, &key)
-                    .contains(TableMode::AccessExclusive)
-            });
-        MoveRelease {
-            database,
-            owner,
-            table: key,
-        }
-    }
-}
-
-impl Drop for MoveRelease<'_> {
-    fn drop(&mut self) {
-        if let Some(owner) = self.owner {
-            self.database.row_locks.table_locks().release_mode(
-                owner,
-                &self.table,
-                crate::core::mvcc::table_locks::TableMode::AccessExclusive,
-            );
-        }
-    }
-}
+// `MoveRelease` lives in mvcc::table_locks: SHARD TAKE/GIVE uses it too,
+// in builds without storage pools.
+pub(crate) use crate::core::mvcc::table_locks::MoveRelease;
 
 /// Works out what should move, without moving anything.
 async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {

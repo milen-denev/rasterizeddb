@@ -100,10 +100,10 @@ const FORMER_ESCAPES: &[(&str, &str, &str)] = &[
     (EXEC, "execute_drop_path_index", "table_for"),
     (EXEC, "execute_join", "relation_for"),
     (EXEC, "execute_prepared_rows", "relation_for"),
-    (EXEC, "execute_with_need", "table_for"),
+    (EXEC, "execute_with_need_inner", "table_for"),
     // B8b: the INSERT arm resolves its target once, under ROW EXCLUSIVE, and
     // hands the schema to the steps that read it (`SCHEMA_FROM_CALLER`).
-    (EXEC, "execute_with_need", "relation_for"),
+    (EXEC, "execute_with_need_inner", "relation_for"),
     (EXEC, "existing_rows_break_unique", "table_for"),
     (EXEC, "insert_loaded_row", "table_for"),
     (EXEC, "load_json_document", "table_for"),

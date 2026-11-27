@@ -107,6 +107,8 @@ async fn a_column_added_after_a_drop_does_not_take_the_previous_column_s_bytes_b
             },
         ],
         is_immutable: false,
+        special: rasterizeddb_core::core::row::schema::SpecialTable::None,
+        ledger_policy: Vec::new(),
         foreign_keys: Vec::new(),
         defaults: Vec::new(),
         primary_key: None,

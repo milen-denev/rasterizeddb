@@ -24,6 +24,8 @@ use crate::memory_pool::MEMORY_POOL;
 /// `pub`/`pub(crate)` methods of `impl Table` that touch only the schema,
 /// the transaction wiring or a counter, and so may run on a shell.
 const SCHEMA_ONLY: &[&str] = &[
+    // A budget's estimate: 0 for a shell, never an error (asserted on one).
+    "resident_estimate",
     // The file set's write gate and the family a ticket on it is kept for
     // (slice B11): a shell has a detached gate and nothing to write.
     "gate",
@@ -88,6 +90,8 @@ const CALLED_ON_SHELL: &[&str] = &[
     "reserve_insert_id",
     "neutralize_aborted_now",
     "vacuum_now",
+    "ledger_rows",
+    "ledger_versions",
     "compact",
     "vacuum_stats",
     "reclaimable_bytes",
@@ -95,6 +99,7 @@ const CALLED_ON_SHELL: &[&str] = &[
     "set_vacuum_enabled",
     "locate_row_by_id",
     "filters_ready",
+    "wait_indexes_ready",
     "wait_filters_ready",
     "backfill_filters",
     "backfill_filters_from",
@@ -461,6 +466,8 @@ async fn a_shell_refuses_every_data_method() {
     expect("reserve_insert_id", unit(shell.reserve_insert_id().await));
     expect("neutralize_aborted_now", unit(shell.neutralize_aborted_now().await));
     expect("vacuum_now", unit(shell.vacuum_now().await));
+    expect("ledger_rows", unit(shell.ledger_rows().await));
+    expect("ledger_versions", unit(shell.ledger_versions(0).await));
     expect("compact", unit(shell.compact().await));
     expect("vacuum_stats", unit(shell.vacuum_stats()));
     expect("reclaimable_bytes", unit(shell.reclaimable_bytes()));
@@ -468,6 +475,9 @@ async fn a_shell_refuses_every_data_method() {
     expect("set_vacuum_enabled", unit(shell.set_vacuum_enabled(true)));
     expect("locate_row_by_id", unit(shell.locate_row_by_id(1).await));
     expect("filters_ready", unit(shell.filters_ready()));
+    expect("wait_indexes_ready", unit(shell.wait_indexes_ready(std::time::Duration::from_millis(1)).await));
+    // No error to give: a shell holds nothing resident.
+    assert_eq!(shell.resident_estimate(), 0, "resident_estimate of a shell");
     expect("wait_filters_ready", unit(shell.wait_filters_ready().await));
     expect("backfill_filters", unit(shell.backfill_filters().await));
     expect("backfill_filters_from", unit(shell.backfill_filters_from(0).await));

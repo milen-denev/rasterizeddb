@@ -43,6 +43,7 @@ use syn::{Data, DeriveInput, Fields, LitStr, Type, parse_macro_input};
 /// | `column = "name"` | the column's name, when it is not the field's |
 /// | `sql_type = "VARCHAR(64)"` | the DDL type, when the field type's default is not wanted |
 /// | `default = "…"` | a `DEFAULT` expression for the DDL |
+/// | `compression`, `compression = "zstd(19)"` | store a text, `jsonb`, `bytea` or array column's values compressed: zstd at level 3, or the level given (1 fastest to 22 smallest); `lz4` and `pglz` are taken as zstd. Applies to values written after it is set |
 /// | `renamed_from = "old"` | an earlier column name, for the migrator to rename (may repeat) |
 /// | `json` | any `Serialize + Deserialize` type, stored as `jsonb` (feature `serde_json`) |
 /// | `text` | read as `col::text` and parsed (for a type of your own) |
@@ -77,6 +78,9 @@ use syn::{Data, DeriveInput, Fields, LitStr, Type, parse_macro_input};
 /// | `renamed_from = "old"` | an earlier table name, for the migrator to rename |
 /// | `hooks` | run the struct's `ModelHooks` impl (validation, before/after hooks), which you then write |
 /// | `partition_by = "tenant_id, group_id"`, `partitions = 16` | a hash-partitioned table: `CREATE TABLE … PARTITION BY HASH (…) PARTITIONS 16` |
+/// | `shard_by = "tenant_id"` | the shard key a router routes by (defaults to the leading `partition_by` column). The column must be an integer, `String` or `Uuid`, in the primary key and in every unique key, and the model has no `serial` column |
+/// | `shard = "global"`, `shard = "unsharded"` | rows on the home shard only; or refused by a router |
+/// | `row_compression = "zstd(9)"` | store each row's text, `jsonb`, `bytea` and array values as one compressed frame: `WITH (row_compression = …)`; for a table of many short strings, where per-column `compression` finds too little to work on |
 ///
 /// A field's type must implement `SqlType` (every type the client maps does)
 /// unless it has `sql_type` or `json`.
@@ -143,6 +147,8 @@ struct FieldAttrs {
     column: Option<String>,
     sql_type: Option<String>,
     default: Option<String>,
+    /// `compression`: the method as the server names it (`zstd`, `zstd(19)`).
+    compression: Option<String>,
     json: bool,
     text: bool,
     skip: bool,
@@ -284,6 +290,31 @@ fn fk_action(text: &str, span: Span) -> syn::Result<String> {
     }
 }
 
+/// The method of `#[rdb(compression = "…")]` as the server names it in
+/// `pg_attribute.attcompression` (`zstd` at the default level 3, else
+/// `zstd(n)`), so the migrator compares like with like. The grammar is the
+/// server's `COMPRESSION` clause: `zstd`, `zstd(1..=22)`, and `lz4` / `pglz`,
+/// which it stores as zstd.
+fn compression_method(text: &str) -> Result<String, String> {
+    const DEFAULT_LEVEL: u32 = 3;
+    let lower: String = text.trim().to_ascii_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    let level = match lower.as_str() {
+        "zstd" | "lz4" | "pglz" => DEFAULT_LEVEL,
+        other => {
+            let inner = other
+                .strip_prefix("zstd(")
+                .and_then(|r| r.strip_suffix(')'))
+                .ok_or_else(|| format!("compression is zstd, zstd(level), lz4 or pglz, not \"{text}\""))?;
+            let level: u32 = inner.parse().map_err(|_| format!("compression level \"{inner}\" is not a number"))?;
+            if !(1..=22).contains(&level) {
+                return Err(format!("compression level {level} is out of range: zstd levels are 1 to 22"));
+            }
+            level
+        }
+    };
+    Ok(if level == DEFAULT_LEVEL { "zstd".to_string() } else { format!("zstd({level})") })
+}
+
 fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
     let mut out = FieldAttrs::default();
     for attr in attrs.iter().filter(|a| a.path().is_ident("rdb")) {
@@ -325,6 +356,16 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
                 "column" | "rename" => out.column = Some(string(&meta)?),
                 "sql_type" => out.sql_type = Some(string(&meta)?),
                 "default" => out.default = Some(string(&meta)?),
+                "compression" => {
+                    let method = if meta.input.peek(syn::Token![=]) {
+                        string(&meta)?
+                    } else {
+                        "zstd".to_string()
+                    };
+                    out.compression = Some(
+                        compression_method(&method).map_err(|e| meta.error(e))?,
+                    );
+                }
                 "renamed_from" => out.renamed_from.push(string(&meta)?),
                 "references" => {
                     let text = string(&meta)?;
@@ -353,7 +394,7 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
                 _ => {
                     return Err(meta.error(
                         "unknown rdb attribute; expected primary_key, serial, unique, index, \
-                         column, sql_type, default, renamed_from, references, on_delete, \
+                         column, sql_type, default, compression, renamed_from, references, on_delete, \
                          on_update, json, text, skip, version, created_at, updated_at, \
                          soft_delete, has_many, has_one, belongs_to, many_to_many or count_of",
                     ));
@@ -392,6 +433,7 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
             || out.column.is_some()
             || out.sql_type.is_some()
             || out.default.is_some()
+            || out.compression.is_some()
             || out.json
             || out.text
         {
@@ -407,6 +449,7 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
             || out.serial
             || out.unique
             || out.index.is_some()
+            || out.compression.is_some()
             || out.role.is_some())
     {
         return Err(syn::Error::new(
@@ -621,6 +664,13 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             "hooks",
             "partition_by",
             "partitions",
+            "row_compression",
+            "shard_by",
+            "shard",
+            "ledger",
+            "ledger_drop_idle",
+            "ledger_anchor",
+            "ledger_versioned",
         ],
     )?;
     let setting = |key: &str| {
@@ -644,6 +694,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
         .collect();
 
     let mut defs = Vec::new();
+    let mut column_compression = Vec::new();
     let mut writes = Vec::new();
     let mut texts = Vec::new();
     let mut consts = Vec::new();
@@ -683,6 +734,9 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             Some(d) => quote!(::core::option::Option::Some(#d)),
             None => quote!(::core::option::Option::None),
         };
+        if let Some(method) = &f.attrs.compression {
+            column_compression.push(quote!((#column, #method)));
+        }
         let (primary_key, serial, unique) = (f.attrs.primary_key, f.attrs.serial, f.attrs.unique);
         let renamed_from = &f.attrs.renamed_from;
         let references = match &f.attrs.references {
@@ -919,6 +973,60 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             }))
         }
     };
+    let (shard_const, shard_key_fn) = sharding(input, &fields, setting("shard_by"), setting("shard"), setting("partition_by"))?;
+    let row_compression = match setting("row_compression") {
+        Some(method) => {
+            // A bare `row_compression` is zstd at its default level.
+            let method = if method.is_empty() { "zstd".to_string() } else { method };
+            let method = compression_method(&method).map_err(|e| syn::Error::new(input.span(), e))?;
+            quote!(const ROW_COMPRESSION: ::core::option::Option<&'static str> = ::core::option::Option::Some(#method);)
+        }
+        None => quote!(),
+    };
+    // Emitted only for a model that compresses, so that a model that does
+    // not compiles against a client that predates these constants.
+    let column_compression = if column_compression.is_empty() {
+        quote!()
+    } else {
+        quote!(const COLUMN_COMPRESSION: &'static [(&'static str, &'static str)] = &[#(#column_compression),*];)
+    };
+    // A ledger table (`#[rdb(ledger = "7 years")]`): plain data the client
+    // reads to create it and to refuse what it never takes. Its rows never
+    // change, so a model that tracks changes to them cannot be one.
+    let ledger = match setting("ledger") {
+        None => quote!(),
+        Some(retention) => {
+            if retention.is_empty() {
+                return Err(syn::Error::new(input.span(), "#[rdb(ledger = \"<n> <unit>\")] names the retention, e.g. \"7 years\""));
+            }
+            let versioned = struct_settings.iter().any(|(k, _)| k == "ledger_versioned");
+            // A versioned ledger table takes updates, so `version` and
+            // `updated_at` fit it; a soft delete never does (a row is
+            // deleted past its retention, or kept).
+            let refused: &[&str] = if versioned { &["soft_delete"] } else { &["version", "updated_at", "soft_delete"] };
+            if let Some(role) = roles.iter().find(|r| refused.contains(r)) {
+                return Err(syn::Error::new(
+                    input.span(),
+                    format!("a ledger model's rows are never updated: #[rdb({role})] has no place on one"),
+                ));
+            }
+            if setting("row_compression").is_some() || setting("partition_by").is_some() {
+                return Err(syn::Error::new(input.span(), "a ledger model takes neither row_compression nor partition_by yet"));
+            }
+            let drop_idle = match setting("ledger_drop_idle") {
+                Some(d) => quote!(::core::option::Option::Some(#d)),
+                None => quote!(::core::option::Option::None),
+            };
+            let anchors: Vec<String> = struct_settings.iter().filter(|(k, _)| k == "ledger_anchor").map(|(_, v)| v.clone()).collect();
+            quote!(const LEDGER: ::core::option::Option<::rasterizeddb_client::orm::LedgerSpec> =
+                ::core::option::Option::Some(::rasterizeddb_client::orm::LedgerSpec {
+                    retention: #retention,
+                    drop_idle: #drop_idle,
+                    anchors: &[#(#anchors),*],
+                    versioned: #versioned,
+                });)
+        }
+    };
     let from_row = from_row_impl(input, &fields, named);
     let hook_methods = if hooks {
         quote! {
@@ -938,6 +1046,11 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             const COLUMNS: &'static [::rasterizeddb_client::orm::ColumnDef] = &[#(#defs),*];
             const RENAMED_FROM: &'static [&'static str] = &[#(#table_renamed_from),*];
             const PARTITION: ::core::option::Option<::rasterizeddb_client::orm::Partitioning> = #partition;
+            #row_compression
+            #column_compression
+            #ledger
+            #shard_const
+            #shard_key_fn
 
             fn write_value(&self, column: usize, out: &mut ::std::string::String) -> ::rasterizeddb_client::Result<()> {
                 match column {
@@ -967,6 +1080,125 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
 
         #from_row
     })
+}
+
+/// `SHARD` and `shard_key()` for a model: `shard_by` checked strictly (a
+/// compile error per broken rule), the leading `partition_by` column taken
+/// by default when it can shard (else `Unroutable` with the reason), and
+/// `shard = "global" | "unsharded"`.
+fn sharding(
+    input: &DeriveInput,
+    fields: &[Field<'_>],
+    shard_by: Option<String>,
+    shard: Option<String>,
+    partition_by: Option<String>,
+) -> syn::Result<(Tokens, Tokens)> {
+    let span = input.span();
+    let global = quote!(const SHARD: ::rasterizeddb_client::orm::Sharding = ::rasterizeddb_client::orm::Sharding::Global;);
+    match (shard.as_deref(), &shard_by) {
+        (Some(_), Some(_)) => {
+            return Err(syn::Error::new(span, "shard_by and shard = \"…\" do not go together"));
+        }
+        (Some("global"), None) => return Ok((global, quote!())),
+        (Some("unsharded"), None) => {
+            return Ok((
+                quote!(const SHARD: ::rasterizeddb_client::orm::Sharding = ::rasterizeddb_client::orm::Sharding::Unsharded;),
+                quote!(),
+            ));
+        }
+        (Some(other), None) => {
+            return Err(syn::Error::new(
+                span,
+                format!("shard = \"{other}\": write shard = \"global\" or shard = \"unsharded\", or shard_by = \"<column>\""),
+            ));
+        }
+        (None, _) => {}
+    }
+    let explicit = shard_by.is_some();
+    let column = match (shard_by, partition_by) {
+        (Some(c), _) => c.trim().to_string(),
+        (None, Some(key)) => key.split(',').next().unwrap_or("").trim().to_string(),
+        (None, None) => return Ok((global, quote!())),
+    };
+    let column_of = |f: &Field<'_>| {
+        f.attrs
+            .column
+            .clone()
+            .unwrap_or_else(|| f.ident.expect("named").to_string().trim_start_matches("r#").to_string())
+    };
+    let columns: Vec<&Field<'_>> = fields.iter().filter(|f| !f.attrs.skip && f.attrs.relation.is_none() && f.attrs.count_of.is_none()).collect();
+    let Some(key) = columns.iter().find(|f| column_of(f) == column) else {
+        return Err(syn::Error::new(span, format!("shard_by names {column}, which is not a column of this model")));
+    };
+    // The rules a sharded model keeps (per-shard uniqueness is exact only
+    // when every unique key holds the shard column; a sequence is per shard).
+    let mut broken: Option<String> = None;
+    if is_option(key.ty) {
+        broken = Some(format!("the shard column {column} is an Option: a NULL key has no shard"));
+    } else if key.attrs.json || key.attrs.text || key.attrs.sql_type.is_some() {
+        broken = Some(format!("the shard column {column} has a custom type, which does not route"));
+    } else if let Some(f) = columns.iter().find(|f| f.attrs.serial) {
+        broken = Some(format!(
+            "{} is serial, and a sequence is per shard so its values collide across shards: use a Uuid (v7)",
+            column_of(f)
+        ));
+    } else if columns.iter().any(|f| f.attrs.primary_key) && !key.attrs.primary_key {
+        broken = Some(format!("the primary key does not contain the shard column {column}"));
+    } else if let Some(f) = columns.iter().find(|f| f.attrs.unique && column_of(f) != column) {
+        broken = Some(format!(
+            "unique on {} is not exact across shards: a unique key of a sharded model must contain the shard column {column}",
+            column_of(f)
+        ));
+    }
+    if let Some(why) = broken {
+        if explicit {
+            return Err(syn::Error::new(span, format!("shard_by = \"{column}\": {why}")));
+        }
+        let why = format!("partitioned by {column}, but not shardable: {why}");
+        return Ok((
+            quote!(const SHARD: ::rasterizeddb_client::orm::Sharding = ::rasterizeddb_client::orm::Sharding::Unroutable(#why);),
+            quote!(),
+        ));
+    }
+    if !explicit && !routable_type(key.ty) {
+        let why = format!("partitioned by {column}, but its Rust type does not route: declare shard_by to check it");
+        return Ok((
+            quote!(const SHARD: ::rasterizeddb_client::orm::Sharding = ::rasterizeddb_client::orm::Sharding::Unroutable(#why);),
+            quote!(),
+        ));
+    }
+    let ty = key.ty;
+    let access = &key.access;
+    Ok((
+        quote! {
+            const SHARD: ::rasterizeddb_client::orm::Sharding = ::rasterizeddb_client::orm::Sharding::By {
+                column: #column,
+                family: <#ty as ::rasterizeddb_client::orm::ShardKeyType>::FAMILY,
+            };
+        },
+        quote! {
+            fn shard_key(&self) -> ::core::option::Option<::rasterizeddb_client::orm::ShardKey<'_>> {
+                ::core::option::Option::Some(::rasterizeddb_client::orm::ShardKeyType::shard_key(&self.#access))
+            }
+        },
+    ))
+}
+
+/// Whether a field's type is one `ShardKeyType` covers, read from its last
+/// path segment: what lets a partitioned model shard by default without a
+/// compile error on an unusual key type.
+fn routable_type(ty: &Type) -> bool {
+    let Type::Path(p) = ty else {
+        return false;
+    };
+    p.qself.is_none()
+        && p.path.segments.last().is_some_and(|s| {
+            s.arguments.is_empty()
+                && matches!(
+                    s.ident.to_string().as_str(),
+                    "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "String" | "Uuid"
+                )
+        })
 }
 
 // -------------------------------------------------------------------- SqlEnum

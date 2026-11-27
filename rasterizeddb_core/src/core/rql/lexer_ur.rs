@@ -609,7 +609,9 @@ fn parse_update_row(
 
         // A companion column belongs to the engine; a statement cannot assign
         // to it directly, and doing so would desynchronise it from its column.
-        if crate::core::rql::nullable::is_hidden(key) {
+        // A time column's 100 ns digit is the SQL Server front end's to
+        // write, beside its column (no other companion depends on it).
+        if crate::core::rql::nullable::is_hidden(key) && !crate::core::rql::nullable::is_tick_digit(key) {
             return None;
         }
 

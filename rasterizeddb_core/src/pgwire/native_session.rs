@@ -76,6 +76,17 @@ const CANCEL_PREFIX: &[u8] = b"\x01CANCEL;";
 /// way never the default database by accident.
 pub(crate) const DATABASE_PREFIX: &[u8] = b"\x01DATABASE;";
 
+/// Names the role a connection runs as, on a listener that asks for no
+/// login (`--rdb-socket-auth trust`): `\x01ROLE;<role>`, optionally followed
+/// by `\x1f<database>` to select the database in the same request. A trust
+/// connection that names none runs as nobody: in a database with roles it is
+/// no administrator and has only what PUBLIC is granted (roles plan, R0:
+/// `trust` authenticates as the named role, never as an administrator by
+/// itself). The role must exist there and be allowed to log in. Sent before
+/// the connection's first statement, as a database selection is; refused on
+/// a listener that authenticates, whose login names the role.
+pub(crate) const ROLE_PREFIX: &[u8] = b"\x01ROLE;";
+
 /// Asks for notices: `\x01NOTICES;` makes every later answer on the
 /// connection that has notices carry them ([`with_notices`]). Sent by a
 /// client as a setup request of every connection it opens, after any
@@ -87,6 +98,21 @@ pub(crate) const DATABASE_PREFIX: &[u8] = b"\x01DATABASE;";
 /// answers as it always did: an unknown marked request on a server with
 /// marked requests (0A000), two statements on one before them.
 pub(crate) const NOTICES_PREFIX: &[u8] = b"\x01NOTICES;";
+
+/// Asks for a statement's result columns without running it:
+/// `\x01DESCRIBE;<statement>`, the statement with its `$n` placeholders as
+/// written (no values are needed to name columns). Answered in the
+/// simple-query form with the `RowDescription` pgwire would send for the same
+/// statement (names, type OIDs, modifiers) and no rows; a statement that
+/// returns no rows answers `DESCRIBE`, with no description.
+///
+/// For a client that reads native (binary) answers, which carry no column
+/// names: it describes a statement once and keeps the names. Nothing runs, so
+/// a statement with side effects is as safe to describe as any other, and a
+/// failed transaction block is neither read nor changed. Two statements to a
+/// server before marked requests, and an unknown marked request (0A000) to one
+/// without this: a client then has no names, as before.
+pub(crate) const DESCRIBE_PREFIX: &[u8] = b"\x01DESCRIBE;";
 
 /// The first byte of an answer that carries notices: a `u32` count (little
 /// endian), then each notice as three NUL-terminated strings (severity,
@@ -208,6 +234,35 @@ pub(crate) struct SimpleOptions {
     pub(crate) rows: Option<u64>,
 }
 
+/// A cancelable request: `\x01CANCELABLE:<token>;<request>`, where the request
+/// is a statement's text or its `EXEC` form. The statement runs as it would
+/// have alone, and for as long as it does a `CANCEL` carrying the token (from
+/// the same user, on any connection) stops it: the answer is then an error
+/// with SQLSTATE 57014. What `cancel=<token>` is to a simple query, for a
+/// statement answered with native rows.
+pub(crate) const CANCELABLE_PREFIX: &[u8] = b"\x01CANCELABLE:";
+
+/// Splits a cancelable request into its token and the request it wraps:
+/// `None` when `request` is not one, an error for a token no client may
+/// choose or a request that wraps another cancelable one.
+pub(crate) fn split_cancelable(request: &[u8]) -> Option<Result<(&str, &[u8]), &'static str>> {
+    let rest = request.strip_prefix(CANCELABLE_PREFIX)?;
+    let Some(end) = rest.iter().position(|b| *b == b';') else {
+        return Some(Err("a cancelable request is \\x01CANCELABLE:<token>;<statement>"));
+    };
+    let inner = &rest[end + 1..];
+    Some(match std::str::from_utf8(&rest[..end]) {
+        Ok(token) if valid_token(token) => {
+            if inner.starts_with(CANCELABLE_PREFIX) {
+                Err("a cancelable request cannot wrap another")
+            } else {
+                Ok((token, inner))
+            }
+        }
+        _ => Err("a cancel token is 1 to 64 letters, digits, '_' or '-'"),
+    })
+}
+
 /// A cancel token as a client may choose it: 1 to 64 of `[A-Za-z0-9_-]`.
 fn valid_token(token: &str) -> bool {
     (1..=64).contains(&token.len())
@@ -296,6 +351,19 @@ pub(crate) async fn answer_marked(
         let stopped = crate::core::cancel::cancel_token(user, &token);
         log::debug!("native CANCEL for a query of {user}: {stopped}");
         return simple_complete(if stopped { "CANCEL 1" } else { "CANCEL 0" });
+    }
+    if let Some(text) = request.strip_prefix(DESCRIBE_PREFIX) {
+        let Ok(text) = std::str::from_utf8(text) else {
+            return simple_error("22021", "the statement is not valid UTF-8", b'I');
+        };
+        return match session {
+            Some(session) => Box::pin(session.describe(text)).await,
+            None => simple_error(
+                "0A000",
+                "describing a statement needs a connection session, which this caller does not have",
+                b'I',
+            ),
+        };
     }
     let Some(parsed) = parse_simple(request) else {
         return simple_error(
@@ -403,6 +471,12 @@ pub(crate) struct NativeSession {
     user: String,
     superuser: bool,
     authenticated: bool,
+    /// For a connection that proved nothing (`authenticated` false): whether
+    /// its user is an administrator, as a `trust` login is
+    /// (`auth::trust_login`), read once from the database's roles. Not by
+    /// itself: a listener that asks for no credential made every caller an
+    /// administrator.
+    trust_admin: tokio::sync::OnceCell<bool>,
     /// The connection is `rastcp/2`, which may not hold a block.
     multiplexed: bool,
     /// Whether a block is open: read without the lock, so a statement
@@ -494,6 +568,7 @@ impl NativeSession {
             user: user.to_string(),
             superuser,
             authenticated,
+            trust_admin: tokio::sync::OnceCell::new(),
             multiplexed,
             in_block: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
@@ -665,6 +740,17 @@ impl NativeSession {
     pub(crate) async fn needs_session_path(&self, query: &str) -> bool {
         let database = &self.database;
         let stmt = query.trim();
+        // Ledger and vault statements: the session path says who runs them
+        // (`ledger_hooks::with_session`), which their privileges and a
+        // vault's audit need.
+        if crate::core::ledger_hooks::is_ledger_statement(stmt) {
+            return true;
+        }
+        // A table with an encrypted column: the session path guards the
+        // text and knows whose role may read the plaintext.
+        if crate::core::column_crypto::touches(database, stmt) {
+            return true;
+        }
         // The schema-object statements below each begin with CREATE, DROP,
         // ALTER, CALL, MERGE, GRANT or REVOKE, so a statement that begins
         // with a reading or writing verb is none of them. Each parser
@@ -738,11 +824,13 @@ impl NativeSession {
         {
             return true;
         }
-        // A privilege check (a non-superuser's statement), or the owner a
-        // new relation is given. A superuser's other statements stay on the
-        // native path.
-        if database.has_table(crate::core::rql::privileges::ACL_TABLE)
-            && ((self.authenticated && !self.superuser) || upper_head.starts_with("CREATE"))
+        // A privilege check (a non-superuser's statement), with or without
+        // an ACL: without one, every relation is unowned and refused to it
+        // (`privilege_statements::check` fails closed), which the native
+        // path, checking nothing, would have run. Or the owner a new relation
+        // is given. A superuser's other statements stay on the native path.
+        if !self.resolve_admin().await
+            || (upper_head.starts_with("CREATE") && database.has_table(crate::core::rql::privileges::ACL_TABLE))
         {
             return true;
         }
@@ -784,8 +872,29 @@ impl NativeSession {
             || is_transaction_control(query)
     }
 
+    /// Whether this connection's user administers: a superuser who
+    /// authenticated, or for a connection that proved nothing, what its role
+    /// makes it (`auth::trust_login`: no roles at all, or a superuser role).
+    /// Resolved once, before the first session state is made.
+    pub(crate) async fn resolve_admin(&self) -> bool {
+        if self.authenticated {
+            return self.superuser;
+        }
+        *self
+            .trust_admin
+            .get_or_init(|| async { crate::auth::trust_login(&self.database, &self.user, None).await.unwrap_or(false) })
+            .await
+    }
+
+    /// What [`Self::resolve_admin`] found, for a session state; false before
+    /// it ran (fails closed).
+    fn effective_superuser(&self) -> bool {
+        if self.authenticated { self.superuser } else { self.trust_admin.get().copied().unwrap_or(false) }
+    }
+
     /// Runs one statement (already known to be one) of this connection.
     pub(crate) async fn run(&self, query: &str) -> Vec<u8> {
+        self.resolve_admin().await;
         if self.poisoned.load(Ordering::Acquire) {
             return native_error(
                 "08006",
@@ -830,6 +939,7 @@ impl NativeSession {
     /// block, so a multiplexed connection may use it too. Never called with
     /// a block open (`takes` routes every statement of one to `run`).
     pub(crate) async fn run_alone(&self, query: &str) -> Vec<u8> {
+        self.resolve_admin().await;
         let mut state = self.new_state();
         let answer = Box::pin(self.run_in(&mut state, query)).await;
         self.keep_temp_tables(&state);
@@ -846,6 +956,46 @@ impl NativeSession {
     }
 
     /// [`SIMPLE_ANSWER`], for the native statement tests.
+    /// A [`DESCRIBE_PREFIX`] request: the columns `query` answers with, as
+    /// pgwire describes a prepared statement (`describe_for_wire`), and the
+    /// transaction status the connection is in. Nothing is run, and the
+    /// connection's block, if one is open, is left exactly as it was.
+    pub(crate) async fn describe(&self, query: &str) -> Vec<u8> {
+        let status = if self.poisoned.load(Ordering::Acquire) {
+            b'E'
+        } else if self.in_block.load(Ordering::Acquire) {
+            b'T'
+        } else {
+            b'I'
+        };
+        match describe_for_wire(&self.database, query).await {
+            // A statement that is no SELECT and still answers with rows (a write with RETURNING)
+            // is described by the columns it names, where it names any.
+            Ok(Some((fields, _))) if !fields.is_empty() => {
+                let mut answer = vec![SIMPLE_ANSWER];
+                // Into the answer's own bytes: a `Vec<u8>` takes every write whole.
+                if let Err(e) = describing(&self.database, query, send_row_description(&mut answer, &fields, &[])).await {
+                    return simple_error("XX000", &e.to_string(), status);
+                }
+                answer.push(b'Z');
+                answer.extend_from_slice(&5i32.to_be_bytes());
+                answer.push(status);
+                answer
+            }
+            Ok(_) => {
+                let mut answer = simple_complete("DESCRIBE");
+                if let Some(last) = answer.last_mut() {
+                    *last = status;
+                }
+                answer
+            }
+            Err(e) => {
+                let message = e.to_string();
+                simple_error(sqlstate_for(&message), &message, status)
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) const SIMPLE_ANSWER_FOR_TESTS: u8 = SIMPLE_ANSWER;
 
@@ -864,6 +1014,7 @@ impl NativeSession {
     /// session of its own, so a block must end within it; one left open is
     /// rolled back and the answer ends with an error saying so.
     pub(crate) async fn run_simple(&self, query: &str, options: &SimpleOptions) -> Vec<u8> {
+        self.resolve_admin().await;
         if self.poisoned.load(Ordering::Acquire) {
             return simple_error(
                 "08006",
@@ -1049,7 +1200,7 @@ impl NativeSession {
             AuthConfig::default(),
             Principal {
                 name: self.user.clone(),
-                superuser: self.superuser,
+                superuser: self.effective_superuser(),
                 authenticated: self.authenticated,
             },
             ConnectionLimits::default(),

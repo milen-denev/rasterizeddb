@@ -93,14 +93,15 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.dry_run
         run: >
           cargo package --locked
-          -p rastcp -p rasterizeddb_client_derive -p rasterizeddb_client
+          -p rastcp -p rasterizeddb_mq -p rasterizeddb_router -p rasterizeddb_raft
+          -p rasterizeddb_client_derive -p rasterizeddb_client
           -p rasterizeddb_core -p rasterizeddb_embedded
 
       - name: Publish to crates.io
         if: github.event_name == 'push' || !inputs.dry_run
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: bash .github/scripts/publish-crates.sh rastcp rasterizeddb_core rasterizeddb_embedded
+        run: bash .github/scripts/publish-crates.sh rastcp rasterizeddb_mq rasterizeddb_router rasterizeddb_raft rasterizeddb_core rasterizeddb_embedded
 
       - name: GitHub release
         if: github.event_name == 'push'

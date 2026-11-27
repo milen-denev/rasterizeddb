@@ -57,6 +57,8 @@ fn create_table(name: &str, columns: Vec<CreateColumnData>) -> CreateTable {
         table_name: name.to_string(),
         columns,
         is_immutable: false,
+        special: crate::core::row::schema::SpecialTable::None,
+        ledger_policy: Vec::new(),
         foreign_keys: Vec::new(),
         defaults: Vec::new(),
         json_columns: Vec::new(),

@@ -168,6 +168,10 @@ async fn append(target: &mut CopyTarget, versions: Vec<RawVersion>) -> io::Resul
         return Ok(());
     }
     let d = target.table.data()?;
+    crate::core::shard_hooks::check_stamp(
+        d.guard.as_ref().map(|g| g.range()),
+        crate::core::shard_hooks::StampOp::ReshapeAppend,
+    )?;
     let mut txn = d.io_rows.begin_txn();
     for mut v in versions {
         // Shielded from the target's sweeps until its pointer is written, as

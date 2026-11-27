@@ -95,7 +95,8 @@ async fn a_materialised_relation_never_syncs_a_file_of_its_own() {
     };
     let principal = Principal {
         name: "rasterized".to_string(),
-        superuser: false,
+        // `trust` on a database with no roles: the bootstrap session.
+        superuser: true,
         authenticated: false,
     };
     let mut state = SessionState::new(
@@ -187,7 +188,8 @@ async fn a_materialised_relation_is_never_catalogued() {
     };
     let principal = Principal {
         name: "rasterized".to_string(),
-        superuser: false,
+        // `trust` on a database with no roles: the bootstrap session.
+        superuser: true,
         authenticated: false,
     };
     let mut state = SessionState::new(catalog, db.name.clone(), auth, principal, ConnectionLimits::default());
@@ -302,7 +304,8 @@ async fn temp_relation_cache_child() {
     };
     let principal = Principal {
         name: "rasterized".to_string(),
-        superuser: false,
+        // `trust` on a database with no roles: the bootstrap session.
+        superuser: true,
         authenticated: false,
     };
     let mut state = SessionState::new(catalog, db.name.clone(), auth, principal, ConnectionLimits::default());

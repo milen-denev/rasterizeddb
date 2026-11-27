@@ -33,7 +33,8 @@ already runs, so it cannot drift from PostgreSQL's behaviour.
   folding them to lower case. A result column is named as it was written in
   the select list (`SELECT UserId` returns `UserId`); `SELECT *` returns the
   names in lower case.
-- **Text compares as bytes unless a column says otherwise.** The servers
+- **Text compares as bytes unless a column says otherwise** (over the
+  MySQL protocol; for SQL Server see its section). The servers
   report `utf8mb4_bin` and `Latin1_General_BIN2` as their defaults, and a
   table's default collation (`DEFAULT COLLATE=…`, which `mysqldump` writes on
   every table) is not applied: existing schemas keep the answers they had. A
@@ -180,7 +181,8 @@ transaction with ENVCHANGE; `SET IMPLICIT_TRANSACTIONS ON` and
 
 | T-SQL | Sent as |
 |---|---|
-| `[name]`, `"name"`, `N'…'`, `dbo.`/`db.dbo.` | names (the engine's one schema), strings |
+| `[name]`, `"name"`, `N'…'`, `dbo.`/`db.dbo.` | names (the engine's one schema), strings; a dot inside a bracketed name (`[DenevCloud.ERP.Colors]`) is the name's own, stored as `․` (U+2024) and shown as `.` |
+| `CROSS APPLY (…) t`, `OUTER APPLY (…) t` | `CROSS JOIN LATERAL`, `LEFT JOIN LATERAL … ON true` |
 | `TOP (n)`, `OFFSET … FETCH` | `LIMIT … OFFSET …`; `UPDATE/DELETE TOP` by primary key |
 | `a + b` with a string side | `\|\|` |
 | `IDENTITY(1,1)`, `SCOPE_IDENTITY()`, `@@IDENTITY` | `serial`, the captured value |
@@ -193,6 +195,93 @@ transaction with ENVCHANGE; `SET IMPLICIT_TRANSACTIONS ON` and
 
 `master`, `model`, `msdb` and `tempdb` are the default database, so a
 client can create and drop its own (`EnsureCreated`, `EnsureDeleted`).
+Database names are found without case (`CREATE DATABASE [DenevColors]`
+makes `denevcolors`, which a login naming `DenevColors` opens), and a
+pooled connection's reset returns to the login's database after a `USE`.
+
+**Names show as declared.** The engine folds identifiers to lower case;
+the front end records each table's, column's, constraint's, index's and
+database's spelling (CREATE TABLE, ALTER … ADD, CREATE INDEX, CREATE
+DATABASE, sp_rename) in `__rdb_tds_names` and shows it in result columns,
+`FMTONLY`, `sp_tablecollations`, `sys.*`, `INFORMATION_SCHEMA`, `DB_NAME()`
+and error messages. Catalogue lookups (`TABLE_NAME = @t`) ignore case. A
+database made before a build recorded names shows folded names; run the
+script that made it through `EXEC sp_rdb_record_names @script = N'…'`
+(for EF Core, `dotnet ef migrations script --idempotent`): its CREATE
+TABLE, ALTER TABLE … ADD, CREATE INDEX and sp_rename statements, also
+inside `IF … BEGIN … END` and `EXEC(N'…')`, are read for their names and
+not run.
+
+**Errors** carry SQL Server's numbers and wording: 547 for a foreign key
+(`The INSERT statement conflicted with the FOREIGN KEY constraint …`),
+2627 for a PRIMARY KEY or UNIQUE constraint, and 2601 for a unique index
+(`--mssql-unique-index-error 2627` reports those as 2627 for applications
+testing only that number).
+
+**uniqueidentifier orders as SQL Server's**: its last six bytes first,
+then bytes 8-9, 7-6, 5-4 and 3-0, where PostgreSQL's `uuid` orders by its
+bytes. A `uniqueidentifier` column a `CREATE TABLE` or `ADD COLUMN` makes
+takes the engine's `rdb_guid_order` ([collations](collations.md)): `ORDER
+BY`, `<`, `>`, `BETWEEN`, `min`/`max` and window `ORDER BY` follow it
+(keyset paging by a GUID pages as on SQL Server), through a hidden key
+column beside it; equality, joins, keys, foreign keys and indexes stay on
+the column itself. Grouped and DISTINCT queries, derived tables and CTE copies keep the order
+(a grouped or DISTINCT join ordered by one is refused). `--mssql-guid-order binary` makes such columns
+order by their bytes instead. Tables made before this build order by bytes
+until made again.
+
+**Time to 100 ns.** `datetime2`, `datetimeoffset` and `time` keep the
+precision they declare: 0 to 6 are the engine's `timestamp(p)` /
+`timestamptz(p)` / `time(p)`, rounded as SQL Server rounds; 7, theirs when
+none is written (EF Core's `DateTime`), keeps its seventh digit in a hidden
+`__t7_<column>` beside the column: how far the value lies from the
+microsecond the column holds, worked out by the engine's own parser
+(`__rdb_t7_digit`). Every way a statement reads such a column gives SQL
+Server's answer or is refused (0A000), never one to the microsecond:
+- exact: the column read whole (as `datetime2(7)`, through `*`, aliases,
+  joins, derived tables, set-op branches); `=`, `<>`, `<`, `<=`, `>`, `>=`
+  with the value on either side, `IN`, `NOT IN`, `BETWEEN`, `IS NULL`,
+  CASE, join conditions, UPDATE/DELETE conditions; ORDER BY, GROUP BY,
+  `min`/`max`, `DATEADD` in a select list, `CAST`/`CONVERT` to text (styles
+  121, 126 included); `YEAR`, `MONTH`, `DAY`, `EOMONTH`, `DATEPART`,
+  `DATENAME`, `DATEDIFF` of a microsecond or more and `CAST(… AS date)`,
+  read from the value's own microsecond (the year's last 100 ns is still
+  that year); writes by INSERT VALUES, EF Core's MERGE, UPDATE SET (also
+  from another such column or a `DATEADD` of one) and SqlBulkCopy;
+- refused: `COUNT(DISTINCT c)` (`SELECT COUNT(*) FROM (SELECT DISTINCT c
+  …)`, EF Core's form, is exact), `ISNULL`/`COALESCE` and other expressions
+  over the column, the column in an `IN (SELECT …)`, INSERT … SELECT into
+  one, nanosecond date parts.
+PostgreSQL clients read the microsecond. Every time column is sent at
+scale 7. Tables made before this build keep microseconds until made again.
+
+**NULLs sort as SQL Server's**: first ascending, last descending (NULL is
+its least value), in ORDER BY, windows and `WITHIN GROUP`; a key that
+cannot be NULL is sent as written, and keeps the scan's own sort.
+
+**TRY_CAST / TRY_CONVERT** are NULL where the value's text does not read as
+the type (`pg_input_is_valid`). A value of another type is judged by its
+text: `TRY_CAST(1.5 AS int)` is NULL, where SQL Server answers 1.
+
+**Text is case-insensitive by default**, as under SQL Server's default
+collation: a text column a `CREATE TABLE` or `ADD COLUMN` makes without a
+`COLLATE` takes the engine's `rdb_ci` ([collations](collations.md)), so
+`=`, `LIKE`, `IN`, keys, foreign keys, `GROUP BY`, `DISTINCT`, joins,
+`ORDER BY` and windows ignore case. Each such column carries a hidden key
+column beside it. `--mssql-collation bin` makes such columns compare by
+their bytes instead. What the engine still refuses over one is listed
+there.
+
+**EF Core**: EF Core 10's SqlServer provider runs unchanged: `APPLY`
+shapes (`Take`/`First` in projections and filtered `Include`), batched
+inserts, `EnsureCreated`/`EnsureDeleted`, ASP.NET Identity's schema,
+`Migrate()` with its `sp_getapplock` lock, idempotent scripts,
+`RenameIndex`, `DropColumn`/`AlterColumn` (`sys.default_constraints` has
+the columns their scripts read), savepoints under `EnableRetryOnFailure`.
+A unique index filtered by `key IS NOT NULL [AND …]` over its own key
+columns (what EF puts on every unique index over a nullable column) is
+the plain unique key, since a unique key here never compares NULLs equal;
+a filtered index that is not unique is built over every row.
 
 **Kept by the front end** (the engine has none of these):
 
@@ -247,9 +336,39 @@ and `CONTAINS(*, …)` is refused (name the columns; the table-valued forms take
 `*`). `ALTER FULLTEXT INDEX … ADD/DROP` is refused: drop the index and create
 it again.
 
+**Application locks**: `sp_getapplock`, `sp_releaseapplock` and
+`APPLOCK_TEST`, per database and in this server only, owned by the
+connection or its transaction and released when either ends.
+
+`OPENJSON(json [, path]) [WITH (column type [path] [AS JSON], …)]` reads JSON
+the statement carries (a literal, a parameter or a variable), which is how EF
+Core passes a list (`ids.Contains(x)`): its rows are written into the
+statement, an object's members in the order written, and
+`x IN (SELECT value FROM OPENJSON(@ids) WITH (…))` becomes the list itself.
+Over a row's JSON (`OPENJSON([t].[Tags])`, EF Core's collections kept in a
+column) it is read by the engine: after `CROSS APPLY` / `OUTER APPLY` as a
+`LATERAL` join, as the relation of a subquery (`(SELECT COUNT(*) FROM
+OPENJSON(col) …)`), and under `EXISTS` and `IN`. That form reads a JSON
+array only (an object is an error) and refuses `NOT IN`.
+
+`COL_LENGTH('table', 'column')` is the column's length in bytes as SQL Server
+counts it, NULL for none such. Text is the engine's one kind, shown as
+`nvarchar`, so a length declared as `varchar(n)` also reads 2n.
+
+**Restarts under a connection pool.** The server acknowledges TDS session
+recovery, so Microsoft.Data.SqlClient (with its default `ConnectRetryCount`)
+finds a connection broken by a server restart before it sends a command and
+reconnects by itself: the session's database and its `SET NOCOUNT`,
+`XACT_ABORT` and `IMPLICIT_TRANSACTIONS` come back. A connection holding
+what cannot come back (an open transaction, a `#table`, a cursor, a session
+application lock) reports the break instead.
+`dotnet/test/tds-reconnect-e2e.sh` runs this against a real SqlClient.
+
 **Refused**: `MERGE … OUTPUT` (other than EF Core's insert form) and a `MERGE`
 that updates a column its `ON` reads, `FOR XML RAW/AUTO/EXPLICIT`, stored
-functions and triggers, `rowversion`, computed columns, filtered indexes,
+functions and triggers, `rowversion`, computed columns, unique indexes
+with any other filter, `APPLY` of a table-valued function other than `OPENJSON`, `OPENJSON` over a
+row's JSON in a plain join,
 `SET ROWCOUNT`, `TOP … PERCENT/WITH TIES`, `OUTPUT … INTO`, `SELECT @v = @v
 + … FROM` over more than one row, and Windows authentication.
 `TRY_CAST`/`TRY_CONVERT` raise the conversion error where SQL Server would

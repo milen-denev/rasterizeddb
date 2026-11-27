@@ -137,7 +137,7 @@ fn split_from(from: &str) -> Option<Vec<Joined>> {
     }
     let word_before = |end: usize| -> Option<(usize, String)> {
         let head = from[..end].trim_end();
-        let start = head.rfind(|c: char| c.is_whitespace()).map_or(0, |p| p + 1);
+        let start = head.char_indices().rev().find(|&(_, c)| c.is_whitespace()).map_or(0, |(p, c)| p + c.len_utf8());
         Some((start, head[start..].to_ascii_uppercase()))
     };
     // Where each join's words begin.
@@ -268,7 +268,7 @@ fn replace_bare(sql: &str, merged: &[(String, String)]) -> String {
             let after_as = {
                 let before = sql[..start].trim_end();
                 before.len() >= 2
-                    && before[before.len() - 2..].eq_ignore_ascii_case("AS")
+                    && before.as_bytes()[before.len() - 2..].eq_ignore_ascii_case(b"AS")
                     && !before[..before.len() - 2]
                         .ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
             };

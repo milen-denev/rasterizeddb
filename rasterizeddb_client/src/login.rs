@@ -149,6 +149,51 @@ impl ConnectionSetup for DatabaseSetup {
     }
 }
 
+/// What names `role` (and selects `database`, if one) on a trust connection
+/// ([`crate::Client::connect_as_role`]).
+pub(crate) fn role_setup(role: &str, database: Option<&str>) -> Arc<dyn ConnectionSetup> {
+    Arc::new(RoleSetup { role: role.to_string(), database: database.map(str::to_string) })
+}
+
+/// The server's `pgwire::native_session::ROLE_PREFIX`.
+const ROLE_PREFIX: &[u8] = b"\x01ROLE;";
+
+/// Names a trust connection's role (and selects its database, if one is
+/// named) with the connection's first request.
+#[derive(Debug)]
+struct RoleSetup {
+    role: String,
+    database: Option<String>,
+}
+
+impl ConnectionSetup for RoleSetup {
+    fn request(&self) -> Vec<u8> {
+        let mut request = ROLE_PREFIX.to_vec();
+        request.extend_from_slice(self.role.as_bytes());
+        if let Some(database) = &self.database {
+            request.push(0x1f);
+            request.extend_from_slice(database.as_bytes());
+        }
+        request
+    }
+
+    fn accept(&self, answer: &[u8]) -> Result<(), RastcpError> {
+        match crate::simple::decode(answer.to_vec()) {
+            Ok(_) => Ok(()),
+            // A server older than the request answers it as a query.
+            Err(crate::Error::Unsupported(detail)) => Err(RastcpError::AuthenticationError(format!(
+                "this server cannot name role \"{}\" on a trust connection (it predates \
+                 Client::connect_as_role), so the connection was not used: {detail}",
+                self.role
+            ))),
+            Err(e) => Err(RastcpError::AuthenticationError(match e {
+                crate::Error::Server(message) => message,
+                other => other.to_string(),
+            })),
+        }
+    }
+}
+
 // The exchange's opening message and the server's reply tags
 // (`rasterizeddb_core::native_auth`).
 const PROTOCOL_VERSION: u8 = 1;

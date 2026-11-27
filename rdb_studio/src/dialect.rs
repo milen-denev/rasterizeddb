@@ -33,10 +33,12 @@
 //! come back empty rather than zero.
 
 use crate::model::{
+    BrokerBinding, BrokerCreateKind, BrokerExchange, BrokerForm, BrokerPublishForm, BrokerQueue, BrokerReadForm,
+    BrokerSubscription, BrokerTopic,
     BackupEntry, BranchDiffRow, BranchForm, BranchInfo, BranchPointKind, ColumnInfo,
-    ConfigEntry, DatabaseInfo, Flavor, Grid, IndexInfo, IndexOwner, MergePolicy, PartitionInfo,
-    PeerStatus, Relationship, RestoreReport, RestoreTarget, RoleInfo, Stat, StatementRecord,
-    StatementShape, StorageLocation, TableInfo, TablePlacement,
+    ConfigEntry, DatabaseInfo, Flavor, KvStore, Grid, IndexInfo, IndexOwner, MergePolicy, PartitionInfo,
+    PeerStatus, Relationship, RestoreReport, RebalanceStep, RestoreTarget, RoleInfo, ShardInfo, ShardsSnapshot, Stat,
+    StatementRecord, StatementShape, StorageLocation, TableInfo, TableLoad, TablePlacement,
 };
 
 // ---------------------------------------------------------------------------
@@ -204,16 +206,43 @@ pub fn kv_describe_sql(key: &str) -> String {
 /// and a hash on screen is a hash in a screenshot.
 pub fn roles_sql(flavor: Flavor) -> &'static str {
     match flavor {
+        // `pg_roles`, as on PostgreSQL: the role catalogue itself is no
+        // client's to read (it holds the verifiers), and `pg_roles` has
+        // every attribute.
         Flavor::Rasterized => {
-            "SELECT name, can_login, is_superuser FROM rdb_roles ORDER BY name"
+            "SELECT rolname AS name, rolcanlogin AS can_login, rolsuper AS is_superuser, \
+             rolcreatedb AS create_db, rolcreaterole AS create_role, rolbypassrls AS bypass_rls, \
+             rolconnlimit AS conn_limit, rolvaliduntil AS valid_until FROM pg_roles ORDER BY rolname"
         }
         // The predefined `pg_*` roles are PostgreSQL's own and cannot be
         // dropped or logged in as.
         Flavor::Postgres => {
-            "SELECT rolname AS name, rolcanlogin AS can_login, rolsuper AS is_superuser \
+            "SELECT rolname AS name, rolcanlogin AS can_login, rolsuper AS is_superuser, \
+             rolcreatedb AS create_db, rolcreaterole AS create_role, rolbypassrls AS bypass_rls, \
+             rolconnlimit AS conn_limit, rolvaliduntil AS valid_until \
              FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%' ORDER BY rolname"
         }
     }
+}
+
+/// Every membership, `(member, role)`, on both servers.
+pub fn memberships_sql() -> &'static str {
+    "SELECT m.rolname AS member, g.rolname AS role FROM pg_auth_members a \
+     JOIN pg_roles m ON m.oid = a.member JOIN pg_roles g ON g.oid = a.roleid"
+}
+
+/// `roles` with the memberships [`memberships_sql`] listed filled in.
+pub fn add_memberships(mut roles: Vec<RoleInfo>, grid: &Grid) -> Vec<RoleInfo> {
+    for row in 0..grid.rows.len() {
+        let (Some(member), Some(role)) = (grid.value(row, "member"), grid.value(row, "role")) else { continue };
+        if let Some(r) = roles.iter_mut().find(|r| r.name == member) {
+            r.member_of.push(role.to_string());
+        }
+    }
+    for r in &mut roles {
+        r.member_of.sort();
+    }
+    roles
 }
 
 pub fn parse_roles(grid: &Grid) -> Vec<RoleInfo> {
@@ -223,6 +252,12 @@ pub fn parse_roles(grid: &Grid) -> Vec<RoleInfo> {
                 name: grid.value(row, "name")?.to_string(),
                 can_login: grid.flag(row, "can_login").unwrap_or(false),
                 superuser: grid.flag(row, "is_superuser").unwrap_or(false),
+                create_db: grid.flag(row, "create_db").unwrap_or(false),
+                create_role: grid.flag(row, "create_role").unwrap_or(false),
+                bypass_rls: grid.flag(row, "bypass_rls").unwrap_or(false),
+                conn_limit: grid.value(row, "conn_limit").and_then(|v| v.trim().parse().ok()).unwrap_or(-1),
+                valid_until: grid.value(row, "valid_until").map(str::to_string),
+                member_of: Vec::new(),
             })
         })
         .collect()
@@ -265,6 +300,320 @@ pub fn role_password_sql(name: &str, password: &str) -> Result<String, String> {
         quote_ident(name),
         quote_literal(password)
     ))
+}
+
+// --- what each role may reach (the ROLES tab's detail)
+
+/// Every grant on a table outside the catalogues: who granted what to whom.
+/// A row whose grantor is its grantee is an owner's own privilege.
+pub fn table_grants_sql() -> &'static str {
+    "SELECT grantor, grantee, table_name, privilege_type, is_grantable FROM information_schema.role_table_grants \
+     WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY grantee, table_name"
+}
+
+/// The default privileges: (owner, object kind letter, ACL text).
+pub fn default_privileges_sql() -> &'static str {
+    "SELECT pg_get_userbyid(defaclrole) AS owner, defaclobjtype AS kind, defaclacl::text AS acl FROM pg_default_acl"
+}
+
+/// Every row-level security policy, with its table.
+pub fn policies_sql(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => {
+            "SELECT p.polname AS name, c.relname AS table_name, p.polcmd AS cmd, p.polpermissive AS permissive, \
+             p.polroles::text AS roles, p.polqual AS using_expr, p.polwithcheck AS check_expr \
+             FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid ORDER BY c.relname, p.polname"
+        }
+        Flavor::Postgres => {
+            "SELECT policyname AS name, tablename AS table_name, cmd, permissive = 'PERMISSIVE' AS permissive, \
+             roles::text AS roles, qual AS using_expr, with_check AS check_expr FROM pg_policies \
+             ORDER BY tablename, policyname"
+        }
+    }
+}
+
+/// The tables with row-level security on.
+pub fn rls_tables_sql() -> &'static str {
+    "SELECT relname AS name FROM pg_class WHERE relkind = 'r' AND relrowsecurity ORDER BY relname"
+}
+
+/// The grants, grouped per (grantee, table), and what each role owns.
+pub fn parse_table_grants(grid: &Grid) -> (Vec<crate::model::TableGrant>, Vec<(String, String)>) {
+    let mut grants: Vec<crate::model::TableGrant> = Vec::new();
+    let mut owned: Vec<(String, String)> = Vec::new();
+    for row in 0..grid.rows.len() {
+        let (Some(grantor), Some(grantee), Some(table), Some(privilege)) = (
+            grid.value(row, "grantor"),
+            grid.value(row, "grantee"),
+            grid.value(row, "table_name"),
+            grid.value(row, "privilege_type"),
+        ) else {
+            continue;
+        };
+        if grantor == grantee {
+            if !owned.iter().any(|(o, t)| o == grantee && t == table) {
+                owned.push((grantee.to_string(), table.to_string()));
+            }
+            continue;
+        }
+        let grantable = grid.value(row, "is_grantable").is_some_and(|v| v.eq_ignore_ascii_case("YES"));
+        let at = match grants.iter().position(|g| g.grantee == grantee && g.table == table) {
+            Some(i) => i,
+            None => {
+                grants.push(crate::model::TableGrant { grantee: grantee.to_string(), table: table.to_string(), ..Default::default() });
+                grants.len() - 1
+            }
+        };
+        let g = &mut grants[at];
+        if !g.privileges.iter().any(|p| p == privilege) {
+            g.privileges.push(privilege.to_string());
+        }
+        if grantable && !g.grantable.iter().any(|p| p == privilege) {
+            g.grantable.push(privilege.to_string());
+        }
+    }
+    (grants, owned)
+}
+
+/// The privilege an ACL letter stands for, as `aclitem` writes them.
+fn acl_privilege(letter: char) -> Option<&'static str> {
+    Some(match letter {
+        'r' => "SELECT",
+        'a' => "INSERT",
+        'w' => "UPDATE",
+        'd' => "DELETE",
+        'D' => "TRUNCATE",
+        'x' => "REFERENCES",
+        't' => "TRIGGER",
+        'm' => "MAINTAIN",
+        'X' => "EXECUTE",
+        'U' => "USAGE",
+        'C' => "CREATE",
+        _ => return None,
+    })
+}
+
+fn default_kind(letter: &str) -> &'static str {
+    match letter {
+        "S" => "SEQUENCES",
+        "f" => "FUNCTIONS",
+        "T" => "TYPES",
+        "n" => "SCHEMAS",
+        _ => "TABLES",
+    }
+}
+
+/// One entry per (owner, kind, grantee) of `pg_default_acl`.
+pub fn parse_default_privileges(grid: &Grid) -> Vec<crate::model::DefaultPrivilege> {
+    let mut out = Vec::new();
+    for row in 0..grid.rows.len() {
+        let owner = grid.value(row, "owner").unwrap_or("").to_string();
+        let kind = default_kind(grid.value(row, "kind").unwrap_or("r"));
+        let acl = grid.value(row, "acl").unwrap_or("").trim_matches(|c| c == '{' || c == '}');
+        for item in acl.split(',').filter(|i| !i.is_empty()) {
+            let item = item.trim_matches('"');
+            let Some((grantee, rest)) = item.split_once('=') else { continue };
+            let letters = rest.split('/').next().unwrap_or("");
+            let privileges: Vec<String> = letters.chars().filter_map(acl_privilege).map(str::to_string).collect();
+            out.push(crate::model::DefaultPrivilege {
+                owner: owner.clone(),
+                kind: kind.to_string(),
+                grantee: if grantee.is_empty() { "public".to_string() } else { grantee.to_string() },
+                privileges,
+            });
+        }
+    }
+    out
+}
+
+pub fn parse_policies(grid: &Grid) -> Vec<crate::model::PolicyInfo> {
+    (0..grid.rows.len())
+        .filter_map(|row| {
+            let command = match grid.value(row, "cmd").unwrap_or("*") {
+                "r" | "SELECT" => "SELECT",
+                "a" | "INSERT" => "INSERT",
+                "w" | "UPDATE" => "UPDATE",
+                "d" | "DELETE" => "DELETE",
+                _ => "ALL",
+            };
+            Some(crate::model::PolicyInfo {
+                name: grid.value(row, "name")?.to_string(),
+                table: grid.value(row, "table_name")?.to_string(),
+                command: command.to_string(),
+                permissive: grid.flag(row, "permissive").unwrap_or(true),
+                roles: grid
+                    .value(row, "roles")
+                    .unwrap_or("{public}")
+                    .trim_matches(|c| c == '{' || c == '}')
+                    .split(',')
+                    .map(|r| r.trim_matches('"').to_string())
+                    .filter(|r| !r.is_empty())
+                    .collect(),
+                using: grid.value(row, "using_expr").unwrap_or("").to_string(),
+                check: grid.value(row, "check_expr").unwrap_or("").to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The privileges a table grant can name, in the order PostgreSQL lists them.
+pub const TABLE_PRIVILEGES: [&str; 7] = ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"];
+
+/// `ALTER ROLE` for what changed between `role` and the wanted attributes;
+/// `Err` when nothing did or a value is not one.
+pub fn alter_role_sql(
+    role: &RoleInfo,
+    login: bool,
+    superuser: bool,
+    create_db: bool,
+    create_role: bool,
+    bypass_rls: bool,
+    conn_limit: &str,
+    valid_until: &str,
+) -> Result<String, String> {
+    let mut parts = Vec::new();
+    let mut flag = |now: bool, want: bool, on: &str, off: &str| {
+        if now != want {
+            parts.push(if want { on.to_string() } else { off.to_string() });
+        }
+    };
+    flag(role.can_login, login, "LOGIN", "NOLOGIN");
+    flag(role.superuser, superuser, "SUPERUSER", "NOSUPERUSER");
+    flag(role.create_db, create_db, "CREATEDB", "NOCREATEDB");
+    flag(role.create_role, create_role, "CREATEROLE", "NOCREATEROLE");
+    flag(role.bypass_rls, bypass_rls, "BYPASSRLS", "NOBYPASSRLS");
+    let limit = conn_limit.trim();
+    let limit: i64 = if limit.is_empty() { -1 } else { limit.parse().map_err(|_| "a connection limit is a whole number (empty: none)".to_string())? };
+    if limit < -1 {
+        return Err("a connection limit is -1 (none) or more".to_string());
+    }
+    if limit != role.conn_limit {
+        parts.push(format!("CONNECTION LIMIT {limit}"));
+    }
+    let until = valid_until.trim();
+    if let Some(p) = date_problem(until) {
+        return Err(format!("valid until: {p}"));
+    }
+    if until != role.valid_until.as_deref().unwrap_or("").trim() {
+        parts.push(format!("VALID UNTIL {}", quote_literal(if until.is_empty() { "infinity" } else { until })));
+    }
+    if parts.is_empty() {
+        return Err("nothing changed".to_string());
+    }
+    Ok(format!("ALTER ROLE {} {}", quote_ident(&role.name), parts.join(" ")))
+}
+
+/// What is wrong with `s` as a date (`YYYY-MM-DD`, optionally ` HH:MM[:SS]`
+/// and a zone); `None` when it is one, or empty.
+pub fn date_problem(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("infinity") {
+        return None;
+    }
+    let bad = || Some("Write a date as YYYY-MM-DD, or YYYY-MM-DD HH:MM.".to_string());
+    let (date, time) = match s.split_once([' ', 'T']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let parts: Vec<&str> = date.split('-').collect();
+    let [y, m, d] = parts.as_slice() else { return bad() };
+    if y.len() != 4 {
+        return bad();
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i32>(), m.parse::<u32>(), d.parse::<u32>()) else { return bad() };
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Some(format!("There is no month {m}.")),
+    };
+    if d == 0 || d > days {
+        return Some(format!("{date} has no day {d}."));
+    }
+    if let Some(t) = time {
+        let t = t.trim_end_matches('Z');
+        let t = t.split(['+']).next().unwrap_or(t);
+        let hms: Vec<&str> = t.split(':').collect();
+        let ok = matches!(hms.len(), 2 | 3)
+            && hms[0].parse::<u32>().is_ok_and(|h| h < 24)
+            && hms[1].parse::<u32>().is_ok_and(|m| m < 60)
+            && hms.get(2).is_none_or(|s| s.split('.').next().unwrap_or("").parse::<u32>().is_ok_and(|s| s < 60));
+        if !ok {
+            return Some("Write a time as HH:MM or HH:MM:SS (24-hour).".to_string());
+        }
+    }
+    None
+}
+
+/// `GRANT <privileges> ON <table> TO <role>`.
+pub fn grant_table_sql(table: &str, privileges: &[&str], role: &str, with_grant: bool) -> Result<String, String> {
+    if table.trim().is_empty() {
+        return Err("choose a table".to_string());
+    }
+    if privileges.is_empty() {
+        return Err("tick at least one privilege".to_string());
+    }
+    Ok(format!(
+        "GRANT {} ON {} TO {}{}",
+        privileges.join(", "),
+        quote_ident(table.trim()),
+        quote_ident(role),
+        if with_grant { " WITH GRANT OPTION" } else { "" }
+    ))
+}
+
+pub fn revoke_table_sql(table: &str, privileges: &[String], role: &str) -> String {
+    format!("REVOKE {} ON {} FROM {}", privileges.join(", "), quote_ident(table), quote_ident(role))
+}
+
+/// `ALTER DEFAULT PRIVILEGES GRANT … ON TABLES TO role`: what tables the
+/// session's role creates from now on give `role`.
+pub fn grant_default_sql(privileges: &[&str], role: &str) -> Result<String, String> {
+    if privileges.is_empty() {
+        return Err("tick at least one privilege".to_string());
+    }
+    Ok(format!("ALTER DEFAULT PRIVILEGES GRANT {} ON TABLES TO {}", privileges.join(", "), quote_ident(role)))
+}
+
+pub fn revoke_default_sql(d: &crate::model::DefaultPrivilege, current_user: &str) -> String {
+    let owner = if d.owner.is_empty() || d.owner == current_user { String::new() } else { format!("FOR ROLE {} ", quote_ident(&d.owner)) };
+    format!(
+        "ALTER DEFAULT PRIVILEGES {owner}REVOKE {} ON {} FROM {}",
+        d.privileges.join(", "),
+        d.kind,
+        if d.grantee == "public" { "PUBLIC".to_string() } else { quote_ident(&d.grantee) }
+    )
+}
+
+/// `CREATE POLICY name ON table FOR command TO role USING (…) WITH CHECK (…)`.
+pub fn create_policy_sql(name: &str, table: &str, command: &str, role: &str, using: &str, check: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name the policy".to_string());
+    }
+    if table.trim().is_empty() {
+        return Err("choose its table".to_string());
+    }
+    let (using, check) = (using.trim(), check.trim());
+    if using.is_empty() && check.is_empty() {
+        return Err("give it a USING condition (rows it may see) or a WITH CHECK (rows it may write)".to_string());
+    }
+    if matches!(command, "SELECT" | "DELETE") && !check.is_empty() {
+        return Err(format!("a {command} policy takes USING only"));
+    }
+    if command == "INSERT" && !using.is_empty() {
+        return Err("an INSERT policy takes WITH CHECK only".to_string());
+    }
+    let mut sql = format!("CREATE POLICY {} ON {} FOR {command} TO {}", quote_ident(name), quote_ident(table.trim()), quote_ident(role));
+    if !using.is_empty() {
+        sql.push_str(&format!(" USING ({using})"));
+    }
+    if !check.is_empty() {
+        sql.push_str(&format!(" WITH CHECK ({check})"));
+    }
+    Ok(sql)
 }
 
 /// A statement as it may be kept and shown: every string literal after
@@ -1164,6 +1513,116 @@ pub fn replication_stats_sql(flavor: Flavor) -> &'static str {
     }
 }
 
+/// The cluster map as the connected node serves it: a shard answers from
+/// its map, a gateway passes it to its home shard. PostgreSQL has no such
+/// statement, and the page says so instead of sending one.
+pub fn shards_sql(flavor: Flavor) -> Option<&'static str> {
+    match flavor {
+        Flavor::Rasterized => Some("SHOW SHARDS"),
+        Flavor::Postgres => None,
+    }
+}
+
+/// The gateway's own rows (a shard refuses the statement).
+pub const SHOW_GATEWAY_SQL: &str = "SHOW GATEWAY";
+/// Per-partition load on the shard reached.
+pub const SHOW_SHARD_LOAD_SQL: &str = "SHOW SHARD LOAD";
+/// Two-phase parts prepared on the shard reached.
+pub const SHOW_PREPARED_SQL: &str = "SHOW PREPARED TRANSACTIONS";
+/// A gateway's rebalance: the planner's moves, a run, and the run's state.
+pub const SHOW_REBALANCE_PLAN_SQL: &str = "SHOW REBALANCE PLAN";
+pub const REBALANCE_SQL: &str = "REBALANCE CLUSTER";
+pub const SHOW_REBALANCE_STATUS_SQL: &str = "SHOW REBALANCE STATUS";
+
+/// `SHOW REBALANCE PLAN`'s rows; empty for anything else.
+pub fn parse_rebalance_plan(grid: &Grid) -> Vec<RebalanceStep> {
+    if grid.column_index("kind").is_none() {
+        return Vec::new();
+    }
+    let v = |row: usize, c: &str| grid.value(row, c).unwrap_or_default().to_string();
+    (0..grid.rows.len())
+        .map(|row| RebalanceStep {
+            kind: v(row, "kind"),
+            shard: v(row, "shard"),
+            to_shard: v(row, "to_shard"),
+            lo: v(row, "lo_block"),
+            hi: v(row, "hi_block"),
+            bytes: v(row, "bytes"),
+            before: v(row, "load_before"),
+            after: v(row, "load_after"),
+        })
+        .collect()
+}
+
+/// `SHOW SHARDS` into the page's shards and map identity.
+pub fn parse_shards(grid: &Grid, into: &mut ShardsSnapshot) {
+    into.supported = grid.column_index("shard_id").is_some();
+    into.shards = (0..grid.rows.len())
+        .map(|row| ShardInfo {
+            id: grid.number(row, "shard_id").unwrap_or(0),
+            this: grid.flag(row, "this_shard").unwrap_or(false),
+            address: grid.value(row, "address").unwrap_or_default().to_string(),
+            standbys: grid
+                .value(row, "standbys")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
+            ranges: grid.number(row, "ranges").unwrap_or(0),
+            blocks: grid.number(row, "blocks").unwrap_or(0),
+        })
+        .collect();
+    if !grid.rows.is_empty() {
+        into.map_epoch = grid.number(0, "map_epoch");
+        into.cluster_id = grid.value(0, "cluster_id").unwrap_or_default().to_string();
+        into.map_digest = grid.value(0, "map_digest").unwrap_or_default().to_string();
+    }
+}
+
+/// `SHOW GATEWAY`'s `(name, value)` rows; empty for anything else.
+pub fn parse_gateway(grid: &Grid) -> Vec<(String, String)> {
+    if grid.column_index("name").is_none() || grid.column_index("value").is_none() {
+        return Vec::new();
+    }
+    (0..grid.rows.len())
+        .map(|row| (grid.value(row, "name").unwrap_or_default().to_string(), grid.value(row, "value").unwrap_or_default().to_string()))
+        .collect()
+}
+
+/// `SHOW SHARD LOAD` summed per table, the biggest first.
+pub fn parse_shard_load(grid: &Grid) -> Vec<TableLoad> {
+    if grid.column_index("table_name").is_none() {
+        return Vec::new();
+    }
+    let mut by_table: Vec<TableLoad> = Vec::new();
+    for row in 0..grid.rows.len() {
+        let table = grid.value(row, "table_name").unwrap_or_default();
+        let at = match by_table.iter().position(|t| t.table == table) {
+            Some(i) => i,
+            None => {
+                by_table.push(TableLoad { table: table.to_string(), partitions: 0, row_slots: 0, bytes: 0 });
+                by_table.len() - 1
+            }
+        };
+        let t = &mut by_table[at];
+        t.partitions += 1;
+        t.row_slots += grid.number(row, "row_slots").unwrap_or(0);
+        t.bytes += grid.number(row, "total_bytes").unwrap_or(0);
+    }
+    by_table.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.table.cmp(&b.table)));
+    by_table
+}
+
+/// `SHOW PREPARED TRANSACTIONS`' global ids.
+pub fn parse_prepared(grid: &Grid) -> Vec<String> {
+    if grid.column_index("gid").is_none() {
+        return Vec::new();
+    }
+    (0..grid.rows.len()).filter_map(|row| grid.value(row, "gid").map(String::from)).collect()
+}
+
 /// A row per peer.
 ///
 /// The two servers replicate in opposite directions and the page says so.
@@ -1255,6 +1714,14 @@ pub fn storage_placements_sql(flavor: Flavor) -> &'static str {
     match flavor {
         Flavor::Rasterized => "SHOW STORAGE PLACEMENTS",
         Flavor::Postgres => PG_STORAGE_PLACEMENTS,
+    }
+}
+
+/// A row per key/value store. PostgreSQL has nothing that matches.
+pub fn storage_stores_sql(flavor: Flavor) -> Option<&'static str> {
+    match flavor {
+        Flavor::Rasterized => Some("SHOW STORAGE STORES"),
+        Flavor::Postgres => None,
     }
 }
 
@@ -1354,6 +1821,26 @@ pub fn parse_storage_locations(grid: &Grid) -> Vec<StorageLocation> {
             tables: grid.number(row, "tables").unwrap_or(0),
             available_bytes: grid.number(row, "available_bytes").unwrap_or(0),
             total_bytes: grid.number(row, "total_bytes").unwrap_or(0),
+        })
+        .collect()
+}
+
+pub fn parse_storage_stores(grid: &Grid) -> Vec<KvStore> {
+    let text = |row: usize, column: &str| grid.value(row, column).unwrap_or_default().to_string();
+    (0..grid.rows.len())
+        .map(|row| KvStore {
+            name: text(row, "store"),
+            kind: text(row, "kind"),
+            endpoint: text(row, "endpoint"),
+            region: text(row, "region"),
+            bucket: text(row, "bucket"),
+            prefix: text(row, "prefix"),
+            addressing: text(row, "addressing"),
+            settings: text(row, "settings"),
+            credentials: text(row, "credentials"),
+            tables: grid.number(row, "tables").unwrap_or(0),
+            opened: grid.flag(row, "opened").unwrap_or(false),
+            supported: grid.flag(row, "supported").unwrap_or(true),
         })
         .collect()
 }
@@ -3095,6 +3582,59 @@ mod tests {
     }
 
     #[test]
+    fn what_a_role_may_reach_is_read_and_changed() {
+        let grants = index_grid(
+            &["grantor", "grantee", "table_name", "privilege_type", "is_grantable"],
+            &[
+                &["rdb", "app", "pay", "SELECT", "NO"],
+                &["rdb", "app", "pay", "INSERT", "YES"],
+                &["rdb", "rdb", "pay", "SELECT", "YES"],
+                &["rdb", "auditors", "sec", "SELECT", "NO"],
+            ],
+        );
+        let (g, owned) = parse_table_grants(&grants);
+        assert_eq!(owned, [("rdb".to_string(), "pay".to_string())]);
+        assert_eq!(g.len(), 2);
+        assert_eq!((g[0].privileges.clone(), g[0].grantable.clone()), (vec!["SELECT".to_string(), "INSERT".to_string()], vec!["INSERT".to_string()]));
+
+        let d = parse_default_privileges(&index_grid(&["owner", "kind", "acl"], &[&["rdb", "r", "{auditors=rw/rdb,=r/rdb}"]]));
+        assert_eq!(d.len(), 2);
+        assert_eq!((d[0].grantee.as_str(), d[0].kind.as_str(), d[0].privileges.clone()), ("auditors", "TABLES", vec!["SELECT".to_string(), "UPDATE".to_string()]));
+        assert_eq!(d[1].grantee, "public");
+        assert_eq!(revoke_default_sql(&d[0], "rdb"), "ALTER DEFAULT PRIVILEGES REVOKE SELECT, UPDATE ON TABLES FROM \"auditors\"");
+
+        let p = parse_policies(&index_grid(
+            &["name", "table_name", "cmd", "permissive", "roles", "using_expr", "check_expr"],
+            &[&["own", "pay", "r", "t", "{app,ops}", "id > 1", ""]],
+        ));
+        assert_eq!((p[0].command.as_str(), p[0].roles.clone()), ("SELECT", vec!["app".to_string(), "ops".to_string()]));
+
+        let role = RoleInfo { name: "app".into(), can_login: true, conn_limit: -1, ..RoleInfo::default() };
+        assert_eq!(alter_role_sql(&role, true, false, false, false, false, "", ""), Err("nothing changed".to_string()));
+        assert_eq!(
+            alter_role_sql(&role, false, false, true, false, false, "5", "2027-01-01").unwrap(),
+            "ALTER ROLE \"app\" NOLOGIN CREATEDB CONNECTION LIMIT 5 VALID UNTIL '2027-01-01'"
+        );
+        assert!(alter_role_sql(&role, true, false, false, false, false, "x", "").is_err());
+        assert!(alter_role_sql(&role, true, false, false, false, false, "", "2027-02-30").is_err());
+        assert_eq!(date_problem("2027-02-30").unwrap(), "2027-02-30 has no day 30.");
+        assert_eq!(date_problem("2028-02-29 23:59"), None);
+        assert!(date_problem("27-1-1").is_some());
+        assert!(date_problem("2027-01-01 25:00").is_some());
+        assert_eq!(
+            grant_table_sql("sec", &["SELECT"], "app", true).unwrap(),
+            "GRANT SELECT ON \"sec\" TO \"app\" WITH GRANT OPTION"
+        );
+        assert!(grant_table_sql("sec", &[], "app", false).is_err());
+        assert_eq!(
+            create_policy_sql("mine", "pay", "SELECT", "app", "owner = current_user", "").unwrap(),
+            "CREATE POLICY \"mine\" ON \"pay\" FOR SELECT TO \"app\" USING (owner = current_user)"
+        );
+        assert!(create_policy_sql("p", "pay", "SELECT", "app", "", "x").is_err());
+        assert!(create_policy_sql("p", "pay", "INSERT", "app", "x", "").is_err());
+    }
+
+    #[test]
     fn a_role_is_created_in_the_form_both_servers_take() {
         assert_eq!(
             create_role_sql(" ops ", "pw'1", true, true).unwrap(),
@@ -3514,5 +4054,397 @@ mod branch_sql_tests {
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].parent_exists && parsed[0].mergeable());
         assert_eq!((parsed[0].parent_lsn, parsed[0].sessions), (7, 2));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broker (`BROKER …` statements, RasterizedDB's message broker)
+// ---------------------------------------------------------------------------
+
+/// A broker argument: always single-quoted (`''` for a quote), which the
+/// broker reads the same as a bare word.
+pub fn broker_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn broker_int(what: &str, value: &str) -> Result<Option<String>, String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    if v.bytes().all(|b| b.is_ascii_digit()) && v.len() <= 18 {
+        Ok(Some(v.to_string()))
+    } else {
+        Err(format!("{what} is a whole number"))
+    }
+}
+
+/// A start position: EARLIEST, LATEST or an offset.
+fn broker_start(value: &str) -> Result<String, String> {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("earliest") || v.eq_ignore_ascii_case("latest") {
+        return Ok(v.to_ascii_uppercase());
+    }
+    broker_int("A start", v)?.ok_or_else(|| "a start is EARLIEST, LATEST or an offset".to_string())
+}
+
+fn broker_name(what: &str, value: &str) -> Result<String, String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Err(format!("{what} is needed"));
+    }
+    Ok(broker_quote(v))
+}
+
+pub const BROKER_TOPICS_SQL: &str = "BROKER SHOW TOPICS";
+pub const BROKER_QUEUES_SQL: &str = "BROKER SHOW QUEUES";
+pub const BROKER_SUBSCRIPTIONS_SQL: &str = "BROKER SHOW SUBSCRIPTIONS";
+pub const BROKER_EXCHANGES_SQL: &str = "BROKER SHOW EXCHANGES";
+pub const BROKER_BINDINGS_SQL: &str = "BROKER SHOW BINDINGS";
+
+/// The create form's statement, or why it cannot be made yet.
+pub fn broker_create_sql(form: &BrokerForm) -> Result<String, String> {
+    let mut sql;
+    let opt = |sql: &mut String, word: &str, value: &str| {
+        if !value.trim().is_empty() {
+            sql.push_str(&format!(" {word} {}", broker_quote(value.trim())));
+        }
+    };
+    match form.kind {
+        BrokerCreateKind::Topic => {
+            sql = format!("BROKER CREATE TOPIC {}", broker_name("A topic name", &form.name)?);
+            if let Some(n) = broker_int("Partitions", &form.partitions)? {
+                sql.push_str(&format!(" PARTITIONS {n}"));
+            }
+            opt(&mut sql, "DURABILITY", &form.durability);
+            opt(&mut sql, "RETENTION", &form.retention);
+            opt(&mut sql, "RETENTION BYTES", &form.retention_bytes);
+        }
+        BrokerCreateKind::Queue => {
+            sql = format!("BROKER CREATE QUEUE {}", broker_name("A queue name", &form.name)?);
+            opt(&mut sql, "DURABILITY", &form.durability);
+            opt(&mut sql, "ACK TIMEOUT", &form.ack_timeout);
+            if let Some(n) = broker_int("Max deliveries", &form.max_deliveries)? {
+                sql.push_str(&format!(" MAX DELIVERIES {n}"));
+            }
+            opt(&mut sql, "DEAD LETTER", &form.dead_letter);
+            opt(&mut sql, "TTL", &form.retention);
+        }
+        BrokerCreateKind::Exchange => {
+            sql = format!("BROKER CREATE EXCHANGE {}", broker_name("An exchange name", &form.name)?);
+            opt(&mut sql, "TYPE", &form.exchange_type);
+        }
+        BrokerCreateKind::Subscription => {
+            sql = format!(
+                "BROKER CREATE SUBSCRIPTION {} ON {}",
+                broker_name("A subscription name", &form.name)?,
+                broker_name("Its topic", &form.target)?
+            );
+            opt(&mut sql, "MODE", &form.mode);
+            if !form.from.trim().is_empty() {
+                sql.push_str(&format!(" FROM {}", broker_start(&form.from)?));
+            }
+            opt(&mut sql, "ACK TIMEOUT", &form.ack_timeout);
+            if let Some(n) = broker_int("Max deliveries", &form.max_deliveries)? {
+                sql.push_str(&format!(" MAX DELIVERIES {n}"));
+            }
+            opt(&mut sql, "DEAD LETTER", &form.dead_letter);
+        }
+        BrokerCreateKind::Binding => {
+            sql = format!(
+                "BROKER BIND {} TO {}",
+                broker_name("An exchange", &form.name)?,
+                broker_name("A topic or queue", &form.target)?
+            );
+            opt(&mut sql, "KEY", &form.key);
+        }
+    }
+    Ok(sql)
+}
+
+/// The publish form's statement, or why it cannot be made yet.
+pub fn broker_publish_sql(form: &BrokerPublishForm) -> Result<String, String> {
+    let mut sql = if form.via_exchange {
+        format!(
+            "BROKER SEND {} {} {}",
+            broker_name("An exchange", &form.target)?,
+            broker_quote(form.routing_key.trim()),
+            broker_quote(&form.value)
+        )
+    } else {
+        format!("BROKER PUBLISH {} {}", broker_name("A topic or queue", &form.target)?, broker_quote(&form.value))
+    };
+    if !form.key.is_empty() {
+        sql.push_str(&format!(" KEY {}", broker_quote(&form.key)));
+    }
+    if !form.header_name.trim().is_empty() {
+        sql.push_str(&format!(
+            " HEADER {} {}",
+            broker_quote(form.header_name.trim()),
+            broker_quote(&form.header_value)
+        ));
+    }
+    Ok(sql)
+}
+
+/// `BROKER READ`: a look at a topic's records that takes nothing.
+pub fn broker_read_sql(topic: &str, form: &BrokerReadForm) -> Result<String, String> {
+    let mut sql = format!("BROKER READ {}", broker_name("A topic", topic)?);
+    if let Some(p) = broker_int("A partition", &form.partition)? {
+        sql.push_str(&format!(" PARTITION {p}"));
+    }
+    if !form.from.trim().is_empty() {
+        sql.push_str(&format!(" FROM {}", broker_start(&form.from)?));
+    }
+    if let Some(n) = broker_int("A limit", &form.limit)? {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    Ok(sql)
+}
+
+/// `BROKER POP`: takes messages off a queue and acknowledges them.
+pub fn broker_pop_sql(queue: &str, limit: &str) -> Result<String, String> {
+    let mut sql = format!("BROKER POP {}", broker_name("A queue", queue)?);
+    if let Some(n) = broker_int("A limit", limit)? {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    Ok(sql)
+}
+
+pub fn broker_partitions_sql(topic: &str) -> String {
+    format!("BROKER SHOW PARTITIONS {}", broker_quote(topic))
+}
+
+/// `what` is TOPIC, QUEUE or EXCHANGE.
+pub fn broker_drop_sql(what: &str, name: &str) -> String {
+    format!("BROKER DROP {what} {}", broker_quote(name))
+}
+
+pub fn broker_drop_subscription_sql(topic: &str, name: &str) -> String {
+    format!("BROKER DROP SUBSCRIPTION {} ON {}", broker_quote(name), broker_quote(topic))
+}
+
+pub fn broker_unbind_sql(b: &BrokerBinding) -> String {
+    let mut sql = format!("BROKER UNBIND {} FROM {}", broker_quote(&b.exchange), broker_quote(&b.topic));
+    if !b.key.is_empty() {
+        sql.push_str(&format!(" KEY {}", broker_quote(&b.key)));
+    }
+    sql
+}
+
+fn broker_flag(grid: &Grid, row: usize, column: &str) -> bool {
+    matches!(grid.value(row, column), Some("t" | "true" | "1" | "TRUE" | "True"))
+}
+
+pub fn parse_broker_topics(grid: &Grid) -> Vec<BrokerTopic> {
+    (0..grid.rows.len())
+        .map(|i| BrokerTopic {
+            name: grid.value(i, "name").unwrap_or("").to_string(),
+            partitions: grid.number(i, "partitions").unwrap_or(0),
+            durability: grid.value(i, "durability").unwrap_or("").to_string(),
+            queue: broker_flag(grid, i, "queue"),
+            messages: grid.number(i, "messages").unwrap_or(0),
+            bytes: grid.number(i, "bytes").unwrap_or(0),
+            retention_ms: grid.number(i, "retention_ms").unwrap_or(0),
+        })
+        .collect()
+}
+
+pub fn parse_broker_queues(grid: &Grid) -> Vec<BrokerQueue> {
+    (0..grid.rows.len())
+        .map(|i| BrokerQueue {
+            name: grid.value(i, "name").unwrap_or("").to_string(),
+            messages: grid.number(i, "messages").unwrap_or(0),
+            ready: grid.number(i, "ready").unwrap_or(0),
+            unacked: grid.number(i, "unacked").unwrap_or(0),
+            consumers: grid.number(i, "consumers").unwrap_or(0),
+        })
+        .collect()
+}
+
+pub fn parse_broker_subscriptions(grid: &Grid) -> Vec<BrokerSubscription> {
+    (0..grid.rows.len())
+        .map(|i| {
+            let n = |c: &str| grid.number(i, c).unwrap_or(0);
+            BrokerSubscription {
+                topic: grid.value(i, "topic").unwrap_or("").to_string(),
+                name: grid.value(i, "name").unwrap_or("").to_string(),
+                mode: grid.value(i, "mode").unwrap_or("").to_string(),
+                members: n("members"),
+                backlog: n("backlog"),
+                inflight: n("inflight"),
+                delivered: n("delivered"),
+                acked: n("acked"),
+                dead: n("dead"),
+            }
+        })
+        .collect()
+}
+
+pub fn parse_broker_exchanges(grid: &Grid) -> Vec<BrokerExchange> {
+    (0..grid.rows.len())
+        .map(|i| BrokerExchange {
+            name: grid.value(i, "name").unwrap_or("").to_string(),
+            kind: grid.value(i, "type").unwrap_or("").to_string(),
+            durable: broker_flag(grid, i, "durable"),
+            bindings: grid.number(i, "bindings").unwrap_or(0),
+        })
+        .collect()
+}
+
+pub fn parse_broker_bindings(grid: &Grid) -> Vec<BrokerBinding> {
+    (0..grid.rows.len())
+        .map(|i| BrokerBinding {
+            exchange: grid.value(i, "exchange").unwrap_or("").to_string(),
+            topic: grid.value(i, "topic").unwrap_or("").to_string(),
+            key: grid.value(i, "key").unwrap_or("").to_string(),
+        })
+        .collect()
+}
+
+/// A retention in milliseconds as the page shows it.
+pub fn broker_retention(ms: u64) -> String {
+    match ms {
+        0 => "—".to_string(),
+        ms if ms % 86_400_000 == 0 => format!("{}d", ms / 86_400_000),
+        ms if ms % 3_600_000 == 0 => format!("{}h", ms / 3_600_000),
+        ms if ms % 60_000 == 0 => format!("{}m", ms / 60_000),
+        ms if ms % 1000 == 0 => format!("{}s", ms / 1000),
+        ms => format!("{ms}ms"),
+    }
+}
+
+#[cfg(test)]
+mod broker_tests {
+    use super::*;
+
+    #[test]
+    fn broker_statements_quote_what_was_typed() {
+        let mut form = BrokerForm { name: "orders".into(), partitions: "4".into(), durability: "sync".into(), retention: "7d".into(), ..BrokerForm::default() };
+        assert_eq!(
+            broker_create_sql(&form).unwrap(),
+            "BROKER CREATE TOPIC 'orders' PARTITIONS 4 DURABILITY 'sync' RETENTION '7d'"
+        );
+        form.partitions = "four".into();
+        assert!(broker_create_sql(&form).is_err());
+        let q = BrokerForm { kind: BrokerCreateKind::Queue, name: "jo'bs".into(), max_deliveries: "5".into(), dead_letter: "dead".into(), ..BrokerForm::default() };
+        assert_eq!(broker_create_sql(&q).unwrap(), "BROKER CREATE QUEUE 'jo''bs' MAX DELIVERIES 5 DEAD LETTER 'dead'");
+        let s = BrokerForm { kind: BrokerCreateKind::Subscription, name: "s".into(), target: "orders".into(), from: "earliest".into(), ..BrokerForm::default() };
+        assert_eq!(broker_create_sql(&s).unwrap(), "BROKER CREATE SUBSCRIPTION 's' ON 'orders' MODE 'shared' FROM EARLIEST");
+        let b = BrokerForm { kind: BrokerCreateKind::Binding, name: "ev".into(), target: "orders".into(), key: "order.*".into(), ..BrokerForm::default() };
+        assert_eq!(broker_create_sql(&b).unwrap(), "BROKER BIND 'ev' TO 'orders' KEY 'order.*'");
+        let p = BrokerPublishForm { target: "orders".into(), value: "it's".into(), key: "c7".into(), ..Default::default() };
+        assert_eq!(broker_publish_sql(&p).unwrap(), "BROKER PUBLISH 'orders' 'it''s' KEY 'c7'");
+        let x = BrokerPublishForm { target: "ev".into(), via_exchange: true, routing_key: "order.new".into(), value: "v".into(), ..Default::default() };
+        assert_eq!(broker_publish_sql(&x).unwrap(), "BROKER SEND 'ev' 'order.new' 'v'");
+        assert_eq!(
+            broker_read_sql("orders", &BrokerReadForm { partition: "0".into(), from: "100".into(), limit: "10".into() }).unwrap(),
+            "BROKER READ 'orders' PARTITION 0 FROM 100 LIMIT 10"
+        );
+        assert_eq!(broker_pop_sql("jobs", "5").unwrap(), "BROKER POP 'jobs' LIMIT 5");
+        assert_eq!(
+            broker_unbind_sql(&BrokerBinding { exchange: "ev".into(), topic: "orders".into(), key: "k".into() }),
+            "BROKER UNBIND 'ev' FROM 'orders' KEY 'k'"
+        );
+        assert_eq!(broker_retention(7 * 86_400_000), "7d");
+    }
+}
+
+// Broker permissions (GRANT/REVOKE … ON TOPIC|QUEUE|EXCHANGE, ALTER … OWNER TO)
+
+pub const BROKER_GRANTS_SQL: &str = "BROKER SHOW GRANTS";
+
+/// A grantee: PUBLIC as the keyword, a role quoted.
+fn broker_grantee(role: &str) -> Result<String, String> {
+    let r = role.trim();
+    if r.is_empty() {
+        return Err("A role (or PUBLIC) is needed".to_string());
+    }
+    Ok(if r.eq_ignore_ascii_case("public") { "PUBLIC".to_string() } else { quote_ident(r) })
+}
+
+/// `ON TOPIC "x"`, or `ON ALL TOPICS` for an empty name.
+fn broker_on(kind: crate::model::BrokerObjectKind, object: &str) -> String {
+    let o = object.trim();
+    if o.is_empty() {
+        format!("ON ALL {}S", kind.label())
+    } else {
+        format!("ON {} {}", kind.label(), quote_ident(o))
+    }
+}
+
+/// `GRANT …` (or `REVOKE … FROM`) for the permissions form.
+pub fn broker_grant_sql(form: &crate::model::BrokerPermForm, revoke: bool) -> Result<String, String> {
+    let [a, b] = form.kind.privileges();
+    let privileges = match (form.first, form.second) {
+        (true, true) => "ALL".to_string(),
+        (true, false) => a.to_string(),
+        (false, true) => b.to_string(),
+        (false, false) => return Err(format!("Pick {a}, {b} or both")),
+    };
+    let on = broker_on(form.kind, &form.object);
+    let who = broker_grantee(&form.grantee)?;
+    Ok(if revoke {
+        format!("REVOKE {privileges} {on} FROM {who}")
+    } else {
+        format!("GRANT {privileges} {on} TO {who}")
+    })
+}
+
+/// One listed grant taken back.
+pub fn broker_revoke_row_sql(g: &crate::model::BrokerGrant) -> String {
+    let kind = g.object_type.to_ascii_uppercase();
+    let who = if g.grantee.eq_ignore_ascii_case("public") { "PUBLIC".to_string() } else { quote_ident(&g.grantee) };
+    format!("REVOKE {} ON {kind} {} FROM {who}", g.privilege.to_ascii_uppercase(), quote_ident(&g.object))
+}
+
+pub fn broker_owner_sql(form: &crate::model::BrokerPermForm) -> Result<String, String> {
+    let o = form.object.trim();
+    if o.is_empty() {
+        return Err("An object is needed to change its owner".to_string());
+    }
+    let r = form.owner.trim();
+    if r.is_empty() || r.eq_ignore_ascii_case("public") {
+        return Err("A role is needed as the new owner".to_string());
+    }
+    Ok(format!("ALTER {} {} OWNER TO {}", form.kind.label(), quote_ident(o), quote_ident(r)))
+}
+
+pub fn parse_broker_grants(grid: &Grid) -> Vec<crate::model::BrokerGrant> {
+    (0..grid.rows.len())
+        .map(|i| {
+            let t = |c: &str| grid.value(i, c).unwrap_or("").to_string();
+            crate::model::BrokerGrant {
+                object_type: t("object_type"),
+                object: t("object"),
+                owner: t("owner"),
+                grantee: t("grantee"),
+                privilege: t("privilege"),
+                grantor: t("grantor"),
+                grantable: broker_flag(grid, i, "grantable"),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod broker_acl_tests {
+    use super::*;
+    use crate::model::{BrokerGrant, BrokerObjectKind, BrokerPermForm};
+
+    #[test]
+    fn broker_permission_statements() {
+        let mut f = BrokerPermForm { object: "orders".into(), grantee: "app".into(), first: true, second: true, ..Default::default() };
+        assert_eq!(broker_grant_sql(&f, false).unwrap(), "GRANT ALL ON TOPIC \"orders\" TO \"app\"");
+        f.second = false;
+        assert_eq!(broker_grant_sql(&f, true).unwrap(), "REVOKE PRODUCE ON TOPIC \"orders\" FROM \"app\"");
+        f.first = false;
+        assert!(broker_grant_sql(&f, false).is_err());
+        let x = BrokerPermForm { kind: BrokerObjectKind::Exchange, grantee: "public".into(), second: true, ..Default::default() };
+        assert_eq!(broker_grant_sql(&x, false).unwrap(), "GRANT BIND ON ALL EXCHANGES TO PUBLIC");
+        let o = BrokerPermForm { kind: BrokerObjectKind::Queue, object: "jobs".into(), owner: "billing".into(), ..Default::default() };
+        assert_eq!(broker_owner_sql(&o).unwrap(), "ALTER QUEUE \"jobs\" OWNER TO \"billing\"");
+        let g = BrokerGrant { object_type: "topic".into(), object: "a.b".into(), grantee: "PUBLIC".into(), privilege: "CONSUME".into(), ..Default::default() };
+        assert_eq!(broker_revoke_row_sql(&g), "REVOKE CONSUME ON TOPIC \"a.b\" FROM PUBLIC");
     }
 }

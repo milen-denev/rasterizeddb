@@ -62,6 +62,25 @@ pub enum Introspect {
     TableStats(String),
     /// One row per partition of a partitioned table.
     Partitions(String),
+    /// One row per shard of the cluster map this node serves (sharding-plan.md
+    /// B1a.12); no rows on a node that is not a shard.
+    Shards,
+    /// One row per materialized partition of every partitioned table: its
+    /// level-0 block range and stored size, what the auto-balancer plans
+    /// from (sharding-plan.md §4.6b).
+    ShardLoad,
+    /// `SHARD TAKE|GIVE|FENCE|UNFENCE RANGE lo hi` and `SHARD MAP INSTALL
+    /// '<map>'`: a shard's side of a move (sharding-plan.md B2). Admin only
+    /// (`pgwire::privileged_statement`).
+    ShardAdmin(ShardAdmin),
+    /// `SHOW PREPARED TRANSACTIONS`: this database's prepared transactions
+    /// (sharding-plan.md B5).
+    PreparedTransactions,
+    /// `SHOW SHARD DECISION 'gid'`: `commit`, `abort` or no row.
+    Decision(String),
+    /// A table's 128-bit schema fingerprint, as cluster DDL compares them
+    /// across shards (sharding-plan.md B1a.10).
+    SchemaFingerprint(String),
     Columns(String),
     SchemaMap,
     /// Every CHECK constraint and whether this binary enforces it.
@@ -82,9 +101,143 @@ pub enum Introspect {
     },
 }
 
+/// One `SHARD …` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShardAdmin {
+    /// Blocks `[lo, hi)` come in by this shard's move: marked incoming, and
+    /// every partitioned table's FOREIGN span there made this shard's.
+    Take { lo: u64, hi: u64 },
+    /// Blocks `[lo, hi)` were handed off: every table's span there made
+    /// FOREIGN (its rows kept, unread, until retired) and the ownership
+    /// dropped.
+    Give { lo: u64, hi: u64 },
+    Fence { lo: u64, hi: u64 },
+    Unfence { lo: u64, hi: u64 },
+    /// `SHARD DECIDE 'gid' COMMIT|ABORT`: records a two-phase commit's
+    /// decision on this (anchor) shard; `SHOW SHARD DECISION 'gid'` reads it.
+    Decide { gid: String, commit: bool },
+    /// A newer cluster map, in its text form, with the authority's signature
+    /// (hex) where shards require one.
+    MapInstall { text: String, signature: Option<String> },
+    /// `SHARD REFERENCE TABLE t` / `SHARD UNREFERENCE TABLE t` (B5).
+    Reference { table: String, on: bool },
+    /// `SHARD HOLD COMMITS <ms>`: commit decisions on this (anchor) shard
+    /// wait until `SHARD RELEASE COMMITS` or `ms` (at most 5000) pass; sent
+    /// again before then, it extends the hold. For a consistent cut of the
+    /// cluster (`rdb-shard backup`).
+    HoldCommits { ms: u32 },
+    ReleaseCommits,
+    /// `SHARD HOST ROLE 'db' 'role'` / `SHARD UNHOST ROLE 'db' 'role'`: the
+    /// placement hook's list of per-user-shard roles this shard admits.
+    HostRole { database: String, role: String, on: bool },
+}
+
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
+
+fn parse_shard_admin(trimmed: &str, words: &[&str], original: &[&str]) -> Result<Introspect, String> {
+    let block = |s: &str| -> Result<u64, String> {
+        match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            Some(h) => u64::from_str_radix(h, 16),
+            None => s.parse(),
+        }
+        .map_err(|_| format!("{s:?} is not a block number"))
+    };
+    let range = || -> Result<(u64, u64), String> {
+        if words.get(2).copied() != Some("RANGE") || original.len() != 5 {
+            return Err(format!("the statement is `SHARD {} RANGE <lo> <hi>`", words.get(1).unwrap_or(&"")));
+        }
+        let (lo, hi) = (block(original[3])?, block(original[4])?);
+        if lo >= hi || hi > rasterizeddb_router::shard_map::BLOCKS {
+            return Err(format!("[{lo:#x}, {hi:#x}) is not a range of level-0 blocks"));
+        }
+        Ok((lo, hi))
+    };
+    let admin = match words.get(1).copied() {
+        Some("TAKE") => range().map(|(lo, hi)| ShardAdmin::Take { lo, hi })?,
+        Some("GIVE") => range().map(|(lo, hi)| ShardAdmin::Give { lo, hi })?,
+        Some("FENCE") => range().map(|(lo, hi)| ShardAdmin::Fence { lo, hi })?,
+        Some("UNFENCE") => range().map(|(lo, hi)| ShardAdmin::Unfence { lo, hi })?,
+        Some("DECIDE") => {
+            let (a, b) = (trimmed.find('\''), trimmed.rfind('\''));
+            let (Some(a), Some(b)) = (a, b) else {
+                return Err("the statement is `SHARD DECIDE 'gid' COMMIT|ABORT`".to_string());
+            };
+            let gid = trimmed[a + 1..b].to_string();
+            let commit = match trimmed[b + 1..].trim().to_ascii_uppercase().as_str() {
+                "COMMIT" => true,
+                "ABORT" | "ROLLBACK" => false,
+                _ => return Err("the statement is `SHARD DECIDE 'gid' COMMIT|ABORT`".to_string()),
+            };
+            ShardAdmin::Decide { gid, commit }
+        }
+        Some(kind @ ("REFERENCE" | "UNREFERENCE")) if words.get(2).copied() == Some("TABLE") && original.len() == 4 => {
+            let raw = original[3].trim_end_matches(';');
+            let table = if raw.starts_with('"') && raw.ends_with('"') && raw.len() > 1 {
+                raw[1..raw.len() - 1].replace("\"\"", "\"")
+            } else {
+                raw.to_ascii_lowercase()
+            };
+            ShardAdmin::Reference { table, on: kind == "REFERENCE" }
+        }
+        Some("MAP") if words.get(2).copied() == Some("INSTALL") => {
+            let usage = "the statement is `SHARD MAP INSTALL '<map>' [SIGNATURE '<hex>']`";
+            let literal = |from: usize| -> Result<(String, usize), String> {
+                let b = trimmed.as_bytes();
+                let at = from + trimmed[from..].find('\'').ok_or(usage)?;
+                let end = crate::core::sql_scan::string_literal_end(b, at, false);
+                if end > b.len() || end < at + 2 || b[end - 1] != b'\'' {
+                    return Err(usage.to_string());
+                }
+                Ok((trimmed[at + 1..end - 1].replace("''", "'"), end))
+            };
+            let (text, end) = literal(0)?;
+            let rest = trimmed[end..].trim();
+            let signature = if rest.is_empty() {
+                None
+            } else if rest.len() > 9 && rest[..9].eq_ignore_ascii_case("SIGNATURE") {
+                let (sig, after) = literal(end)?;
+                if !trimmed[after..].trim().is_empty() {
+                    return Err(usage.to_string());
+                }
+                Some(sig)
+            } else {
+                return Err(usage.to_string());
+            };
+            ShardAdmin::MapInstall { text, signature }
+        }
+        Some("HOLD") if words.get(2).copied() == Some("COMMITS") && original.len() == 4 => {
+            let ms: u32 = original[3].trim_end_matches(';').parse().map_err(|_| "the statement is `SHARD HOLD COMMITS <ms>`".to_string())?;
+            if ms == 0 || ms > 5_000 {
+                return Err("SHARD HOLD COMMITS takes 1 to 5000 ms; send it again to hold longer".to_string());
+            }
+            ShardAdmin::HoldCommits { ms }
+        }
+        Some("RELEASE") if words.get(2).copied() == Some("COMMITS") && words.len() == 3 => ShardAdmin::ReleaseCommits,
+        Some(kind @ ("HOST" | "UNHOST")) if words.get(2).copied() == Some("ROLE") => {
+            let usage = || format!("the statement is `SHARD {kind} ROLE '<database>' '<role>'`");
+            let b = trimmed.as_bytes();
+            let mut names = Vec::new();
+            let mut at = 0;
+            while let Some(off) = trimmed[at..].find('\'') {
+                let start = at + off;
+                let end = crate::core::sql_scan::string_literal_end(b, start, false);
+                if end > b.len() || end < start + 2 || b[end - 1] != b'\'' {
+                    return Err(usage());
+                }
+                names.push(trimmed[start + 1..end - 1].replace("''", "'"));
+                at = end;
+            }
+            if names.len() != 2 || names.iter().any(|n| n.is_empty()) || !trimmed[at..].trim().trim_end_matches(';').trim().is_empty() {
+                return Err(usage());
+            }
+            ShardAdmin::HostRole { database: names[0].clone(), role: names[1].clone(), on: kind == "HOST" }
+        }
+        _ => return Err("SHARD takes TAKE, GIVE, FENCE or UNFENCE RANGE, MAP INSTALL, DECIDE, HOLD COMMITS or RELEASE COMMITS".to_string()),
+    };
+    Ok(Introspect::ShardAdmin(admin))
+}
 
 /// Whether this statement belongs to the introspection surface.
 ///
@@ -150,6 +303,10 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
         return Some(Ok(Introspect::SetConfig { key, value }));
     }
 
+    if words.first().copied() == Some("SHARD") {
+        return Some(parse_shard_admin(trimmed, &words, &original));
+    }
+
     if words.first().copied() != Some("SHOW") {
         return None;
     }
@@ -182,6 +339,31 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
             Some(_) => Some(Err("SHOW TABLE STATS takes one table name".to_string())),
             None => Some(Err("SHOW TABLE STATS names no table".to_string())),
         },
+        Some("SCHEMA") if words.get(2).copied() == Some("FINGERPRINT") => match original.get(3) {
+            Some(name) if original.len() == 4 => Some(Ok(Introspect::SchemaFingerprint(normalize_name(name)))),
+            _ => Some(Err("SHOW SCHEMA FINGERPRINT takes one table name".to_string())),
+        },
+        Some("SHARD") if words.get(2).copied() == Some("DECISION") => {
+            match (trimmed.find('\''), trimmed.rfind('\'')) {
+                (Some(a), Some(b)) if b > a => Some(Ok(Introspect::Decision(trimmed[a + 1..b].to_string()))),
+                _ => Some(Err("the statement is `SHOW SHARD DECISION 'gid'`".to_string())),
+            }
+        }
+        Some("PREPARED") if words.get(2).copied() == Some("TRANSACTIONS") && words.len() == 3 => {
+            Some(Ok(Introspect::PreparedTransactions))
+        }
+        Some("SHARD") if words.get(2).copied() == Some("LOAD") => {
+            if words.len() > 3 {
+                return Some(Err("SHOW SHARD LOAD takes no arguments".to_string()));
+            }
+            Some(Ok(Introspect::ShardLoad))
+        }
+        Some("SHARDS") => {
+            if words.len() > 2 {
+                return Some(Err("SHOW SHARDS takes no arguments".to_string()));
+            }
+            Some(Ok(Introspect::Shards))
+        }
         Some("PARTITIONS") => match original.get(2) {
             Some(name) if original.len() == 3 => {
                 Some(Ok(Introspect::Partitions(normalize_name(name))))
@@ -326,6 +508,31 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
         // `lo` and `hi` are text: the hash space is `[0, 2^64)`, so the last
         // partition's `hi` does not fit a BIGINT, and a `lo` past 2^63 would
         // read as negative. Hex, as the map log and the design write them.
+        Introspect::ShardAdmin(_) => vec![text("result")],
+        Introspect::PreparedTransactions => vec![text("gid"), number("transaction")],
+        Introspect::Decision(_) => vec![text("decision")],
+        Introspect::SchemaFingerprint(_) => vec![text("table_name"), text("fingerprint"), number("schema_epoch")],
+        Introspect::ShardLoad => vec![
+            text("table_name"),
+            number("pid"),
+            text("lo_block"),
+            text("hi_block"),
+            number("row_slots"),
+            number("total_bytes"),
+            number("statements"),
+        ],
+        // Block ranges as hex text, as SHOW PARTITIONS writes points.
+        Introspect::Shards => vec![
+            number("shard_id"),
+            flag("this_shard"),
+            text("address"),
+            text("standbys"),
+            number("ranges"),
+            number("blocks"),
+            number("map_epoch"),
+            text("cluster_id"),
+            text("map_digest"),
+        ],
         Introspect::Partitions(_) => vec![
             number("pid"),
             text("lo"),
@@ -438,6 +645,27 @@ pub async fn execute(statement: &Introspect, database: &Arc<Database>) -> Vec<u8
             Err(e) => failure(&e),
         },
         Introspect::Partitions(name) => match partitions(database, name).await {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
+        Introspect::Shards => rows(shards()),
+        Introspect::Decision(gid) => match decision_rows(gid) {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
+        Introspect::PreparedTransactions => match prepared_transactions(database) {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
+        Introspect::ShardAdmin(admin) => match shard_admin(database, admin).await {
+            Ok(line) => rows(vec![row(&[Cell::Text(line)])]),
+            Err(e) => failure(&e),
+        },
+        Introspect::SchemaFingerprint(name) => match schema_fingerprint(database, name) {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
+        Introspect::ShardLoad => match shard_load(database).await {
             Ok(r) => rows(r),
             Err(e) => failure(&e),
         },
@@ -1424,6 +1652,49 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         sizes.schema.to_string(),
         "schema and its sidecars",
     );
+    // Compression (`core::compression`), for a table that asked for it: what
+    // it asks, and what its writes since it opened got from it.
+    let policy = &schema.compression;
+    if !policy.is_empty() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let columns: Vec<String> = policy
+            .columns
+            .iter()
+            .filter_map(|c| {
+                let field = schema.fields.iter().find(|f| f.write_order == c.write_order && !f.is_deleted)?;
+                let method = crate::core::compression::method_name(Some(c.codec.level))?;
+                let dictionary = if c.codec.dictionary.is_some() { " +dictionary" } else { "" };
+                Some(format!("{}={method}{dictionary}", field.name))
+            })
+            .collect();
+        push("compressed_columns", columns.join(", "), "columns that store their values compressed");
+        push(
+            "row_compression",
+            policy
+                .row
+                .as_ref()
+                .and_then(|c| {
+                    crate::core::compression::method_name(Some(c.level))
+                        .map(|m| if c.dictionary.is_some() { format!("{m} +dictionary") } else { m })
+                })
+                .unwrap_or_else(|| "none".to_string()),
+            "each row's variable-width values stored as one frame",
+        );
+        let counters = &policy.counters;
+        push(
+            "compressed_values",
+            counters.values_compressed.load(Relaxed).to_string(),
+            "values stored as their own frame since the table opened",
+        );
+        push(
+            "compressed_row_tails",
+            counters.tails_compressed.load(Relaxed).to_string(),
+            "row tails stored as one frame since the table opened",
+        );
+        let (raw, stored) = (counters.raw_bytes.load(Relaxed), counters.stored_bytes.load(Relaxed));
+        push("compression_raw_bytes", raw.to_string(), "bytes those values and tails held");
+        push("compression_stored_bytes", stored.to_string(), "bytes their frames took");
+    }
     push(
         "index_bytes",
         sizes.filters.to_string(),
@@ -1639,6 +1910,237 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
 /// `[lo, hi)` range of the hash space, where its files are, whether it has
 /// any, and its sizes (zero until it is materialized). Refused for a plain
 /// table, and for a partitioned table that cannot be opened.
+#[cfg(feature = "sharding")]
+fn decision_rows(gid: &str) -> Result<Vec<Row>, String> {
+    Ok(match crate::core::shard::rshard::decision(gid)? {
+        Some(c) => vec![row(&[Cell::Text(if c { "commit" } else { "abort" }.to_string())])],
+        None => Vec::new(),
+    })
+}
+
+#[cfg(not(feature = "sharding"))]
+fn decision_rows(_gid: &str) -> Result<Vec<Row>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(feature = "sharding_2pc")]
+fn prepared_transactions(database: &Arc<Database>) -> Result<Vec<Row>, String> {
+    Ok(database
+        .prepared()?
+        .into_iter()
+        .map(|(gid, tx)| row(&[Cell::Text(gid), Cell::Number(tx)]))
+        .collect())
+}
+
+#[cfg(not(feature = "sharding_2pc"))]
+fn prepared_transactions(_database: &Arc<Database>) -> Result<Vec<Row>, String> {
+    Ok(Vec::new())
+}
+
+/// Runs a `SHARD …` statement (sharding-plan.md B2).
+#[cfg(feature = "sharding")]
+async fn shard_admin(database: &Arc<Database>, admin: &ShardAdmin) -> Result<String, String> {
+    use crate::core::shard::{map_state, ownership, start};
+    let spans = |lo: u64, hi: u64, take: bool| async move {
+        let mut names: Vec<String> = table_names(database).into_iter().filter(|n| !n.starts_with("__")).collect();
+        names.sort();
+        let mut tables = 0;
+        for name in names {
+            if !matches!(database.relation(&name), Some(Relation::Partitioned(_))) {
+                continue;
+            }
+            // Under ACCESS EXCLUSIVE, as a reshape is: the span change
+            // reopens the whole table, and a write to any other span of it
+            // made through the old instance meanwhile was acknowledged and
+            // then lost to the new one. Writers wait for the lock, then run
+            // on the reopened table; given back once the span is changed.
+            let release = crate::core::mvcc::table_locks::MoveRelease::before(database, &name);
+            database
+                .lock_table(&name, crate::core::mvcc::owner::ensure(), crate::core::mvcc::table_locks::TableMode::AccessExclusive)
+                .await
+                .map_err(|e| format!("{name}: {e}"))?;
+            let changed = database.shard_span(&name, lo, hi, take).await.map_err(|e| format!("{name}: {e}"));
+            drop(release);
+            changed?;
+            tables += 1;
+        }
+        Ok::<usize, String>(tables)
+    };
+    match *admin {
+        ShardAdmin::Reference { ref table, on } => {
+            match database.relation(table) {
+                Some(Relation::Plain(_)) => {}
+                Some(Relation::Partitioned(_)) => return Err(format!("{table} is sharded: a reference table is a global one")),
+                None => return Err(format!("relation \"{table}\" does not exist")),
+            }
+            crate::core::shard::reference::set(&database.name, table, on)?;
+            Ok(format!(
+                "{table} {} on this shard",
+                if on { "is a reference table (send this to every shard, and copy its rows)" } else { "is no longer a reference table" }
+            ))
+        }
+        ShardAdmin::Decide { ref gid, commit } => {
+            // A commit decision waits out a hold, as one from a gateway does:
+            // a consistent cut must not see it land mid-way.
+            if commit {
+                crate::core::shard::rshard::wait_commit_hold().await;
+            }
+            crate::core::shard::rshard::decide(gid, commit)?;
+            Ok(format!("{gid} decided {}", if commit { "commit" } else { "abort" }))
+        }
+        ShardAdmin::HoldCommits { ms } => {
+            crate::core::shard::rshard::hold_commits_admin(ms);
+            Ok(format!("commit decisions held for {ms} ms, or until SHARD RELEASE COMMITS"))
+        }
+        ShardAdmin::ReleaseCommits => {
+            crate::core::shard::rshard::release_commits_admin();
+            Ok("commit decisions released".to_string())
+        }
+        ShardAdmin::HostRole { ref database, ref role, on } => {
+            crate::core::policy_hooks::placement().host_role(database, role, on)?;
+            Ok(format!("role \"{role}\" of \"{database}\" {} this shard", if on { "is hosted on" } else { "is no longer hosted on" }))
+        }
+        ShardAdmin::Fence { lo, hi } => {
+            ownership::fence(lo, hi)?;
+            Ok(format!("blocks [{lo:#x}, {hi:#x}) fenced: their writes are refused until UNFENCE"))
+        }
+        ShardAdmin::Unfence { lo, hi } => {
+            ownership::unfence(lo, hi)?;
+            Ok(format!("blocks [{lo:#x}, {hi:#x}) unfenced"))
+        }
+        ShardAdmin::Take { lo, hi } => {
+            // A placement policy may forbid this shard the range (§4.10).
+            let shard = map_state::current().map_or(0, |s| s.shard_id);
+            crate::core::policy_hooks::placement().may_place(lo, hi, shard, &[])?;
+            // Incoming first, so the copy's stamps pass the guard as soon
+            // as the spans open.
+            ownership::add_incoming(lo, hi)?;
+            let n = spans(lo, hi, true).await?;
+            Ok(format!("blocks [{lo:#x}, {hi:#x}) taken in {n} partitioned tables; incoming until the map gives them here"))
+        }
+        ShardAdmin::Give { lo, hi } => {
+            // Ownership first: nothing stamps there from now on, and only
+            // then do the spans close.
+            ownership::give_up(lo, hi)?;
+            let n = spans(lo, hi, false).await?;
+            Ok(format!("blocks [{lo:#x}, {hi:#x}) given up in {n} partitioned tables; their rows stay until retired"))
+        }
+        ShardAdmin::MapInstall { ref text, ref signature } => {
+            let Some(served) = map_state::current() else {
+                return Err("this node is not a shard (--role shard)".to_string());
+            };
+            let map = rasterizeddb_router::ShardMap::from_text(text)?;
+            let signature = signature
+                .as_deref()
+                .map(|h| crate::core::shard::signing::parse_hex(h.trim()))
+                .transpose()
+                .map_err(|e| format!("the signature: {e}"))?;
+            crate::core::shard::signing::check(&map, signature.as_deref())?;
+            if map.cluster_id() != served.map.cluster_id() {
+                return Err(format!("the map is for cluster {:032x}, this shard is in {:032x}", map.cluster_id(), served.map.cluster_id()));
+            }
+            if map.shard(served.shard_id).is_none() {
+                return Err(format!("the map has no shard {}", served.shard_id));
+            }
+            // Every range the map gives this shard must be one a placement
+            // policy lets it hold: a forged or stale map is refused here.
+            for (lo, hi) in map.ranges_of(served.shard_id) {
+                crate::core::policy_hooks::placement().may_place(lo, hi, served.shard_id, &[])?;
+            }
+            if map.epoch() <= served.map.epoch() {
+                return Err(format!("the map is at epoch {}, this shard is already at {}", map.epoch(), served.map.epoch()));
+            }
+            let dir = database.location.clone().ok_or("the shard has no data directory")?;
+            let dir = std::path::Path::new(&dir);
+            start::check_epoch(dir, &map)?;
+            start::record_epoch(dir, map.epoch(), map.digest())?;
+            ownership::adopt_map(map.ranges_of(served.shard_id), map.epoch())?;
+            let epoch = map.epoch();
+            map_state::install(map, served.shard_id, signature);
+            Ok(format!("cluster map epoch {epoch} installed"))
+        }
+    }
+}
+
+#[cfg(not(feature = "sharding"))]
+async fn shard_admin(_database: &Arc<Database>, _admin: &ShardAdmin) -> Result<String, String> {
+    Err("SHARD statements need a server built with the sharding feature".to_string())
+}
+
+/// `SHOW SCHEMA FINGERPRINT t`.
+#[cfg(feature = "sharding")]
+fn schema_fingerprint(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
+    let relation = database.relation(name).ok_or_else(|| format!("relation `{}` does not exist", name))?;
+    let fp = crate::core::shard::ddl::fingerprint(relation.schema());
+    let epoch = crate::core::shard::rshard::SCHEMA_EPOCH.load(Ordering::Acquire);
+    Ok(vec![row(&[Cell::Text(name.to_string()), Cell::Text(format!("{fp:032x}")), Cell::Number(epoch)])])
+}
+
+#[cfg(not(feature = "sharding"))]
+fn schema_fingerprint(_database: &Arc<Database>, _name: &str) -> Result<Vec<Row>, String> {
+    Err("SHOW SCHEMA FINGERPRINT needs a server built with the sharding feature".to_string())
+}
+
+/// `SHOW SHARD LOAD`: every materialized partition's level-0 block range and
+/// size. `statements` is 0 until per-range statement counters exist; the
+/// balancer then weighs bytes alone.
+async fn shard_load(database: &Arc<Database>) -> Result<Vec<Row>, String> {
+    let mut names: Vec<String> = table_names(database).into_iter().filter(|n| !n.starts_with("__")).collect();
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        let Some(Relation::Partitioned(table)) = database.relation(&name) else {
+            continue;
+        };
+        let infos = table.partitions().await.map_err(|e| e.to_string())?;
+        for p in infos.into_iter().filter(|p| p.state == "materialized") {
+            let lo_block = p.lo >> 16;
+            let hi_block = ((p.hi + 0xFFFF) >> 16) as u64;
+            out.push(row(&[
+                Cell::Text(name.clone()),
+                Cell::Number(p.pid as u64),
+                Cell::Text(format!("{lo_block:#x}")),
+                Cell::Text(format!("{hi_block:#x}")),
+                Cell::Number(p.slots),
+                Cell::Number(p.bytes),
+                Cell::Number(0),
+            ]));
+        }
+    }
+    Ok(out)
+}
+
+/// `SHOW SHARDS`: the served cluster map, one row per shard.
+#[cfg(feature = "sharding")]
+fn shards() -> Vec<Row> {
+    let Some(served) = crate::core::shard::map_state::current() else {
+        return Vec::new();
+    };
+    let map = &served.map;
+    map.shards()
+        .iter()
+        .map(|s| {
+            let ranges = map.ranges_of(s.id);
+            row(&[
+                Cell::Number(s.id as u64),
+                Cell::Flag(s.id == served.shard_id),
+                Cell::Text(s.addr.clone()),
+                Cell::Text(s.standbys.join(",")),
+                Cell::Number(ranges.len() as u64),
+                Cell::Number(ranges.iter().map(|(lo, hi)| hi - lo).sum()),
+                Cell::Number(map.epoch()),
+                Cell::Text(format!("{:032x}", map.cluster_id())),
+                Cell::Text(format!("{:016x}", map.digest())),
+            ])
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "sharding"))]
+fn shards() -> Vec<Row> {
+    Vec::new()
+}
+
 async fn partitions(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
     let table = match database.relation(name) {
         None => return Err(format!("relation `{}` does not exist", name)),
@@ -2588,6 +3090,33 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         help: "seconds a partition goes without a routed access before it closes; 0 turns idle close off",
     },
     ConfigKey {
+        section: "shard",
+        key: "schema_epoch",
+        hot: true,
+        set_with: "SET CONFIG shard.schema_epoch = 2",
+        options: "",
+        help: "the schema epoch a shard classifies statements under; cluster DDL raises it on every shard once their \
+               fingerprints agree, and gateways drop templates of older epochs; never goes down",
+    },
+    ConfigKey {
+        section: "shard",
+        key: "ddl_fence",
+        hot: true,
+        set_with: "SET CONFIG shard.ddl_fence = 'orders,items'",
+        options: "",
+        help: "tables a cluster DDL is changing: statements touching them are refused with a retryable 40001 until \
+               rdb-shard ddl lifts it (''), so none reads one shard's new schema and another's old",
+    },
+    ConfigKey {
+        section: "partition",
+        key: "resident_budget",
+        hot: true,
+        set_with: "SET CONFIG partition.resident_budget = 0",
+        options: "",
+        help: "estimated bytes open partitions may hold in memory, across tables; past it an open closes idle ones first, \
+               before the count budget is reached; 0 bounds them by count alone",
+    },
+    ConfigKey {
         section: "index_snapshot",
         key: "idle_checkpoint_secs",
         hot: true,
@@ -2650,6 +3179,14 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         set_with: "SET CONFIG index_snapshot.audit_rate = 64",
         options: "",
         help: "1 in this many index loads is checked against a copy read from rows in the background; 0 checks none",
+    },
+    ConfigKey {
+        section: "roles",
+        key: "create_database_roles",
+        hot: true,
+        set_with: "SET CONFIG roles.create_database_roles = owner",
+        options: "owner|all",
+        help: "which roles CREATE DATABASE gives the new database: its creator and its OWNER (owner), or every role of the default database with its verifier (all)",
     },
 ];
 
@@ -2744,9 +3281,15 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             ("auto_compact", "dead_fraction") => crate::auto_compact_dead_fraction().to_string(),
             ("auto_compact", "dead_fraction_max_slots") => crate::auto_compact_dead_fraction_max_slots().to_string(),
             ("auto_compact", "cooldown_secs") => crate::auto_compact_cooldown_secs().to_string(),
+            ("roles", "create_database_roles") => crate::auth::create_database_roles().to_string(),
             ("partition", "open_budget") => crate::core::partition::budget::process_figures().0.to_string(),
             ("partition", "max_open") => crate::core::partition::budget::settings::max_open().to_string(),
             ("partition", "idle_close_secs") => crate::core::partition::budget::settings::idle_close_secs().to_string(),
+            ("partition", "resident_budget") => crate::core::partition::budget::settings::resident_budget().to_string(),
+            #[cfg(feature = "sharding")]
+            ("shard", "schema_epoch") => crate::core::shard::rshard::SCHEMA_EPOCH.load(Ordering::Acquire).to_string(),
+            #[cfg(feature = "sharding")]
+            ("shard", "ddl_fence") => crate::core::shard::ddl::fence(),
             ("index_snapshot", "idle_checkpoint_secs") => {
                 crate::core::index_store::seal::settings::idle_checkpoint_secs().to_string()
             }
@@ -3077,12 +3620,26 @@ async fn set_config_in(database: Option<&Arc<Database>>, key: &str, value: &str)
 /// database's: what a session's `SET CONFIG` saves, and what a start applies
 /// from the settings file ([`apply_saved_hot_keys`]). `replication.*` and
 /// `vacuum.enabled` act on an open database and are neither.
-const PROCESS_WIDE_SECTIONS: &[&str] = &["wal", "filter", "query_stats", "auto_compact", "partition", "index_snapshot"];
+const PROCESS_WIDE_SECTIONS: &[&str] = &["wal", "filter", "query_stats", "auto_compact", "partition", "index_snapshot", "shard", "roles"];
 
 /// Sets one process-wide hot key. Synchronous, so that a start can apply the
 /// saved ones before its runtime exists.
 fn set_process_wide(key: &str, section: &str, name: &str, value: &str) -> Result<String, String> {
     match section {
+        "roles" => match name {
+            "create_database_roles" => {
+                crate::auth::set_create_database_roles(value)?;
+                Ok(format!(
+                    "CREATE DATABASE now gives the new database {}",
+                    if crate::auth::create_database_roles() == "all" {
+                        "every role of the default database"
+                    } else {
+                        "its creator and its OWNER"
+                    }
+                ))
+            }
+            _ => Err(format!("`{}` has no live setter", key)),
+        },
         "wal" => match name {
             "synchronous_commit" => {
                 let on = crate::parse_synchronous_commit(value).ok_or_else(|| {
@@ -3215,6 +3772,20 @@ fn set_process_wide(key: &str, section: &str, name: &str, value: &str) -> Result
             };
             Ok(format!("{key} is now {now}"))
         }
+        #[cfg(feature = "sharding")]
+        "shard" if name == "ddl_fence" => {
+            crate::core::shard::ddl::set_fence(value.trim().trim_matches('\''));
+            return Ok(format!("{key} is now '{}'", crate::core::shard::ddl::fence()));
+        }
+        #[cfg(feature = "sharding")]
+        "shard" if name == "schema_epoch" => {
+            let n: u64 = value.trim().parse().map_err(|_| format!("`{}` is not a whole number for {}", value, key))?;
+            let was = crate::core::shard::rshard::SCHEMA_EPOCH.fetch_max(n, Ordering::AcqRel);
+            if n < was {
+                return Err(format!("{key} is {was}; an epoch never goes down"));
+            }
+            return Ok(format!("{key} is now {n}"));
+        }
         "partition" => {
             use crate::core::partition::budget::settings;
             let n: u64 = value
@@ -3235,6 +3806,7 @@ fn set_process_wide(key: &str, section: &str, name: &str, value: &str) -> Result
                     });
                 }
                 "idle_close_secs" => settings::set_idle_close_secs(n),
+                "resident_budget" => settings::set_resident_budget(n),
                 _ => return Err(format!("`{}` has no live setter", key)),
             }
             Ok(format!("{key} is now {n}"))
@@ -3492,7 +4064,7 @@ fn reset_query_stats() -> Result<String, String> {
 /// Two of these are only ever constructed by the statement-statistics rows, so
 /// a build without that feature has them declared and unused.
 #[cfg_attr(not(feature = "query_stats"), allow(dead_code))]
-enum Cell {
+pub(crate) enum Cell {
     Text(String),
     Number(u64),
     Flag(bool),
@@ -3503,9 +4075,14 @@ enum Cell {
     /// A signed 64-bit integer, for the one figure here that is a hash rather
     /// than a count and so uses the whole range including the negative half.
     Signed(i64),
+    /// Raw bytes, sent as `bytea` (the broker's message keys and values).
+    Bytes(Vec<u8>),
+    Null,
 }
 
-fn row(cells: &[Cell]) -> Row {
+/// One result row of cells; shared with the other surfaces that answer SQL
+/// with rows of their own (the broker's `BROKER` statements).
+pub(crate) fn row(cells: &[Cell]) -> Row {
     let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
     for (index, cell) in cells.iter().enumerate() {
         let (bytes, column_type): (Vec<u8>, DbType) = match cell {
@@ -3517,6 +4094,8 @@ fn row(cells: &[Cell]) -> Row {
             Cell::Flag(b) => (vec![u8::from(*b)], DbType::BOOL),
             Cell::Real(v) => (v.to_le_bytes().to_vec(), DbType::F64),
             Cell::Signed(v) => (v.to_le_bytes().to_vec(), DbType::I64),
+            Cell::Bytes(b) => (b.clone(), DbType::BYTEA),
+            Cell::Null => (Vec::new(), DbType::NULL),
         };
         let mut block = MEMORY_POOL.acquire(bytes.len());
         block.into_slice_mut().copy_from_slice(&bytes);
@@ -3546,7 +4125,7 @@ fn percent(part: u64, whole: u64) -> f64 {
     part as f64 * 100.0 / whole as f64
 }
 
-fn rows(rows: Vec<Row>) -> Vec<u8> {
+pub(crate) fn rows(rows: Vec<Row>) -> Vec<u8> {
     let mut out = vec![2u8];
     for row in &rows {
         row.extend_serialized(&mut out);
@@ -3554,7 +4133,7 @@ fn rows(rows: Vec<Row>) -> Vec<u8> {
     out
 }
 
-fn failure(message: &str) -> Vec<u8> {
+pub(crate) fn failure(message: &str) -> Vec<u8> {
     let mut out = vec![3u8];
     out.extend_from_slice(message.as_bytes());
     out
@@ -4183,5 +4762,46 @@ mod tests {
             let fields = result_fields(&statement).expect("described");
             assert!(!fields.is_empty(), "{:?} describes no columns", statement);
         }
+    }
+}
+
+#[cfg(test)]
+mod shard_hold_tests {
+    use super::*;
+
+    fn admin(sql: &str) -> Result<ShardAdmin, String> {
+        match parse(sql).expect("an introspection statement") {
+            Ok(Introspect::ShardAdmin(a)) => Ok(a),
+            Ok(other) => panic!("{sql}: {other:?}"),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[test]
+    fn hold_and_release_commits_are_read() {
+        assert_eq!(admin("SHARD HOLD COMMITS 3000"), Ok(ShardAdmin::HoldCommits { ms: 3000 }));
+        assert_eq!(admin("shard hold commits 5000;"), Ok(ShardAdmin::HoldCommits { ms: 5000 }));
+        assert_eq!(admin("SHARD RELEASE COMMITS"), Ok(ShardAdmin::ReleaseCommits));
+        // Capped: a tool that dies must not hold decisions for long.
+        assert!(admin("SHARD HOLD COMMITS 5001").is_err());
+        assert!(admin("SHARD HOLD COMMITS 0").is_err());
+        assert!(admin("SHARD HOLD COMMITS").is_err());
+        assert!(admin("SHARD HOLD COMMITS soon").is_err());
+    }
+
+    #[test]
+    fn host_role_is_read() {
+        assert_eq!(
+            admin("SHARD HOST ROLE 'acme' 'acme_app'"),
+            Ok(ShardAdmin::HostRole { database: "acme".into(), role: "acme_app".into(), on: true })
+        );
+        assert_eq!(
+            admin("shard unhost role 'it''s' 'r';"),
+            Ok(ShardAdmin::HostRole { database: "it's".into(), role: "r".into(), on: false })
+        );
+        assert!(admin("SHARD HOST ROLE 'acme'").is_err());
+        assert!(admin("SHARD HOST ROLE 'acme' 'a' 'b'").is_err());
+        assert!(admin("SHARD HOST ROLE '' 'a'").is_err());
+        assert!(admin("SHARD HOST ROLE 'acme' 'a' extra").is_err());
     }
 }

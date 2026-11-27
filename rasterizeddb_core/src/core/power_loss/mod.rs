@@ -100,6 +100,8 @@ pub(crate) fn dir_synced_by<'a>(tag: &str, path: &'a Path) -> Option<&'a Path> {
     match tag {
         "dir" => path.parent(),
         "partition_dir" => Some(path),
+        // `broker::sync_dir` notes the directory itself.
+        "broker.dir" => Some(path),
         _ => None,
     }
 }
@@ -113,6 +115,10 @@ pub(crate) const SYNC_TAGS: &[(&str, bool)] = &[
     ("unlink", false),
     ("file.data", true),
     ("wal.log", true),
+    // The shard's Raft store (`shard::raft_store`): its log, and a file it
+    // replaces whole (hard state, snapshot) before the rename.
+    ("raft.log", true),
+    ("raft.replace", true),
     ("wal.lsn_mark", true),
     ("wal.txn_mark", true),
     ("wal.truncate", true),
@@ -153,4 +159,8 @@ pub(crate) const SYNC_TAGS: &[(&str, bool)] = &[
     // `index_store::file_gate::copy_files`: a RENAME's or MOVE's copy of
     // `.ixm` and `.ixs` under the target's stem, then a directory sync.
     ("index_store.carry", true),
+    // `broker::sync_file`: a segment, or the metadata or a subscription log.
+    ("broker.file", true),
+    // `broker::sync_dir`: a directory sync that notes the directory itself.
+    ("broker.dir", false),
 ];

@@ -19,6 +19,7 @@
 //! the answer can be made the same, and refused where it cannot — never
 //! answered differently in silence. See [`translate`] for the details.
 
+pub(crate) mod accounts;
 pub(crate) mod admin;
 pub(crate) mod conn;
 pub(crate) mod fulltext;

@@ -1,0 +1,14 @@
+[package]
+name = "rasterizeddb_router"
+version = "1.0.0"
+edition = "2024"
+description = "RasterizedDB's routing function (route_v1) and shard map, shared by the engine, the client and the gateway"
+repository = "https://github.com/milen-denev/rasterizeddb"
+license = "GPL-3.0-only"
+authors = ["Milen Denev"]
+keywords = ["rasterizeddb", "sharding", "partitioning", "routing"]
+categories = ["database"]
+
+# No dependencies on purpose: the client and the gateway link this, and every
+# byte of a route must come from code in this crate.
+[dependencies]

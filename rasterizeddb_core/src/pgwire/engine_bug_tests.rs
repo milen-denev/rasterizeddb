@@ -750,12 +750,13 @@ async fn a_correlated_subquery_in_a_grouped_select_answers_as_postgresql_does() 
         .await
         .expect_err("refused");
     assert_eq!(sqlstate_of(&e), "0A000", "{e}");
-    // Refused, not guessed: ordered by the value without selecting it
-    // (PostgreSQL: 3, NULL, 2, 1), which a grouped join cannot.
-    let e = rows(&db, &mut s, "SELECT k FROM gt GROUP BY k ORDER BY (SELECT max(v) FROM gu WHERE gu.k = gt.k) NULLS FIRST, k")
-        .await
-        .expect_err("refused");
-    assert_eq!(sqlstate_of(&e), "0A000", "{e}");
+    // Ordered by the value without selecting it: computed beside the key
+    // over a derived table (`distinct_on::rewrite_grouped_order`), where a
+    // grouped join alone refused it. PostgreSQL's answer.
+    assert_eq!(
+        one(&db, &mut s, "SELECT k FROM gt GROUP BY k ORDER BY (SELECT max(v) FROM gu WHERE gu.k = gt.k) NULLS FIRST, k").await,
+        vec![r(&[Some("3")]), r(&[None]), r(&[Some("2")]), r(&[Some("1")])]
+    );
     // Refused, not guessed: an aggregate compared with the value in one
     // HAVING term (PostgreSQL: (1,2),(2,1),(3,1),(NULL,1)).
     let e = rows(
@@ -766,6 +767,44 @@ async fn a_correlated_subquery_in_a_grouped_select_answers_as_postgresql_does() 
     .await
     .expect_err("refused");
     assert_eq!(sqlstate_of(&e), "0A000", "{e}");
+}
+
+/// A grouped query sorted by an aggregate its select list has under a cast
+/// alone is answered as written, over both protocols. The Rust ORM selects
+/// `CAST(SUM("amount") AS BIGINT)` (a type the native protocol decodes) and
+/// sorts by the bare `SUM("amount")`; the fold always sorted that by the
+/// item. The rewrite for a sort term the list does not hold
+/// (`distinct_on::rewrite_grouped_order`) judged by whole expressions, made
+/// the statement a derived table, and the native protocol refused the
+/// engine's own text ("WITH (a CTE) and FROM (SELECT …) … are not supported
+/// over the native protocol yet").
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sort_by_an_aggregate_selected_under_a_cast_is_answered_as_written() {
+    use super::correlated_subquery_tests::native_rows;
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE gsale (id BIGINT NOT NULL PRIMARY KEY, region TEXT NOT NULL, amount BIGINT NOT NULL)").await;
+    ok(&db, &mut s, "INSERT INTO gsale VALUES (1, 'north', 10), (2, 'north', 20), (3, 'east', -3), (4, 'east', 2), (5, 'west', 7), (6, 'south', 1), (7, 'south', 3)")
+        .await;
+    let want = vec![
+        r(&[Some("north"), Some("2"), Some("30")]),
+        r(&[Some("south"), Some("2"), Some("4")]),
+        r(&[Some("east"), Some("2"), Some("-1")]),
+    ];
+    for sql in [
+        "SELECT \"region\", COUNT(*), CAST(SUM(\"amount\") AS BIGINT) FROM \"gsale\" GROUP BY \"region\" HAVING COUNT(*) >= 2 ORDER BY SUM(\"amount\") DESC",
+        "SELECT region, count(*), sum(amount)::bigint AS total FROM gsale GROUP BY region HAVING count(*) >= 2 ORDER BY sum(amount) DESC",
+    ] {
+        assert_eq!(crate::core::rql::distinct_on::rewrite_grouped_order(sql), None, "{sql}");
+        assert_eq!(one(&db, &mut s, sql).await, want, "{sql}");
+        assert_eq!(native_rows(&db, sql).await, want, "{sql}");
+    }
+    // Sorted by an aggregate the list does not hold: computed beside the
+    // items, over pgwire (a derived table, which native does not have).
+    assert_eq!(
+        one(&db, &mut s, "SELECT region FROM gsale GROUP BY region ORDER BY sum(amount) DESC").await,
+        vec![r(&[Some("north")]), r(&[Some("west")]), r(&[Some("south")]), r(&[Some("east")])]
+    );
 }
 
 /// `x [NOT] BETWEEN … AND …` with a constant NULL bound, and `BETWEEN
@@ -1766,4 +1805,40 @@ async fn composite_foreign_key_dependencies() {
     })
     .await
     .expect("bounded");
+}
+
+/// denevcloud-df, 2026-11-26: over a join, an aggregate of a `NUMERIC(p,6)`
+/// column read through a cast or an expression (`SUM(b.q)::text`,
+/// `(SUM(b.q)+0)`, `MAX(b.q)::text`) came back a thousand times too small,
+/// with no error: the synthetic column the expression reads was typed at the
+/// engine's nine places, while the fold produced the column's six. A lone
+/// `SUM(b.q)`, the same cast on one table, and the subquery form were right.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aggregate_cast_over_a_join_keeps_the_column_scale() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE sc_o (id INT PRIMARY KEY, v NUMERIC(19,6) NOT NULL)").await;
+    ok(&db, &mut s, "CREATE TABLE sc_b (id INT PRIMARY KEY, oid INT NOT NULL, q NUMERIC(19,6) NOT NULL)").await;
+    ok(&db, &mut s, "INSERT INTO sc_o VALUES (1, 10), (2, 1.5)").await;
+    ok(&db, &mut s, "INSERT INTO sc_b VALUES (1, 1, 2), (2, 1, 3), (3, 2, 0.25)").await;
+    let num = |v: &Option<String>| v.as_deref().unwrap_or("NULL").parse::<f64>().unwrap_or(f64::NAN);
+    let got = one(
+        &db,
+        &mut s,
+        "SELECT SUM(b.q), SUM(b.q)::text, CAST(SUM(b.q) AS text), (SUM(b.q)+0)::text, MAX(b.q)::text, \
+         SUM(o.v)::text, SUM(b.q)::numeric(19,6)::text FROM sc_b b INNER JOIN sc_o o ON o.id = b.oid",
+    )
+    .await;
+    let want = [5.25, 5.25, 5.25, 5.25, 3.0, 21.5, 5.25];
+    let values: Vec<f64> = got[0].iter().map(num).collect();
+    assert_eq!(values, want, "{got:?}");
+
+    let grouped = one(
+        &db,
+        &mut s,
+        "SELECT o.id, SUM(b.q)::text, MAX(o.v)::text FROM sc_b b JOIN sc_o o ON o.id = b.oid GROUP BY o.id ORDER BY o.id",
+    )
+    .await;
+    let grouped: Vec<Vec<f64>> = grouped.iter().map(|r| r.iter().map(num).collect()).collect();
+    assert_eq!(grouped, vec![vec![1.0, 5.0, 10.0], vec![2.0, 0.25, 1.5]]);
 }

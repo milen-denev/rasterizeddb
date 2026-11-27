@@ -68,3 +68,55 @@ async fn a_function_call_in_where_is_evaluated() {
         assert_eq!(got, want, "{sql}");
     }
 }
+
+/// A grouped query sorted by an aggregate, or a grouping key, that its
+/// select list does not hold, as PostgreSQL sorts one: computed beside the
+/// items over a derived table (`distinct_on::rewrite_grouped_order`). It was
+/// refused, "ORDER BY term 'count(*)' is not in the SELECT list" (42601).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grouped_query_sorts_by_what_it_does_not_select() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    pool.execute(sqlx::raw_sql(
+        "CREATE TABLE g (id INT NOT NULL PRIMARY KEY, k TEXT NOT NULL, n INT);
+         CREATE TABLE gl (k TEXT NOT NULL PRIMARY KEY, label TEXT);
+         INSERT INTO g VALUES (1, 'a', 5), (2, 'b', 1), (3, 'b', 2), (4, 'c', 9), (5, 'b', NULL), (6, 'a', 1);
+         INSERT INTO gl VALUES ('a', 'Alpha'), ('b', 'Beta'), ('c', 'Gamma');",
+    ))
+    .await
+    .expect("schema");
+    let rows = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::raw_sql(sql)
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .iter()
+                .map(|r| (0..r.len()).map(|i| r.try_get_unchecked::<Option<String>, _>(i).unwrap().unwrap_or_else(|| "NULL".into())).collect::<Vec<_>>().join("|"))
+                .collect::<Vec<String>>()
+        }
+    };
+    assert_eq!(rows("SELECT k FROM g GROUP BY k ORDER BY count(*) DESC").await, ["b", "a", "c"]);
+    assert_eq!(rows("SELECT k FROM g GROUP BY k ORDER BY count(*) DESC LIMIT 1").await, ["b"]);
+    assert_eq!(rows("SELECT k FROM g GROUP BY k ORDER BY sum(n) DESC NULLS LAST, k LIMIT 2 OFFSET 1").await, ["a", "b"]);
+    assert_eq!(rows("SELECT k, count(*) AS c FROM g GROUP BY k ORDER BY max(id)").await, ["c|1", "b|3", "a|2"]);
+    assert_eq!(rows("SELECT count(*) FROM g GROUP BY k ORDER BY k DESC").await, ["1", "3", "2"]);
+    assert_eq!(rows("SELECT upper(k) AS u FROM g GROUP BY k HAVING count(*) > 1 ORDER BY min(n) NULLS FIRST, u").await, ["A", "B"]);
+    assert_eq!(
+        rows("SELECT gl.label FROM g JOIN gl ON g.k = gl.k GROUP BY gl.label ORDER BY count(*) DESC, gl.label").await,
+        ["Beta", "Alpha", "Gamma"]
+    );
+    assert_eq!(rows("WITH w AS (SELECT k, n FROM g WHERE n IS NOT NULL) SELECT k FROM w GROUP BY k ORDER BY sum(n)").await, ["b", "a", "c"]);
+    // One whose every sort term is an item is answered as it was.
+    assert_eq!(rows("SELECT k, count(*) FROM g GROUP BY k ORDER BY count(*) DESC, k").await, ["b|3", "a|2", "c|1"]);
+    // And so is one sorted by an aggregate the list has under a cast alone
+    // (the Rust ORM's `CAST(SUM(x) AS BIGINT)` selected, `SUM(x)` sorted
+    // by, with a HAVING): left as written, no derived table.
+    assert_eq!(
+        rows("SELECT k, CAST(SUM(n) AS BIGINT) FROM g GROUP BY k HAVING COUNT(*) >= 2 ORDER BY SUM(n) DESC").await,
+        ["a|6", "b|3"]
+    );
+    assert_eq!(rows("SELECT k, sum(n)::bigint AS s FROM g GROUP BY k ORDER BY sum(n) DESC NULLS LAST, k").await, ["c|9", "a|6", "b|3"]);
+}
+

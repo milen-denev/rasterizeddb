@@ -375,6 +375,12 @@ pub(crate) struct Wire {
     pub(crate) spid: u16,
     /// Reply bytes already cut into packets, for [`Wire::mark`].
     sent: usize,
+    /// Where the packet being filled starts, counted over the whole reply:
+    /// packets end every `packet_size - 8` bytes from here.
+    origin: usize,
+    /// Where a packet ends early ([`Wire::commit`]), counted over the whole
+    /// reply, in order.
+    breaks: std::collections::VecDeque<usize>,
     /// The largest message accepted: small until the client has logged in.
     pub(crate) max_message: usize,
 }
@@ -394,8 +400,27 @@ impl Wire {
             packet_id: 1,
             spid: 0,
             sent: 0,
+            origin: 0,
+            breaks: std::collections::VecDeque::new(),
             max_message: MAX_LOGIN_MESSAGE,
         }
+    }
+
+    /// Where the reply buffer's bytes fall in the reply's packets
+    /// ([`Frame`]): for a value written to it now.
+    pub(crate) fn frame(&self) -> Frame {
+        Frame { base: self.sent, origin: self.origin, body: self.packet_size - 8, breaks: Vec::new() }
+    }
+
+    /// Keeps what the values written with `frame` asked of the packets: the
+    /// places one ends early. Not called for values taken back out of the
+    /// reply (a row that could not be encoded).
+    pub(crate) fn commit(&mut self, frame: Frame) {
+        if frame.breaks.is_empty() {
+            return;
+        }
+        self.origin = frame.origin;
+        self.breaks.extend(frame.breaks);
     }
 
     /// Where the next reply byte will be, counted over the whole reply.
@@ -413,6 +438,17 @@ impl Wire {
             }
             _ => false,
         }
+    }
+
+    /// Gives the reply's last token, a DONE of some kind still unsent, its
+    /// MORE bit, so that tokens may follow it; `false` when it is not there.
+    pub(crate) fn reopen_last_done(&mut self) -> bool {
+        let Some(at) = self.reply.len().checked_sub(13) else { return false };
+        if !matches!(self.reply[at], TOKEN_DONE | TOKEN_DONEPROC | TOKEN_DONEINPROC) {
+            return false;
+        }
+        self.reply[at + 1] |= DONE_MORE as u8;
+        true
     }
 
     async fn fill(&mut self, want: usize) -> io::Result<()> {
@@ -516,18 +552,14 @@ impl Wire {
     }
 
     /// Cuts the reply built so far into packets; `last` marks the end of
-    /// the message. Full packets are always cut; a partial one only at the
-    /// end.
+    /// the message. A packet is cut when it is full or ends early at a break
+    /// ([`Wire::commit`]); a partial one only at the end.
     fn packetize(&mut self, kind: u8, last: bool) {
         let body = self.packet_size - 8;
-        let mut start = 0usize;
         let reply = std::mem::take(&mut self.reply);
-        while reply.len() - start > body
-            || (last && start < reply.len())
-            || (last && reply.is_empty() && start == 0)
-        {
-            let end = (start + body).min(reply.len());
-            let eom = last && end == reply.len();
+        let cuts = packet_cuts(reply.len(), self.sent, body, &mut self.breaks, last);
+        let mut start = 0usize;
+        for (end, eom) in cuts {
             let len = (end - start + 8) as u16;
             self.out
                 .extend_from_slice(&[kind, if eom { ST_EOM } else { 0 }]);
@@ -538,9 +570,6 @@ impl Wire {
             self.packet_id = self.packet_id.wrapping_add(1);
             self.out.extend_from_slice(&reply[start..end]);
             start = end;
-            if eom {
-                break;
-            }
         }
         self.sent += start;
         self.reply = reply[start..].to_vec();
@@ -578,6 +607,8 @@ impl Wire {
     pub(crate) async fn send(&mut self, kind: u8) -> io::Result<()> {
         self.packetize(kind, true);
         self.sent = 0;
+        self.origin = 0;
+        self.breaks.clear();
         self.packet_id = 1;
         self.write_packets().await?;
         if self.out.capacity() > 1024 * 1024 {
@@ -588,6 +619,39 @@ impl Wire {
         }
         self.stream.flush().await
     }
+}
+
+/// Where the packets of a reply buffer of `len` bytes end, and whether each
+/// ends the message: the buffer starts `sent` bytes into the reply, a
+/// packet holds `body` bytes, and `breaks` (over the whole reply, in order;
+/// those used are taken) end one early. Not `last`: only whole packets, a
+/// full one kept back while nothing follows it (it may be the message's
+/// last). `last`: everything, the final packet marked; an empty reply is
+/// one empty packet.
+fn packet_cuts(len: usize, sent: usize, body: usize, breaks: &mut std::collections::VecDeque<usize>, last: bool) -> Vec<(usize, bool)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    loop {
+        // A break at or before this packet's start ends nothing.
+        while breaks.front().is_some_and(|b| *b <= sent + start) {
+            breaks.pop_front();
+        }
+        let full = start + body;
+        let early = breaks.front().map(|b| b - sent).filter(|b| *b <= len && *b < full);
+        let end = match early {
+            Some(end) => end,
+            None if len - start > body => full,
+            None if last && (start < len || (len == 0 && start == 0)) => len,
+            None => break,
+        };
+        let eom = last && end == len;
+        out.push((end, eom));
+        start = end;
+        if eom {
+            break;
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -738,6 +802,104 @@ pub(crate) struct Login {
     pub(crate) integrated: bool,
     pub(crate) wants_features: bool,
     pub(crate) read_only_intent: bool,
+    /// The client asked for session recovery (FEATUREEXT 0x01): `Some`,
+    /// holding what a reconnecting client says the session was.
+    pub(crate) recovery: Option<Recovery>,
+}
+
+/// SESSIONRECOVERY's feature id in FEATUREEXT and FEATUREEXTACK.
+pub(crate) const FEATURE_SESSION_RECOVERY: u8 = 0x01;
+
+/// The one session state this server keeps on the client ([`session_state`]):
+/// its id, under SqlClient's limit of 71.
+pub(crate) const STATE_OPTIONS: u8 = 70;
+
+/// What a client reconnecting a broken connection says its session was
+/// (SESSIONRECOVERY's data in LOGIN7); empty on a first login.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Recovery {
+    /// The database the session was in, when not the login's.
+    pub(crate) database: Option<String>,
+    /// [`STATE_OPTIONS`] as last told.
+    pub(crate) options: Option<u8>,
+}
+
+/// LOGIN7's FEATUREEXT block, read for session recovery; `None` when the
+/// client did not ask for it. Anything malformed reads as a first login.
+fn login_recovery(p: &[u8]) -> Option<Recovery> {
+    let u16_at = |at: usize| p.get(at..at + 2).map(|b| u16::from_le_bytes(b.try_into().unwrap()) as usize);
+    let u32_at = |at: usize| p.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+    // ibExtension points at a DWORD: where the feature list starts.
+    let mut at = u32_at(u16_at(56)?)?;
+    loop {
+        let id = *p.get(at)?;
+        if id == 0xff {
+            return None;
+        }
+        let len = u32_at(at + 1)?;
+        let data = p.get(at + 5..at + 5 + len)?;
+        if id == FEATURE_SESSION_RECOVERY {
+            return Some(recovery_data(data).unwrap_or_default());
+        }
+        at += 5 + len;
+    }
+}
+
+/// `InitSessionRecoveryData` then `SessionRecoveryDataToBe`: each a length,
+/// a database, a collation, a language and the states.
+fn recovery_data(data: &[u8]) -> Option<Recovery> {
+    if data.is_empty() {
+        return Some(Recovery::default());
+    }
+    let mut out = Recovery::default();
+    let mut r = Reader::new(data);
+    for current in [false, true] {
+        let len = r.u32().ok()? as usize;
+        let mut block = Reader::new(r.bytes(len).ok()?);
+        let chars = block.u8().ok()? as usize;
+        let database = block.utf16(chars).ok()?;
+        let collation = block.u8().ok()? as usize;
+        block.bytes(collation).ok()?;
+        let language = block.u8().ok()? as usize;
+        block.bytes(language * 2).ok()?;
+        // The database it started in, then the one it moved to.
+        if !database.is_empty() {
+            out.database = Some(database);
+        }
+        while block.remaining() > 0 {
+            let id = block.u8().ok()?;
+            let len = match block.u8().ok()? {
+                0xff => block.u32().ok()? as usize,
+                n => n as usize,
+            };
+            let value = block.bytes(len).ok()?;
+            if id == STATE_OPTIONS && current {
+                out.options = value.first().copied();
+            }
+        }
+    }
+    Some(out)
+}
+
+/// FEATUREEXTACK: session recovery acknowledged (with no state of the
+/// server's to begin from), or nothing.
+pub(crate) fn feature_ext_ack(out: &mut Vec<u8>, recovery: bool) {
+    out.push(0xae);
+    if recovery {
+        out.push(FEATURE_SESSION_RECOVERY);
+        out.extend_from_slice(&0u32.to_le_bytes());
+    }
+    out.push(0xff);
+}
+
+/// SESSIONSTATE: [`STATE_OPTIONS`] as it now is, and whether the session
+/// could be made again from it on a new connection.
+pub(crate) fn session_state(out: &mut Vec<u8>, seq: u32, recoverable: bool, options: u8) {
+    out.push(0xe4);
+    out.extend_from_slice(&8u32.to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.push(u8::from(recoverable));
+    out.extend_from_slice(&[STATE_OPTIONS, 1, options]);
 }
 
 pub(crate) fn parse_login7(p: &[u8]) -> io::Result<Login> {
@@ -786,6 +948,7 @@ pub(crate) fn parse_login7(p: &[u8]) -> io::Result<Login> {
         integrated: flags2 & 0x80 != 0,
         wants_features: flags3 & 0x10 != 0,
         read_only_intent: type_flags & 0x20 != 0,
+        recovery: if flags3 & 0x10 != 0 { login_recovery(p) } else { None },
     })
 }
 
@@ -919,6 +1082,7 @@ pub(crate) fn return_value(
     name: &str,
     oid: u32,
     value: Option<&[u8]>,
+    frame: &mut Frame,
 ) {
     let ty = column_type(oid, -1).unwrap_or_else(|| {
         let (int, frac) = value
@@ -938,9 +1102,11 @@ pub(crate) fn return_value(
     out.extend_from_slice(&0u16.to_le_bytes());
     type_info(out, &ty);
     let at = out.len();
-    if put_value(out, &ty, value).is_err() {
+    // (A value that cannot be written is NULL; a `max` one asks for no
+    // packet to end before it fails.)
+    if put_value(out, &ty, value, frame).is_err() {
         out.truncate(at);
-        let _ = put_value(out, &ty, None);
+        let _ = put_value(out, &ty, None, frame);
     }
 }
 
@@ -974,6 +1140,9 @@ pub(crate) struct Column {
     pub(crate) ty: ColType,
     /// The engine's type, for reading its text.
     pub(crate) oid: u32,
+    /// A table's identity column (COLMETADATA's fIdentity): SqlBulkCopy
+    /// leaves it out unless KeepIdentity, as SQL Server generates it.
+    pub(crate) identity: bool,
 }
 
 /// The column an engine column is sent as. Numeric with no declared scale
@@ -981,6 +1150,8 @@ pub(crate) struct Column {
 pub(crate) fn column_type(oid: u32, typmod: i32) -> Option<ColType> {
     Some(match oid {
         16 => ColType::Bit,
+        // The engine's unsigned byte (`db_type::U8_TYPMOD`): a tinyint.
+        20 if typmod == crate::core::db_type::U8_TYPMOD => ColType::Int(1),
         21 => ColType::Int(2),
         23 | 26 => ColType::Int(4),
         20 => ColType::Int(8),
@@ -1012,9 +1183,12 @@ pub(crate) fn col_metadata(out: &mut Vec<u8>, columns: &[Column]) {
     out.extend_from_slice(&(columns.len() as u16).to_le_bytes());
     for c in columns {
         out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&0x0009u16.to_le_bytes());
+        // fNullable | read/write; an identity column fIdentity, not null.
+        let flags: u16 = if c.identity { 0x0018 } else { 0x0009 };
+        out.extend_from_slice(&flags.to_le_bytes());
         type_info(out, &c.ty);
-        put_b_varchar(out, &c.name);
+        // A bracketed alias keeps its dots (`lex::NAME_DOT`).
+        put_b_varchar(out, &super::lex::decode_dots(&c.name));
     }
 }
 
@@ -1040,9 +1214,12 @@ pub(crate) fn type_info(out: &mut Vec<u8>, ty: &ColType) {
             out.extend_from_slice(&0xffffu16.to_le_bytes());
         }
         ColType::Date => out.push(0x28),
-        ColType::DateTime2 => out.extend_from_slice(&[0x2a, 6]),
-        ColType::DateTimeOffset => out.extend_from_slice(&[0x2b, 6]),
-        ColType::Time => out.extend_from_slice(&[0x29, 6]),
+        // Scale 7, SQL Server's default: 100 ns units, which a
+        // `datetime2(7)`'s kept seventh digit fills (`__rdb_t7_text`); the
+        // engine's six digits have a 0 there.
+        ColType::DateTime2 => out.extend_from_slice(&[0x2a, 7]),
+        ColType::DateTimeOffset => out.extend_from_slice(&[0x2b, 7]),
+        ColType::Time => out.extend_from_slice(&[0x29, 7]),
         ColType::Guid => out.extend_from_slice(&[0x24, 16]),
     }
 }
@@ -1089,6 +1266,8 @@ fn parse_date(s: &str) -> Option<(i64, u32, u32)> {
 }
 
 /// `HH:MM:SS[.ffffff]` as microseconds.
+/// A time's text as 100 ns units since midnight (seven fractional
+/// digits; more are cut).
 fn parse_time_micros(s: &str) -> Option<u64> {
     let mut parts = s.splitn(3, ':');
     let h: u64 = parts.next()?.parse().ok()?;
@@ -1099,14 +1278,14 @@ fn parse_time_micros(s: &str) -> Option<u64> {
     let digits: String = frac
         .chars()
         .take_while(|c| c.is_ascii_digit())
-        .take(6)
+        .take(7)
         .collect();
-    let micros: u64 = if digits.is_empty() {
+    let ticks: u64 = if digits.is_empty() {
         0
     } else {
-        format!("{:0<6}", digits).parse().ok()?
+        format!("{:0<7}", digits).parse().ok()?
     };
-    Some(((h * 60 + m) * 60 + sec) * 1_000_000 + micros)
+    Some(((h * 60 + m) * 60 + sec) * 10_000_000 + ticks)
 }
 
 /// A time zone suffix (`+02`, `-05:30`) split off a time.
@@ -1159,20 +1338,79 @@ pub(crate) fn decimal_shape(text: &str) -> (usize, usize) {
     (int.trim_start_matches('0').len().max(1), frac.len())
 }
 
-fn put_time(out: &mut Vec<u8>, micros: u64) {
-    // Scale 6: units of microseconds, five bytes.
-    out.extend_from_slice(&micros.to_le_bytes()[..5]);
+fn put_time(out: &mut Vec<u8>, ticks: u64) {
+    // Scale 7: units of 100 ns, five bytes.
+    out.extend_from_slice(&ticks.to_le_bytes()[..5]);
 }
 
 fn put_days(out: &mut Vec<u8>, days: i64) {
     out.extend_from_slice(&(days as u32).to_le_bytes()[..3]);
 }
 
-fn put_plp(out: &mut Vec<u8>, data: &[u8]) {
+/// Where a reply's bytes fall in its packets, for a value written to the
+/// reply buffer: the reply bytes already cut into packets before the buffer
+/// (`base`), where the packet being filled starts (`origin`, counted over
+/// the whole reply), a packet's payload size, and the places the value asks
+/// for a packet to end early (`breaks`, over the whole reply; given to
+/// [`Wire::commit`]). [`Frame::none`] for a value not sent in packets.
+#[derive(Clone, Debug)]
+pub(crate) struct Frame {
+    base: usize,
+    origin: usize,
+    body: usize,
+    breaks: Vec<usize>,
+}
+
+impl Frame {
+    #[cfg(test)]
+    pub(crate) fn none() -> Frame {
+        Frame { base: 0, origin: 0, body: usize::MAX, breaks: Vec::new() }
+    }
+
+    /// The bytes from position `at` of the buffer to the end of the packet
+    /// that position is in: a whole packet's when it opens one.
+    fn room(&self, at: usize) -> usize {
+        if self.body == usize::MAX { usize::MAX } else { self.body - (self.base + at - self.origin) % self.body }
+    }
+
+    /// Ends the packet at position `at` of the buffer: the next one starts
+    /// there.
+    fn break_at(&mut self, at: usize) {
+        self.origin = self.base + at;
+        self.breaks.push(self.origin);
+    }
+}
+
+/// A `max` value (PLP): its length, its data in chunks, a terminator.
+///
+/// Laid out for Microsoft.Data.SqlClient's reader, which fails on two
+/// things that are valid TDS (found by replaying one captured response to
+/// SqlClient 6.1.1 and 7.1.0 in every layout and at every alignment):
+///
+/// - a chunk whose data runs into the next packet: each chunk here ends
+///   where its packet ends;
+/// - a chunk length in the last four bytes of a packet, with its data (or
+///   part of itself) in the next: where fewer than five bytes are left the
+///   packet is ended there, short, and the length opens the next one.
+///
+/// With either, a `SELECT *` over a table with `nvarchar(max)` columns
+/// threw ArgumentOutOfRangeException in `TryReadPlpLength` after a few
+/// hundred rows whenever packets reached the client back to back (without
+/// TLS, where each packet is not a record of its own), or the client
+/// waited for ever. One chunk for the whole value is what this sent.
+fn put_plp(out: &mut Vec<u8>, data: &[u8], frame: &mut Frame) {
     out.extend_from_slice(&(data.len() as u64).to_le_bytes());
-    if !data.is_empty() {
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(data);
+    let mut rest = data;
+    while !rest.is_empty() {
+        let mut room = frame.room(out.len());
+        if room <= 4 {
+            frame.break_at(out.len());
+            room = frame.room(out.len());
+        }
+        let take = rest.len().min(room - 4).min(u32::MAX as usize);
+        out.extend_from_slice(&(take as u32).to_le_bytes());
+        out.extend_from_slice(&rest[..take]);
+        rest = &rest[take..];
     }
     out.extend_from_slice(&0u32.to_le_bytes());
 }
@@ -1198,6 +1436,7 @@ pub(crate) fn put_value(
     out: &mut Vec<u8>,
     ty: &ColType,
     value: Option<&[u8]>,
+    frame: &mut Frame,
 ) -> Result<(), String> {
     let Some(value) = value else {
         match ty {
@@ -1263,10 +1502,10 @@ pub(crate) fn put_value(
                     out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
                     out.extend_from_slice(&bytes);
                 }
-                None => put_plp(out, &bytes),
+                None => put_plp(out, &bytes, frame),
             }
         }
-        ColType::VarBinaryMax => put_plp(out, &decode_bytea_text(value)),
+        ColType::VarBinaryMax => put_plp(out, &decode_bytea_text(value), frame),
         ColType::Date => {
             let (y, m, d) = parse_date(text()?).ok_or_else(|| bad("the date"))?;
             out.push(3);
@@ -1289,8 +1528,8 @@ pub(crate) fn put_value(
             let local = parse_time_micros(time).ok_or_else(|| bad("the time"))? as i64;
             // Stored in UTC, with the offset beside it.
             let mut days = tds_days(y, m, d);
-            let mut utc = local - offset as i64 * 60_000_000;
-            const DAY: i64 = 86_400_000_000;
+            let mut utc = local - offset as i64 * 600_000_000;
+            const DAY: i64 = 864_000_000_000;
             while utc < 0 {
                 utc += DAY;
                 days -= 1;
@@ -1882,6 +2121,47 @@ pub(crate) fn read_params(r: &mut Reader<'_>) -> io::Result<Vec<Param>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_recovery_data_is_read() {
+        let name = |s: &str| {
+            let mut out = vec![s.encode_utf16().count() as u8];
+            out.extend(s.encode_utf16().flat_map(|u| u.to_le_bytes()));
+            out
+        };
+        // A first login: the feature asked for, with nothing to recover.
+        assert_eq!(recovery_data(&[]), Some(Recovery::default()));
+        // A reconnect: started in `app` with one state, moved to `Other`
+        // with the options state set.
+        let mut initial = name("app");
+        initial.extend([5, 9, 4, 0, 2, 0]);
+        initial.extend(name("us_english"));
+        initial.extend([3, 2, 0xaa, 0xbb]);
+        let mut current = name("Other");
+        current.push(0);
+        current.push(0);
+        current.extend([STATE_OPTIONS, 1, 0b101]);
+        let mut data = Vec::new();
+        for block in [&initial, &current] {
+            data.extend((block.len() as u32).to_le_bytes());
+            data.extend(block.iter());
+        }
+        assert_eq!(recovery_data(&data), Some(Recovery { database: Some("Other".into()), options: Some(0b101) }));
+        // Still in the database it started in.
+        let mut current = vec![0u8, 0, 0];
+        current.extend([STATE_OPTIONS, 1, 1]);
+        let mut data = Vec::new();
+        for block in [&initial, &current] {
+            data.extend((block.len() as u32).to_le_bytes());
+            data.extend(block.iter());
+        }
+        assert_eq!(recovery_data(&data), Some(Recovery { database: Some("app".into()), options: Some(1) }));
+        // Cut short: read as a first login by the caller.
+        assert_eq!(recovery_data(&data[..data.len() - 2]), None);
+        let mut out = Vec::new();
+        session_state(&mut out, 3, false, 0b10);
+        assert_eq!(out, [0xe4, 8, 0, 0, 0, 3, 0, 0, 0, 0, STATE_OPTIONS, 1, 0b10]);
+    }
+
     use super::*;
 
     #[test]
@@ -1958,7 +2238,7 @@ mod tests {
     #[test]
     fn values_encode() {
         let mut out = Vec::new();
-        put_value(&mut out, &ColType::Int(4), Some(b"-2")).unwrap();
+        put_value(&mut out, &ColType::Int(4), Some(b"-2"), &mut Frame::none()).unwrap();
         assert_eq!(out, vec![4, 0xfe, 0xff, 0xff, 0xff]);
         let mut out = Vec::new();
         put_value(
@@ -1968,6 +2248,7 @@ mod tests {
                 scale: 2,
             },
             Some(b"19.99"),
+            &mut Frame::none(),
         )
         .unwrap();
         assert_eq!(out, vec![9, 1, 0xcf, 0x07, 0, 0, 0, 0, 0, 0]);
@@ -1976,11 +2257,153 @@ mod tests {
             &mut out,
             &ColType::Guid,
             Some(b"00112233-4455-6677-8899-aabbccddeeff"),
+            &mut Frame::none(),
         )
         .unwrap();
         assert_eq!(
             out[..9],
             [16, 0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66]
         );
+    }
+
+    /// The chunks of the `max` value at `at` of a reply laid out in
+    /// `packets` (the reply offsets each ends at): its data, having checked
+    /// that every chunk's length and data are in one packet together.
+    fn read_plp(reply: &[u8], at: &mut usize, packets: &[usize], what: &str) -> Option<Vec<u8>> {
+        let packet_end = |pos: usize| *packets.iter().find(|end| **end > pos).expect("a packet for every byte");
+        let total = u64::from_le_bytes(reply[*at..*at + 8].try_into().unwrap());
+        *at += 8;
+        if total == u64::MAX {
+            return None;
+        }
+        let mut data = Vec::new();
+        loop {
+            let chunk = u32::from_le_bytes(reply[*at..*at + 4].try_into().unwrap()) as usize;
+            if chunk == 0 {
+                *at += 4;
+                break;
+            }
+            let end = packet_end(*at);
+            assert!(*at + 4 < end, "{what}: a chunk length at {at} ends its packet (which ends at {end})");
+            assert!(*at + 4 + chunk <= end, "{what}: a chunk of {chunk} at {at} runs past its packet (which ends at {end})");
+            data.extend_from_slice(&reply[*at + 4..*at + 4 + chunk]);
+            *at += 4 + chunk;
+        }
+        assert_eq!(data.len() as u64, total, "{what}");
+        Some(data)
+    }
+
+    /// A `max` value's chunks: the value whole when it is not sent in
+    /// packets; in packets, wherever the value starts and whatever its
+    /// length, no chunk's data past the packet it starts in and no chunk
+    /// length alone at a packet's end (the packet ends early instead), the
+    /// chunks together being the value.
+    #[test]
+    fn a_max_value_s_chunks_stay_in_their_packets() {
+        let mut out = Vec::new();
+        put_value(&mut out, &ColType::NVarChar(None), Some(b"ab"), &mut Frame::none()).unwrap();
+        assert_eq!(out, [4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, b'a', 0, b'b', 0, 0, 0, 0, 0]);
+        let mut out = Vec::new();
+        put_value(&mut out, &ColType::NVarChar(None), Some(b""), &mut Frame::none()).unwrap();
+        assert_eq!(out, [0u8; 12]);
+        let mut out = Vec::new();
+        put_value(&mut out, &ColType::NVarChar(None), None, &mut Frame::none()).unwrap();
+        assert_eq!(out, [0xffu8; 8]);
+
+        for body in [20usize, 61, 504, 4088, 7992] {
+            for start in (0..=24).chain([body - 13, body - 12, body - 11, body - 9, body - 8, body - 5, body - 4, body - 1, body, body + 3]) {
+                for len in [0usize, 1, 2, 3, body / 2 - 6, body / 2 - 5, body - 13, body - 12, body, 2 * body + 1, 5 * body + 3] {
+                    let what = format!("body {body} start {start} len {len}");
+                    let text: String = (0..len).map(|k| char::from(b'a' + (k % 26) as u8)).collect();
+                    let mut frame = Frame { base: 0, origin: 0, body, breaks: Vec::new() };
+                    let mut reply = vec![0xee; start];
+                    put_value(&mut reply, &ColType::NVarChar(None), Some(text.as_bytes()), &mut frame).unwrap();
+                    reply.extend_from_slice(&[0xee; 3]);
+                    let mut breaks: std::collections::VecDeque<usize> = frame.breaks.iter().copied().collect();
+                    let packets: Vec<usize> = packet_cuts(reply.len(), 0, body, &mut breaks, true).iter().map(|(end, _)| *end).collect();
+                    assert_eq!(packets.last(), Some(&reply.len()), "{what}");
+                    let mut from = 0;
+                    for end in &packets {
+                        assert!(end - from <= body && (*end > from || reply.is_empty()), "{what}: a packet of {} bytes", end - from);
+                        from = *end;
+                    }
+                    let mut at = start;
+                    assert_eq!(read_plp(&reply, &mut at, &packets, &what), Some(utf16_bytes(&text)), "{what}");
+                    assert_eq!(at + 3, reply.len(), "{what}");
+                }
+            }
+        }
+    }
+
+    /// A reply of many rows with `max` values, cut into packets as it is
+    /// built (a flush every so often, the last at the end, as `Wire` cuts
+    /// one): the packets together are the reply, none is larger than a
+    /// packet, and every value reads back with its chunks inside packets.
+    #[test]
+    fn a_reply_s_packets_keep_every_max_value_s_chunks_whole() {
+        for body in [61usize, 504, 7992] {
+            for seed in 0..6u64 {
+                // What `Wire` keeps: the buffer, the bytes cut before it,
+                // the packet being filled, the breaks not yet cut.
+                let (mut reply, mut sent, mut origin) = (Vec::<u8>::new(), 0usize, 0usize);
+                let mut breaks = std::collections::VecDeque::new();
+                let mut whole = Vec::<u8>::new();
+                let mut ends = Vec::<usize>::new();
+                let mut values: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
+                let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+                let mut next = |n: u64| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state % n
+                };
+                let mut cut = |reply: &mut Vec<u8>, sent: &mut usize, breaks: &mut std::collections::VecDeque<usize>, whole: &mut Vec<u8>, last: bool| {
+                    let mut from = 0;
+                    for (end, eom) in packet_cuts(reply.len(), *sent, body, breaks, last) {
+                        assert!(end - from <= body);
+                        whole.extend_from_slice(&reply[from..end]);
+                        ends.push(*sent + end);
+                        assert_eq!(eom, last && end == reply.len());
+                        from = end;
+                    }
+                    *sent += from;
+                    reply.drain(..from);
+                };
+                for row in 0..400u64 {
+                    let mut frame = Frame { base: sent, origin, body, breaks: Vec::new() };
+                    reply.push(0xd1);
+                    for column in 0..4 {
+                        // A fixed column of one to nine bytes, then a max one.
+                        let fixed = 1 + next(9) as usize;
+                        reply.extend(std::iter::repeat_n(0xab, fixed));
+                        let value = match next(9) {
+                            0 => None,
+                            1 => Some(String::new()),
+                            2 => Some("x".repeat(next(4) as usize)),
+                            3 | 4 => Some("y".repeat(body / 2 - 8 + next(8) as usize)),
+                            5 => Some("z".repeat(2 * body + next(body as u64) as usize)),
+                            _ => Some("w".repeat(next(60) as usize)),
+                        };
+                        values.push((sent + reply.len(), value.as_ref().map(|v| utf16_bytes(v))));
+                        put_value(&mut reply, &ColType::NVarChar(None), value.as_ref().map(|v| v.as_bytes()), &mut frame).unwrap();
+                        let _ = (row, column);
+                    }
+                    if !frame.breaks.is_empty() {
+                        origin = frame.origin;
+                        breaks.extend(frame.breaks);
+                    }
+                    if reply.len() > 3 * body && next(3) == 0 {
+                        cut(&mut reply, &mut sent, &mut breaks, &mut whole, false);
+                    }
+                }
+                cut(&mut reply, &mut sent, &mut breaks, &mut whole, true);
+                assert!(reply.is_empty() && breaks.is_empty());
+                assert_eq!(ends.last(), Some(&whole.len()));
+                for (at, value) in &values {
+                    let mut at = *at;
+                    assert_eq!(read_plp(&whole, &mut at, &ends, &format!("body {body} seed {seed}")), *value);
+                }
+            }
+        }
     }
 }

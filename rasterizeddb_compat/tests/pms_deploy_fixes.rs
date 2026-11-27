@@ -4,8 +4,9 @@
 //! Every one failed before: a transaction dropping a child then its parent, a
 //! correlated reference in an inner join's `ON` inside `EXISTS`, a window
 //! beside such a subquery, `make_interval` over a column, a parenthesised
-//! cast as a `DEFAULT`, an alias written without `AS`, and `SHOW TABLES`
-//! naming a composite key.
+//! cast as a `DEFAULT`, an alias written without `AS`, `SHOW TABLES`
+//! naming a composite key, `GROUP BY 1` over a join, a statement with
+//! more than 32,767 bound parameters, and a JSON path written `ARRAY[…]`.
 
 use rasterizeddb_compat::TestServer;
 use sqlx::{AssertSqlSafe, Row};
@@ -248,4 +249,286 @@ async fn show_tables_names_a_composite_primary_key() {
         .map(|r| r.get::<String, _>("primary_key"))
         .expect("zz_pk listed");
     assert_eq!(key, "id, d");
+}
+
+/// `GROUP BY 1` over a join was looked up as a column named `1` ("Column '1'
+/// not found in schema"); on one table it already named the first item.
+#[tokio::test]
+async fn group_by_a_position_or_an_output_name_over_a_join() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE zz_ut (id int PRIMARY KEY, system_key text)").await;
+    run(&pool, "CREATE TABLE zz_utr (id int PRIMARY KEY, table_id int)").await;
+    run(&pool, "INSERT INTO zz_ut VALUES (1, 'a'), (2, 'b')").await;
+    run(&pool, "INSERT INTO zz_utr VALUES (1, 1), (2, 1), (3, 2)").await;
+    let counts = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(AssertSqlSafe(sql))
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+                .iter()
+                .map(|r| (r.get::<String, _>(0), r.get::<i64, _>(1)))
+                .collect::<Vec<_>>()
+        }
+    };
+    let want = vec![("a".to_string(), 2), ("b".to_string(), 1)];
+    for sql in [
+        "SELECT t.system_key, count(*) FROM zz_utr r JOIN zz_ut t ON t.id = r.table_id GROUP BY 1 ORDER BY 1",
+        "SELECT t.system_key AS k, count(*) FROM zz_utr r JOIN zz_ut t ON t.id = r.table_id GROUP BY 1 ORDER BY 1",
+        "SELECT t.system_key k, count(*) FROM zz_utr r JOIN zz_ut t ON t.id = r.table_id GROUP BY k ORDER BY k",
+        "SELECT t.system_key, count(*) FROM zz_utr r JOIN zz_ut t ON t.id = r.table_id GROUP BY t.system_key ORDER BY 1",
+    ] {
+        assert_eq!(counts(sql).await, want, "{sql}");
+    }
+    let e = sqlx::query("SELECT t.system_key, count(*) FROM zz_utr r JOIN zz_ut t ON t.id = r.table_id GROUP BY 3")
+        .fetch_all(&pool)
+        .await
+        .expect_err("a position past the select list");
+    let db = e.as_database_error().expect("a server error");
+    assert_eq!(db.code().as_deref(), Some("42P10"), "{e}");
+}
+
+/// A Bind's parameter count is an Int16 that PostgreSQL reads unsigned, up to
+/// 65,535. Read signed, pms's 39,000-parameter companion insert was -26,536
+/// parameters: the server ran out of message and dropped the connection with
+/// nothing in its log, and the client read "expected to read 5 bytes, got 0
+/// bytes at EOF".
+#[tokio::test]
+async fn a_statement_with_more_than_32767_parameters_is_bound() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE zz_wide (id int PRIMARY KEY, v int)").await;
+    let rows = 20_000; // 40,000 parameters
+    let values: Vec<String> = (0..rows).map(|r| format!("(${}, ${})", 2 * r + 1, 2 * r + 2)).collect();
+    let sql = format!("INSERT INTO zz_wide (id, v) VALUES {} ON CONFLICT (id) DO NOTHING", values.join(", "));
+    let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for r in 0..rows {
+        query = query.bind(r).bind(r * 3);
+    }
+    let done = query.execute(&pool).await.unwrap_or_else(|e| panic!("40,000 parameters: {e}"));
+    assert_eq!(done.rows_affected(), rows as u64);
+    let (count, sum): (i64, i64) =
+        sqlx::query_as("SELECT count(*), sum(v)::bigint FROM zz_wide").fetch_one(&pool).await.unwrap();
+    assert_eq!(count, rows as i64);
+    assert_eq!(sum, (0..rows as i64).map(|r| r * 3).sum::<i64>());
+}
+
+/// pms's relation lookups: `data #>> ARRAY['0','related_row_id']` failed in a
+/// `WHERE` ("unexpected character '['"), in a select list ("Column … not
+/// found") and bound over the wire ("function '' is not supported yet"); and
+/// SQL `EXECUTE` put a JSON key in as `CAST('0' AS text)`, which the operator
+/// refused.
+#[tokio::test]
+async fn a_json_path_written_as_an_array_is_read() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE zz_rel (id int PRIMARY KEY, data jsonb)").await;
+    run(
+        &pool,
+        r#"INSERT INTO zz_rel VALUES (1, '[{"related_row_id": "r1"}, {"related_row_id": "r2"}]'), (2, '[{"related_row_id": "r3"}]'), (3, '{"0": {"related_row_id": "k0"}}')"#,
+    )
+    .await;
+    let pairs = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::raw_sql(AssertSqlSafe(sql))
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+                .iter()
+                .map(|r| (r.get::<Option<String>, _>(0), r.get::<Option<String>, _>(1)))
+                .collect::<Vec<_>>()
+        }
+    };
+    let s = |v: &str| Some(v.to_string());
+    // The statement from .7's log, as psql sends it.
+    assert_eq!(
+        pairs(
+            "SELECT data #>> ARRAY['0','related_row_id'] AS self_id, data #>> ARRAY['1','related_row_id'] AS other_id \
+             FROM zz_rel WHERE id < 3 AND data #>> ARRAY['0','related_row_id'] IN ('r1', 'r3') ORDER BY id"
+        )
+        .await,
+        vec![(s("r1"), s("r2")), (s("r3"), None)]
+    );
+    // The path literal evaluates: it matches, and fails to match, for real.
+    assert_eq!(ids(&pool, "SELECT id FROM zz_rel WHERE data #>> '{0,related_row_id}' = 'r1'").await, vec![1]);
+    assert_eq!(ids(&pool, "SELECT id FROM zz_rel WHERE data #>> '{0,related_row_id}' = 'nope'").await, Vec::<i32>::new());
+    // `#>` keeps jsonb; on an object, '0' is a key.
+    assert_eq!(
+        pairs("SELECT (data #> ARRAY['0'])::text, data #>> ARRAY['0', 'related_row_id'] FROM zz_rel WHERE id = 3").await,
+        vec![(s(r#"{"related_row_id": "k0"}"#), s("k0"))]
+    );
+    // Bound over the wire.
+    let v: Option<String> = sqlx::query_scalar("SELECT (data #>> ARRAY[$1, 'related_row_id']) AS v FROM zz_rel WHERE id = 1")
+        .bind("1")
+        .fetch_one(&pool)
+        .await
+        .expect("a bound path element");
+    assert_eq!(v.as_deref(), Some("r2"));
+    // SQL PREPARE with a text key, on one session as a prepared statement is.
+    let mut conn = pool.acquire().await.expect("a connection");
+    sqlx::raw_sql("PREPARE by_key(text) AS SELECT id FROM zz_rel WHERE data -> $1 ->> 'related_row_id' = 'k0'")
+        .execute(&mut *conn)
+        .await
+        .expect("PREPARE");
+    let got: Vec<i32> = sqlx::raw_sql("EXECUTE by_key('0')")
+        .fetch_all(&mut *conn)
+        .await
+        .expect("EXECUTE with a text key")
+        .iter()
+        .map(|r| r.get::<i32, _>(0))
+        .collect();
+    assert_eq!(got, vec![3]);
+}
+
+/// pms's chat router and global search: `title ILIKE ANY($1)` with the
+/// patterns bound as a `text[]`, which failed on every chat message
+/// ("unexpected LPar", "function 'ANY' is not supported yet"); and SeaORM's
+/// `ORDER BY "case"."updated_at"` over a join on a column not selected,
+/// whose quotes were trimmed into `case"."updated_at`.
+#[tokio::test]
+async fn like_any_over_a_bound_array_and_a_quoted_order_by_over_a_join() {
+    let (_s, pool) = server().await;
+    // `updated_at` on both sides, as pms has it: a column two relations
+    // share is renamed in the join's layout, which a quoted term missed.
+    run(&pool, "CREATE TABLE case_model (id int PRIMARY KEY, domain_id int, updated_at int)").await;
+    run(&pool, r#"CREATE TABLE "case" (id int PRIMARY KEY, title text, case_model_id int, updated_at int)"#).await;
+    run(&pool, "INSERT INTO case_model VALUES (1, 7, 5), (2, 8, 6)").await;
+    run(&pool, r#"INSERT INTO "case" VALUES (1, 'Please help', 1, 10), (2, 'test case', 1, 30), (3, 'other', 1, 20), (4, 'Please too', 2, 40)"#).await;
+
+    let patterns = vec!["%please%".to_string(), "%test%".to_string()];
+    let titles: Vec<String> = sqlx::query_scalar(
+        r#"SELECT "case"."title" FROM "case" INNER JOIN "case_model" ON "case"."case_model_id" = "case_model"."id" WHERE "case_model"."domain_id" = $1 AND ("case"."title" ILIKE ANY($2)) ORDER BY "case"."updated_at" DESC LIMIT 16"#,
+    )
+    .bind(7)
+    .bind(&patterns)
+    .fetch_all(&pool)
+    .await
+    .expect("ILIKE ANY over a bound text[]");
+    assert_eq!(titles, vec!["test case".to_string(), "Please help".to_string()]);
+
+    // `NOT … ALL`, `LIKE ANY (ARRAY[…])`, and the empty and NULL arrays.
+    assert_eq!(ids(&pool, r#"SELECT id FROM "case" WHERE title NOT ILIKE ALL(ARRAY['%please%','%test%']) ORDER BY id"#).await, vec![3]);
+    assert_eq!(ids(&pool, r#"SELECT id FROM "case" WHERE title LIKE ANY(ARRAY['%test%','oth%']) ORDER BY id"#).await, vec![2, 3]);
+    assert_eq!(ids(&pool, r#"SELECT id FROM "case" WHERE title ILIKE ANY('{}') ORDER BY id"#).await, Vec::<i32>::new());
+    assert_eq!(ids(&pool, r#"SELECT id FROM "case" WHERE title ILIKE ALL('{}') ORDER BY id"#).await, vec![1, 2, 3, 4]);
+    let empty: Vec<String> = Vec::new();
+    let none: Vec<i32> = sqlx::query_scalar(r#"SELECT id FROM "case" WHERE "case"."title"::text ILIKE ANY($1)"#)
+        .bind(&empty)
+        .fetch_all(&pool)
+        .await
+        .expect("an empty bound array");
+    assert!(none.is_empty());
+
+    // The quoted, qualified ORDER BY over a join, not selected.
+    assert_eq!(
+        ids(&pool, r#"SELECT "case"."id" FROM "case" INNER JOIN "case_model" ON "case"."case_model_id" = "case_model"."id" ORDER BY "case"."updated_at" DESC LIMIT 2"#).await,
+        vec![4, 2]
+    );
+}
+
+/// A JSON path whose elements are columns or expressions, `data #>>
+/// ARRAY[slot, 'rid']`, and the functions it stands for,
+/// `jsonb_extract_path[_text]`. Only a path of constants was read before. As
+/// in PostgreSQL, an element that reads as an integer indexes an array and is
+/// a key of an object, and a NULL element gives NULL.
+#[tokio::test]
+async fn a_json_path_of_columns_and_expressions_is_read() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE zz_dyn (id int PRIMARY KEY, data jsonb, slot text)").await;
+    run(
+        &pool,
+        r#"INSERT INTO zz_dyn VALUES (1, '[{"rid": "a1"}, {"rid": "a2"}]', '1'), (2, '{"0": {"rid": "k0"}, "x": {"rid": "kx"}}', 'x'), (3, '[{"rid": "n"}]', NULL)"#,
+    )
+    .await;
+    let texts = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(AssertSqlSafe(sql))
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+                .iter()
+                .map(|r| r.get::<Option<String>, _>(0))
+                .collect::<Vec<_>>()
+        }
+    };
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(texts("SELECT data #>> ARRAY[slot, 'rid'] FROM zz_dyn ORDER BY id").await, vec![s("a2"), s("kx"), None]);
+    assert_eq!(texts("SELECT data #>> ARRAY[(id - 1)::text, 'rid'] FROM zz_dyn ORDER BY id").await, vec![s("a1"), None, None]);
+    assert_eq!(texts("SELECT jsonb_extract_path_text(data, '0', 'rid') FROM zz_dyn ORDER BY id").await, vec![s("a1"), s("k0"), s("n")]);
+    assert_eq!(ids(&pool, "SELECT id FROM zz_dyn WHERE data #>> ARRAY[slot, 'rid'] = 'kx'").await, vec![2]);
+    let found: Vec<i32> = sqlx::query_scalar("SELECT id FROM zz_dyn WHERE data #>> ARRAY[$1, 'rid'] = $2")
+        .bind("1")
+        .bind("a2")
+        .fetch_all(&pool)
+        .await
+        .expect("a bound element");
+    assert_eq!(found, vec![1]);
+}
+
+/// `percentile_cont` / `percentile_disc … WITHIN GROUP (ORDER BY …)`, as
+/// PostgreSQL answers them: interpolated, or the first value reaching the
+/// fraction, over the ordered non-NULL values; NULL over none.
+#[tokio::test]
+async fn percentiles_within_group() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE zz_pct (id int PRIMARY KEY, g text, v int)").await;
+    run(&pool, "INSERT INTO zz_pct VALUES (1,'a',1),(2,'a',2),(3,'a',3),(4,'a',4),(5,'b',10),(6,'b',NULL),(7,'c',NULL)").await;
+    let row = sqlx::query(
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v), percentile_cont(0.25) WITHIN GROUP (ORDER BY v DESC), \
+         percentile_disc(0.5) WITHIN GROUP (ORDER BY v) FROM zz_pct WHERE g = 'a'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("percentiles");
+    assert_eq!(row.get::<f64, _>(0), 2.5);
+    assert_eq!(row.get::<f64, _>(1), 3.25);
+    assert_eq!(row.get::<i32, _>(2), 2);
+    let medians: Vec<(String, Option<f64>)> = sqlx::query_as(
+        "SELECT g, percentile_cont(0.5) WITHIN GROUP (ORDER BY v) FROM zz_pct GROUP BY g ORDER BY g",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("grouped");
+    assert_eq!(medians, vec![("a".into(), Some(2.5)), ("b".into(), Some(10.0)), ("c".into(), None)]);
+    let e = sqlx::query("SELECT percentile_cont(1.5) WITHIN GROUP (ORDER BY v) FROM zz_pct")
+        .fetch_all(&pool)
+        .await
+        .expect_err("a fraction past 1");
+    assert!(e.to_string().contains("not between 0 and 1"), "{e}");
+
+    // `mode()`: the most frequent value, the first in the order on a tie.
+    run(&pool, "CREATE TABLE zz_mode (id int PRIMARY KEY, k text)").await;
+    run(&pool, "INSERT INTO zz_mode VALUES (1,'x'),(2,'y'),(3,'y'),(4,'x'),(5,NULL)").await;
+    let row = sqlx::query("SELECT mode() WITHIN GROUP (ORDER BY k), mode() WITHIN GROUP (ORDER BY k DESC) FROM zz_mode")
+        .fetch_one(&pool)
+        .await
+        .expect("mode");
+    assert_eq!((row.get::<String, _>(0), row.get::<String, _>(1)), ("x".to_string(), "y".to_string()));
+}
+
+/// EF Core's and SeaORM's spelling: every alias quoted. A correlated EXISTS
+/// whose subquery joins two relations (`"d0"` JOIN `"d1"`) failed with
+/// `column "d0" does not exist` (DenevCloud ERP's product queries over pgwire:
+/// 13 of 31 statements).
+#[tokio::test]
+async fn a_correlated_exists_over_a_join_with_quoted_aliases() {
+    let (_s, pool) = server().await;
+    for sql in [
+        "CREATE TABLE zz_tags (id int PRIMARY KEY, content text)",
+        "CREATE TABLE zz_pt (tagsid int, productsid int)",
+        "CREATE TABLE zz_products (id int PRIMARY KEY, name text)",
+        "INSERT INTO zz_tags VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        "INSERT INTO zz_pt VALUES (1, 10), (2, 11), (3, 10)",
+        "INSERT INTO zz_products VALUES (10, 'p10'), (11, 'p11')",
+    ] {
+        run(&pool, sql).await;
+    }
+    let exists = r#"SELECT "d"."id" FROM zz_tags AS "d" WHERE EXISTS (SELECT 1 FROM zz_pt AS "d0" INNER JOIN zz_products AS "d1" ON "d0"."productsid" = "d1"."id" WHERE "d"."id" = "d0"."tagsid" AND "d1"."id" = 10) ORDER BY "d"."id""#;
+    assert_eq!(ids(&pool, exists).await, vec![1, 3]);
+    let not_exists = r#"SELECT "d"."id" FROM zz_tags AS "d" WHERE NOT EXISTS (SELECT 1 FROM zz_pt AS "d0" INNER JOIN zz_products AS "d1" ON "d0"."productsid" = "d1"."id" WHERE "d"."id" = "d0"."tagsid" AND "d1"."id" = 10) ORDER BY "d"."id""#;
+    assert_eq!(ids(&pool, not_exists).await, vec![2]);
+    // In a derived table, with a correlated scalar subquery beside it (ERP #13).
+    let derived = r#"SELECT "x"."id" FROM (SELECT "d"."id", (SELECT "d1"."name" FROM zz_pt AS "d0" INNER JOIN zz_products AS "d1" ON "d0"."productsid" = "d1"."id" WHERE "d"."id" = "d0"."tagsid" LIMIT 1) AS "c" FROM zz_tags AS "d" WHERE EXISTS (SELECT 1 FROM zz_pt AS "d0" INNER JOIN zz_products AS "d1" ON "d0"."productsid" = "d1"."id" WHERE "d"."id" = "d0"."tagsid" AND "d1"."name" = 'p11') LIMIT 10) AS "x" ORDER BY "x"."id""#;
+    assert_eq!(ids(&pool, derived).await, vec![2]);
 }

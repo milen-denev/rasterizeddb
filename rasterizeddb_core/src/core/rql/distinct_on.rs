@@ -57,6 +57,94 @@ pub(crate) fn rewrite_statement(sql: &str) -> Option<String> {
     rewrite_select(trimmed)
 }
 
+/// A grouped `SELECT` sorted by something that is not in its select list
+/// (an aggregate, a grouping key), over a derived table that computes the
+/// sort term beside the items:
+///
+/// ```sql
+/// SELECT k FROM t GROUP BY k ORDER BY count(*) DESC LIMIT 1
+/// SELECT __don_c0 AS "k" FROM (SELECT k AS __don_c0, count(*) AS __don_k0 FROM t GROUP BY k) __don
+///  ORDER BY __don_k0 DESC LIMIT 1
+/// ```
+///
+/// PostgreSQL and SQL Server both sort a grouped query by any expression
+/// over its groups; the fold here sorts by what it produced, and such a
+/// statement was refused ("ORDER BY term 'count(*)' is not in the SELECT
+/// list", 42601). EF Core writes it for `GroupBy(…).OrderByDescending(g =>
+/// g.Count()).Select(g => g.Key)`.
+///
+/// `None` unless it is that: a `GROUP BY`, an `ORDER BY` with a term no
+/// select item is, no `DISTINCT`, window, `*`, set operation or row lock.
+/// A statement every sort term of which is an item is left as it is, and
+/// so is one sorted by an aggregate its select list has under a cast alone
+/// (`CAST(sum(x) AS bigint)` selected, `sum(x)` sorted by): the fold always
+/// sorted that by the item (`aggregate::resolve_order_label`), and a
+/// statement that was answered is not made a derived table, which the
+/// native protocol refuses. The Rust ORM writes exactly that.
+pub(crate) fn rewrite_grouped_order(sql: &str) -> Option<String> {
+    let has = |word: &[u8]| sql.as_bytes().windows(word.len()).any(|w| w.eq_ignore_ascii_case(word));
+    if !has(b"GROUP") || !has(b"ORDER") {
+        return None;
+    }
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    if crate::core::rql::cte::has_with_clause(trimmed) {
+        let (_, outer) = crate::core::rql::cte::split_with(trimmed).ok()??;
+        let outer = outer.trim();
+        if outer.is_empty() || !trimmed.ends_with(outer) {
+            return None;
+        }
+        let prefix = &trimmed[..trimmed.len() - outer.len()];
+        return Some(format!("{prefix}{}", grouped_order_select(outer)?));
+    }
+    grouped_order_select(trimmed)
+}
+
+fn grouped_order_select(sql: &str) -> Option<String> {
+    let after_select = strip_word(sql, "SELECT")?;
+    if strip_word(after_select, "DISTINCT").is_some() || strip_word(after_select, "ALL").is_some() {
+        return None;
+    }
+    let list_at = sql.len() - after_select.len();
+    let from_at = find_keyword(sql, "FROM", list_at)?;
+    let list = sql[list_at..from_at].trim();
+    for word in ["UNION", "INTERSECT", "EXCEPT", "FOR", "WINDOW"] {
+        if find_keyword(sql, word, from_at).is_some() {
+            return None;
+        }
+    }
+    find_phrase(sql, &["GROUP", "BY"], from_at)?;
+    let order_at = find_phrase(sql, &["ORDER", "BY"], from_at)?;
+    let after_order = phrase_end(sql, order_at, &["ORDER", "BY"]);
+    let tail_at =
+        ["LIMIT", "OFFSET", "FETCH"].iter().filter_map(|w| find_keyword(sql, w, after_order)).min().unwrap_or(sql.len());
+    let (body, order_text, tail) = (&sql[from_at..order_at], &sql[after_order..tail_at], sql[tail_at..].trim());
+    if has_word(list, "OVER") || has_word(order_text, "OVER") {
+        return None;
+    }
+    // `t.system_key k` names its output `k`, which `select_columns` (reading
+    // only `AS`) would miss: a sort by `k` became a term to compute, and the
+    // derived table cannot see the output name — "Column 'k' not found" for
+    // a statement the fold answered. Such a list is left as written.
+    if crate::core::rql::lexer_ct::split_definitions(list).iter().any(|item| may_have_bare_alias(item)) {
+        return None;
+    }
+    let mut columns = select_columns(list)?;
+    let mut order = Vec::new();
+    for raw in crate::core::rql::lexer_ct::split_definitions(order_text) {
+        let (expr, modifiers) = sort_term(&raw)?;
+        let column = match columns.cast_of(expr) {
+            Some(item) => format!("__don_c{item}"),
+            None => columns.resolve(expr)?,
+        };
+        order.push(format!("{column}{modifiers}"));
+    }
+    // Every term an item: the fold sorts by it as it is.
+    if columns.extra.is_empty() {
+        return None;
+    }
+    Some(assemble("SELECT", "SELECT", &columns, body, &order, tail))
+}
+
 fn mentions_distinct(sql: &str) -> bool {
     sql.as_bytes().windows(8).any(|w| w.eq_ignore_ascii_case(b"DISTINCT"))
 }
@@ -182,6 +270,21 @@ fn norm(text: &str) -> String {
     out
 }
 
+/// Whether a select item without `AS` may end in a bare alias
+/// (`t.system_key k`): its last top-level word, after whitespace and outside
+/// quotes, is an identifier. Errs towards yes (`CASE … END`, `x IS NULL`).
+fn may_have_bare_alias(item: &str) -> bool {
+    let (expr, alias) = split_as(item);
+    if alias.is_some() {
+        return false;
+    }
+    let t = expr.trim_end();
+    t.char_indices()
+        .rev()
+        .find(|&(i, c)| c.is_whitespace() && depth_at(t, i) == 0 && !in_quotes(t, i))
+        .is_some_and(|(i, c)| as_identifier(&t[i + c.len_utf8()..]).is_some())
+}
+
 /// PostgreSQL's name for an unaliased item: a window call or a filtered
 /// aggregate is named after its function (`count(*) OVER ()` is `count`), so
 /// the name is figured from the text before a top-level `OVER` or `FILTER`.
@@ -239,6 +342,44 @@ fn depth_at(text: &str, at: usize) -> usize {
     depth
 }
 
+/// What `expr` casts, when it is a cast and nothing more: `CAST(x AS t)`,
+/// `x::t`, in parentheses or not.
+fn cast_operand(expr: &str) -> Option<&str> {
+    let mut t = expr.trim();
+    while t.starts_with('(') && crate::core::rql::expr::matching_paren(t, 0) == Some(t.len() - 1) {
+        t = t[1..t.len() - 1].trim();
+    }
+    if let Some(rest) = strip_word(t, "CAST") {
+        if rest.starts_with('(') && crate::core::rql::expr::matching_paren(rest, 0) == Some(rest.len() - 1) {
+            let inside = &rest[1..rest.len() - 1];
+            let as_at = find_keyword(inside, "AS", 0)?;
+            return Some(inside[..as_at].trim());
+        }
+        return None;
+    }
+    // The last `::` outside parentheses and quotes, a type's name after it.
+    let at = t.rmatch_indices("::").map(|(at, _)| at).find(|at| depth_at(t, *at) == 0 && !in_quotes(t, *at))?;
+    let (inner, ty) = (t[..at].trim(), t[at + 2..].trim());
+    let type_name = !ty.is_empty()
+        && ty.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '"')
+        && ty.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '(' | ')' | ',' | '"' | '[' | ']'));
+    (type_name && !inner.is_empty()).then_some(inner)
+}
+
+/// Whether byte `at` of `text` is inside a quoted string or identifier.
+fn in_quotes(text: &str, at: usize) -> bool {
+    let mut quote: Option<u8> = None;
+    for &c in &text.as_bytes()[..at] {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'\'' || c == b'"' => quote = Some(c),
+            None => {}
+        }
+    }
+    quote.is_some()
+}
+
 struct Item {
     expr: String,
     /// The output name as it is written into the outer select list.
@@ -256,6 +397,22 @@ struct Columns {
 }
 
 impl Columns {
+    /// The select item that is the aggregate call `term` under a cast alone
+    /// (`CAST(sum(x) AS bigint)`, `sum(x)::bigint`), when no item is the
+    /// call itself.
+    fn cast_of(&self, term: &str) -> Option<usize> {
+        let key = norm(term);
+        if self.items.iter().any(|item| norm(&item.expr) == key) {
+            return None;
+        }
+        let open = key.find('(')?;
+        crate::core::rql::aggregate::AggFunc::parse(key[..open].trim())?;
+        if crate::core::rql::expr::matching_paren(&key, open) != Some(key.len() - 1) {
+            return None;
+        }
+        self.items.iter().position(|item| cast_operand(&item.expr).is_some_and(|inner| norm(inner) == key))
+    }
+
     /// The derived table's column a key or sort term reads, or `None` when it
     /// cannot be resolved faithfully (an ordinal out of range, an ambiguous
     /// output name).
@@ -320,7 +477,8 @@ fn sort_term(raw: &str) -> Option<(&str, String)> {
 /// it: the text before it and the word, upper-cased.
 fn last_word(text: &str) -> Option<(&str, String)> {
     let t = text.trim_end();
-    let start = t.rfind(|c: char| !c.is_ascii_alphabetic()).map_or(0, |i| i + 1);
+    // Past the whole character: `+ 1` cut a multibyte one ('Δ', '😀').
+    let start = t.char_indices().rev().find(|&(_, c)| !c.is_ascii_alphabetic()).map_or(0, |(i, c)| i + c.len_utf8());
     let word = &t[start..];
     if word.is_empty() || !t[..start].ends_with(char::is_whitespace) {
         return None;
@@ -536,6 +694,63 @@ mod tests {
         assert_eq!(super::figure_name("coalesce(sum(x) OVER (), 0)"), "coalesce");
         assert_eq!(super::figure_name("t.a"), "a");
         assert_eq!(super::figure_name("a + 1"), "?column?");
+    }
+
+    #[test]
+    fn a_sort_by_an_aggregate_under_a_cast_is_left_to_the_fold() {
+        use super::{cast_operand, rewrite_grouped_order as rw};
+        assert_eq!(cast_operand("CAST(SUM(\"amount\") AS BIGINT)"), Some("SUM(\"amount\")"));
+        assert_eq!(cast_operand("(sum(a.n)::numeric(10, 2))"), Some("sum(a.n)"));
+        assert_eq!(cast_operand("sum(n)::double precision"), Some("sum(n)"));
+        assert_eq!(cast_operand("sum(n) * 2"), None);
+        assert_eq!(cast_operand("sum(n)::int + 1"), None);
+        assert_eq!(cast_operand("CAST(sum(n) AS int) + 1"), None);
+        assert_eq!(cast_operand("concat(k, '::x')"), None);
+        // The ORM's statement, and the same with `::`: as written.
+        for item in ["CAST(SUM(\"amount\") AS BIGINT)", "sum(amount)::bigint AS total"] {
+            let sql = format!("SELECT \"region\", COUNT(*), {item} FROM \"sale\" GROUP BY \"region\" HAVING COUNT(*) >= 2 ORDER BY SUM(\"amount\") DESC");
+            let sql = if item.starts_with("sum") { sql.replace("SUM(\"amount\") DESC", "sum(amount) DESC") } else { sql };
+            assert_eq!(rw(&sql), None, "{sql}");
+        }
+        // Beside a term the list does not hold: that term is computed, and
+        // the aggregate is sorted by its item, as the fold sorts it.
+        assert_eq!(
+            rw("SELECT k, CAST(sum(n) AS bigint) AS s FROM t GROUP BY k ORDER BY sum(n) DESC, count(*)").as_deref(),
+            Some(
+                "SELECT __don_c0 AS \"k\", __don_c1 AS s FROM (SELECT k AS __don_c0, CAST(sum(n) AS bigint) AS __don_c1, count(*) AS __don_k0 FROM t GROUP BY k) __don ORDER BY __don_c1 DESC, __don_k0"
+            )
+        );
+        // Not a cast alone, another aggregate, another argument: computed.
+        for sql in [
+            "SELECT k, sum(n) * -1 AS s FROM t GROUP BY k ORDER BY sum(n)",
+            "SELECT k, CAST(sum(n) AS bigint) FROM t GROUP BY k ORDER BY max(n)",
+            "SELECT k, CAST(sum(n) AS bigint) FROM t GROUP BY k ORDER BY sum(m)",
+            "SELECT k, CAST(sum(n) AS bigint) FROM t GROUP BY k ORDER BY sum(n) + 1",
+        ] {
+            assert!(rw(sql).is_some_and(|text| text.contains("__don_k0")), "{sql}");
+        }
+    }
+
+    /// CI on 8ca6f4e1: `GROUP BY k ORDER BY k` with `k` a bare alias over a
+    /// join failed in the derived table; and a sort term ending in a
+    /// multibyte character panicked.
+    #[test]
+    fn a_bare_alias_and_a_multibyte_term_are_left_alone() {
+        use super::{last_word, may_have_bare_alias, rewrite_grouped_order as rw, sort_term};
+        assert_eq!(
+            rw("SELECT t.system_key k, count(*) FROM zz_utr r JOIN zz_ut t ON t.id = r.table_id GROUP BY k ORDER BY k"),
+            None
+        );
+        assert_eq!(rw("SELECT k kk, count(*) FROM t GROUP BY k ORDER BY max(n)"), None);
+        assert!(may_have_bare_alias("t.system_key k"));
+        assert!(!may_have_bare_alias("t.system_key AS k"));
+        assert!(!may_have_bare_alias("count(*)"));
+        assert!(!may_have_bare_alias("'a b'"));
+        for term in ["'Δ '", "'😀'", "x || 'Δ' DESC", "ñ"] {
+            let _ = sort_term(term);
+            let _ = last_word(term);
+        }
+        assert_eq!(sort_term("x || 'Δ' DESC"), Some(("x || 'Δ'", " DESC".to_string())));
     }
 
     #[test]

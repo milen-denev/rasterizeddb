@@ -15,7 +15,7 @@
 use crate::core::jsonb::Step;
 
 /// A byte span of the stored text.
-type Span = std::ops::Range<usize>;
+pub type Span = std::ops::Range<usize>;
 
 fn malformed(at: usize) -> String {
     format!("invalid input syntax for type json: malformed document at byte {at}")
@@ -170,6 +170,56 @@ pub fn get_path(text: &str, steps: &[Step]) -> Result<Option<Span>, String> {
         at = next;
     }
     Ok(Some(at))
+}
+
+/// The document's elements, when it is an array; `Err` naming what it is
+/// (`"an object"`, `"a scalar"`) otherwise. For `json_array_elements`.
+pub fn array_elements(text: &str) -> Result<Result<Vec<Span>, &'static str>, String> {
+    let span = document(text)?;
+    Ok(match text.as_bytes()[span.start] {
+        b'[' => Ok(elements(text, span)?),
+        b'{' => Err("an object"),
+        _ => Err("a scalar"),
+    })
+}
+
+/// The document's members in the order written, every one of them (a key
+/// written twice is two), when it is an object; `Err` naming what it is
+/// (`"an array"`, `"a scalar"`) otherwise. For `json_each` and
+/// `json_object_keys`.
+pub fn object_members(text: &str) -> Result<Result<Vec<(String, Span)>, &'static str>, String> {
+    let span = document(text)?;
+    let b = text.as_bytes();
+    match b[span.start] {
+        b'{' => {}
+        b'[' => return Ok(Err("an array")),
+        _ => return Ok(Err("a scalar")),
+    }
+    let mut out = Vec::new();
+    let mut i = skip_ws(b, span.start + 1);
+    if b.get(i) == Some(&b'}') {
+        return Ok(Ok(out));
+    }
+    loop {
+        if b.get(i) != Some(&b'"') {
+            return Err(malformed(i));
+        }
+        let key_end = string_end(b, i)?;
+        let name = unescape(text, i..key_end)?;
+        i = skip_ws(b, key_end);
+        if b.get(i) != Some(&b':') {
+            return Err(malformed(i));
+        }
+        i = skip_ws(b, i + 1);
+        let end = value_end(b, i)?;
+        out.push((name, i..end));
+        i = skip_ws(b, end);
+        match b.get(i) {
+            Some(b',') => i = skip_ws(b, i + 1),
+            Some(b'}') => return Ok(Ok(out)),
+            _ => return Err(malformed(i)),
+        }
+    }
 }
 
 /// What `->>` / `#>>` gives for the value at `span`: a string unescaped, a

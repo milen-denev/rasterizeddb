@@ -1,6 +1,8 @@
 pub mod catalog;
 pub mod incompat;
 pub mod index_checkpoint;
+#[cfg(feature = "sharding_2pc")]
+mod prepared;
 #[cfg(test)]
 mod catalogue_present_tests;
 #[cfg(test)]
@@ -293,6 +295,7 @@ impl fmt::Display for NativeListen {
 async fn bind_native_listener(
     listen: &NativeListen,
     authenticator: Option<StdArc<dyn rastcp::session::ServerAuthenticator>>,
+    client_ca: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
 ) -> std::io::Result<TcpServer> {
     const BIND_ATTEMPTS: u32 = 5;
     const BIND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
@@ -319,6 +322,11 @@ async fn bind_native_listener(
         }
         if let Some(authenticator) = authenticator.clone() {
             builder = builder.authenticator(authenticator);
+        }
+        // Certificate login: every caller presents a certificate the client
+        // CA signed, verified in the handshake.
+        if let Some(ca) = client_ca.clone() {
+            builder = builder.client_auth(rastcp::tls::ClientAuth::RequireCa(ca));
         }
 
         match builder.build().await {
@@ -466,6 +474,12 @@ pub(crate) const RENAMED_SUFFIXES: &[&str] = &[
     // `CREATE INDEX` declarations. The indexes themselves are rebuilt in
     // memory at open; this is what says which ones to build.
     "_schema_IDX.db",
+    // Compression dictionaries (`core::compression::sidecar`): a value
+    // compressed with one cannot be read without it.
+    "_schema_ZD.db",
+    // A ledger table's or vault's policy records (`ledger_hooks::policy_sidecar`):
+    // a table that says it is one refuses to open without them.
+    "_schema_LEDGER.db",
     // Derived: the filter rebuilds from the pointers and the sequence from
     // `load_id_sequence`, so a failure to copy either is recoverable. They are
     // copied anyway because copying is cheaper than rebuilding.
@@ -1286,6 +1300,19 @@ fn pool_forget(pool: &StoragePool, table_name: &str) {
 #[cfg(not(feature = "storage_pools"))]
 fn pool_forget(_pool: &StoragePool, _table_name: &str) {}
 
+/// [`pool_forget`] for several tables, the placements file written once
+/// (each forget rewrote and synced it).
+#[cfg(feature = "storage_pools")]
+fn pool_forget_all(pool: &StoragePool, tables: &[String]) {
+    if tables.is_empty() {
+        return;
+    }
+    pool.forget_where(|t| temp_seed(t).is_none() && tables.iter().any(|n| n == t));
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn pool_forget_all(_pool: &StoragePool, _tables: &[String]) {}
+
 /// Forgets every statement-scoped relation's placement, once the open has
 /// reaped their files. Builds before `temp_seed` recorded one per CTE, and
 /// [`pool_forget`] skips these names, since nothing records them now, so
@@ -1554,6 +1581,11 @@ pub struct Database {
     /// port). Built lazily: a database that never uses it allocates nothing.
     #[cfg(feature = "kv_cache")]
     pub kv_cache: crate::core::kv_cache::KvCacheHandle,
+
+    /// The message broker (`BROKER …` statements and the broker ports).
+    /// Opened lazily: a database that never uses it opens nothing.
+    #[cfg(feature = "broker")]
+    pub broker: crate::core::broker::BrokerHandle,
 }
 
 impl Drop for Database {
@@ -1935,6 +1967,21 @@ impl Database {
                 );
                 continue;
             }
+            // A ledger table or vault this process cannot guard stays closed:
+            // opened, its writes would run unguarded (`ledger_hooks`). One
+            // that opens has its chain read first, so the trusted clock is
+            // past every stamp the chain holds before a new row is stamped.
+            if let Err(e) = crate::core::ledger_hooks::check_open(&table.schema) {
+                error!("table '{}' is left unopened: {}", table_name, e);
+                continue;
+            }
+            if table.schema.special.is_special() && !in_memory {
+                crate::core::ledger_hooks::database_opened(location);
+            }
+            // A versioned ledger table keeps every version it ever wrote.
+            if crate::core::ledger_hooks::keeps_versions(&table.schema) {
+                let _ = table.set_vacuum_enabled(false);
+            }
             // A seventeen-byte NUMERIC field in a directory without its
             // fence (a point-in-time restore brings the field records and not
             // the flag): fenced before anything touches the table, so an
@@ -1958,6 +2005,17 @@ impl Database {
                          directory could not be marked for it ({}): {}",
                         table_name,
                         incompat::NUMERIC_OWN_SCALE_V1,
+                        e
+                    );
+                    continue;
+                }
+                // A column that compresses, the same way (`core::compression`).
+                if let Err(e) = incompat::fence_compressed_values(std::path::Path::new(location), &table.schema) {
+                    error!(
+                        "table '{}' is left unopened: it has a column that compresses its values and the \
+                         directory could not be marked for it ({}): {}",
+                        table_name,
+                        incompat::COMPRESSED_VALUES_V1,
                         e
                     );
                     continue;
@@ -2047,6 +2105,13 @@ impl Database {
                 let handle = crate::core::kv_cache::KvCacheHandle::new((!in_memory).then_some(location));
                 handle.load_snapshot_if_present();
                 // Its writes travel on this database's replication stream.
+                handle.attach_replication(replication.clone());
+                handle
+            },
+            #[cfg(feature = "broker")]
+            broker: {
+                let handle = crate::core::broker::BrokerHandle::new((!in_memory).then_some(location), name);
+                // Its effects travel on this database's replication stream.
                 handle.attach_replication(replication.clone());
                 handle
             },
@@ -2271,10 +2336,66 @@ impl Database {
         self.transactions.check_ids_reserved(tx)?;
         self.sync_other_locations()?;
         let mut family = self.family_of(tx);
+        // A shard's Raft group: the write is proposed and applied by a
+        // quorum before it becomes visible here (sharding-plan.md B3).
+        #[cfg(feature = "sharding_raft")]
+        if crate::core::shard::capture::active() {
+            use crate::core::mvcc::TxOutcome;
+            let members: Vec<(crate::core::mvcc::TxId, bool)> = self
+                .transactions
+                .family_of(tx)
+                .into_iter()
+                .map(|id| (id, self.transactions.outcome(id) != TxOutcome::Aborted))
+                .collect();
+            crate::core::shard::raft_apply::propose_commit(self, &members, tx)?;
+        }
+        // A ledger table's chain entry, ahead of the commit and of the
+        // replication record: on failure nothing has been committed.
+        self.ledger_prepare(tx)?;
         // The replication record, ahead of the commit: on failure nothing
         // has been committed, and the caller aborts.
         self.prepare_replication(tx, &mut family)?;
         Ok(self.commit_family(tx, family))
+    }
+
+    /// Where this database's ledger lives, as the ledger hooks key it: its
+    /// directory, or its id for one in memory.
+    pub fn ledger_store(&self) -> String {
+        match self.location.as_deref() {
+            Some(location) => location.to_string(),
+            None => format!("memory:{}", self.id),
+        }
+    }
+
+    /// Whether every ledger table and vault here admits `write`: what a
+    /// statement that destroys or replaces the whole database asks first
+    /// (`DROP DATABASE` a drop, a branch reset or promotion a rewind). They
+    /// asked nothing, and took ledger rows inside their retention, under a
+    /// hold or before their drop-idle time with them.
+    pub(crate) fn admit_every_special(&self, write: crate::core::ledger_hooks::WriteKind<'_>) -> Result<(), String> {
+        for name in self.relation_names() {
+            if let Some(relation) = self.relation(&name) {
+                crate::core::ledger_hooks::admit(relation.schema(), write)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Chains `tx`'s family's ledger rows before it commits
+    /// (`ledger_hooks::prepare_commit`). Nothing without installed hooks,
+    /// and nothing for a family that wrote no ledger table.
+    fn ledger_prepare(&self, tx: crate::core::mvcc::TxId) -> std::io::Result<()> {
+        if !crate::core::ledger_hooks::installed() {
+            return Ok(());
+        }
+        use crate::core::mvcc::TxOutcome;
+        let members: Vec<(crate::core::mvcc::TxId, bool)> = self
+            .transactions
+            .family_of(tx)
+            .into_iter()
+            .map(|id| (id, self.transactions.outcome(id) != TxOutcome::Aborted))
+            .collect();
+        crate::core::ledger_hooks::prepare_commit(&self.ledger_store(), &members).map_err(std::io::Error::other)
     }
 
     /// Commits a transaction with nothing to make durable first.
@@ -2288,6 +2409,12 @@ impl Database {
         // asking afterwards would depend on the manager keeping its parent map
         // past the commit, which it happens to do and is not obliged to.
         let mut family = self.family_of(tx);
+        // A ledger write should not reach here (it commits through
+        // `commit_written_transaction`); if one does, its entry is still
+        // written, and a failure said as loudly as a replication one.
+        if let Err(e) = self.ledger_prepare(tx) {
+            error!("A transaction committed without its ledger entry ({e}); VERIFY LEDGER will report its rows");
+        }
         if let Err(e) = self.prepare_replication(tx, &mut family) {
             self.replication.note_capture_failure(format!(
                 "A transaction committed but could not be written to the replication log ({}); \
@@ -2395,6 +2522,8 @@ impl Database {
 
     /// Ends `tx` without effect and discards what replication buffered for it.
     pub fn abort_transaction(&self, tx: crate::core::mvcc::TxId) {
+        #[cfg(feature = "sharding_raft")]
+        crate::core::shard::capture::discard(self.id, tx);
         // Read before the abort: nothing prunes the parent map today, but
         // relying on that would make this quietly wrong the day something does.
         let family = self.family_of(tx);
@@ -2593,7 +2722,7 @@ impl Database {
     /// reports an error at any point.
     pub async fn drop_table(&self, table_name: &str) -> io::Result<bool> {
         let _changed = SchemaChanged::unless_internal(&self.schema_generation, table_name);
-        self.drop_table_to_depth(table_name, 0).await
+        self.drop_table_to_depth(table_name, 0, true).await
     }
 
     /// `drop_table`, tracking how far into a chain of JSON shadow tables it has
@@ -2603,7 +2732,7 @@ impl Database {
     /// creation by `json_map::MAX_NESTING_DEPTH`, so reaching the cap here means
     /// a sidecar names a shadow that names it back. Stopping is right in that
     /// case — leaking a table is recoverable, recursing forever is not.
-    async fn drop_table_to_depth(&self, table_name: &str, depth: usize) -> io::Result<bool> {
+    async fn drop_table_to_depth(&self, table_name: &str, depth: usize, admit: bool) -> io::Result<bool> {
         // The map key DDL mutates (`resolve_key`): where identifier case
         // folding drops in, so every mutator removes the slot a lookup finds.
         let resolved = self.resolve_key(table_name);
@@ -2624,6 +2753,16 @@ impl Database {
         // map is touched: taking the entry out and putting it back would let
         // a concurrent statement see no table, or a concurrent CREATE of the
         // same name slip in between.
+        // A ledger table or vault is dropped only when its policy admits it
+        // (`ledger_hooks`: its drop-idle time has passed). A JSON shadow
+        // table is its parent's, dropped with it once the parent was admitted.
+        // Not for a table its own block made and now undoes
+        // (`drop_table_for_rollback`): nothing of it ever committed.
+        if admit {
+            if let Some(relation) = self.relation(table_name) {
+                crate::core::ledger_hooks::admit_io(relation.schema(), crate::core::ledger_hooks::WriteKind::Drop)?;
+            }
+        }
         match self.relation(table_name) {
             Some(Relation::Partitioned(_)) => return self.drop_partitioned(table_name).await,
             Some(Relation::Plain(table)) => {
@@ -2787,7 +2926,7 @@ impl Database {
                 }
                 // A shadow can itself hold JSON columns, so this walks the chain.
                 if let Err(e) =
-                    Box::pin(self.drop_table_to_depth(&json.shadow_table, depth + 1)).await
+                    Box::pin(self.drop_table_to_depth(&json.shadow_table, depth + 1, false)).await
                 {
                     // The parent is already gone; failing here would report a
                     // drop that did happen as one that did not.
@@ -2994,6 +3133,9 @@ impl Database {
             .or_else(|| SchemaChanged::unless_internal(&self.schema_generation, new_name));
         if old_name == new_name {
             return Ok(());
+        }
+        if let Some(relation) = self.relation(old_name) {
+            crate::core::ledger_hooks::admit_io(relation.schema(), crate::core::ledger_hooks::WriteKind::Alter("RENAME"))?;
         }
         // §7: under ACCESS EXCLUSIVE on both names, taken in name order by
         // the statement before anything here ran.
@@ -4374,10 +4516,17 @@ impl Database {
         if !own_scale.is_empty() && temp_seed(&create_table.table_name).is_none() {
             self.require_numeric_own_scale()?;
         }
+        if crate::core::rql::type_modifier::declares_compression(&create_table.type_modifiers)
+            && temp_seed(&create_table.table_name).is_none()
+        {
+            self.require_compressed_values()?;
+        }
         if create_table.foreign_keys.iter().any(|fk| fk.is_composite()) && temp_seed(&create_table.table_name).is_none()
         {
             self.require_composite_foreign_keys()?;
         }
+        // A ledger table or vault: the directory is fenced first.
+        self.require_special(create_table.special)?;
         let table_name = &create_table.table_name;
         let columns = std::mem::take(&mut create_table.columns);
 
@@ -4441,6 +4590,10 @@ impl Database {
         if let Err(e) = write_schema_sidecars(table.io_schema.clone(), &mut table.schema, &create_table).await {
             self.abandon_create(table_name, Some(table), intent, pinned).await;
             return Err(e);
+        }
+        // A versioned ledger table keeps every version it ever wrote.
+        if crate::core::ledger_hooks::keeps_versions(&table.schema) {
+            let _ = table.set_vacuum_enabled(false);
         }
         // Every file durable before the catalogue names the table: an image
         // holding any byte of the row then holds them all.
@@ -4519,6 +4672,16 @@ impl Database {
         }
     }
 
+    /// Marks the database as holding compressed column values
+    /// (`incompat::COMPRESSED_VALUES_V1`), before the first record declaring
+    /// a column's compression is written. Nothing to mark in memory.
+    pub(crate) fn require_compressed_values(&self) -> io::Result<()> {
+        match self.location.as_deref() {
+            Some(root) => incompat::require(std::path::Path::new(root), incompat::COMPRESSED_VALUES_V1),
+            None => Ok(()),
+        }
+    }
+
     /// Marks the database as holding composite foreign keys
     /// (`incompat::COMPOSITE_FOREIGN_KEY_V1`) before the first record of one
     /// is written, so a binary that would read one as a one-column key
@@ -4526,6 +4689,22 @@ impl Database {
     pub(crate) fn require_composite_foreign_keys(&self) -> io::Result<()> {
         match self.location.as_deref() {
             Some(root) => incompat::require(std::path::Path::new(root), incompat::COMPOSITE_FOREIGN_KEY_V1),
+            None => Ok(()),
+        }
+    }
+
+    /// Marks the directory as holding a ledger table or vault before the
+    /// first one's files exist (`incompat::LEDGER_V1`/`VAULT_V1`), so a build
+    /// without the guard refuses the directory.
+    pub(crate) fn require_special(&self, kind: crate::core::row::schema::SpecialTable) -> io::Result<()> {
+        use crate::core::row::schema::SpecialTable;
+        let flag = match kind {
+            SpecialTable::None => return Ok(()),
+            SpecialTable::Ledger => incompat::LEDGER_V1,
+            SpecialTable::Vault => incompat::VAULT_V1,
+        };
+        match self.location.as_deref() {
+            Some(root) => incompat::require(std::path::Path::new(root), flag),
             None => Ok(()),
         }
     }
@@ -4836,7 +5015,10 @@ impl Database {
         let credential_exists =
             auth.bootstrap_password.is_some() || crate::auth::has_login_role(&database).await;
 
-        let authenticator = if auth.authenticates() && credential_exists {
+        // Certificate login needs no password anywhere: the certificate is
+        // the credential.
+        let cert_login = auth.method == crate::auth::AuthMethod::Cert;
+        let authenticator = if auth.authenticates() && (credential_exists || cert_login) {
             if let Err(e) = crate::native_auth::seed_roles(&database, &auth).await {
                 return Err(io::Error::other(format!(
                     "could not prepare the role catalogue: {}",
@@ -4909,7 +5091,18 @@ impl Database {
         };
 
         let server = if listen.tcp {
-            let server = Arc::new(bind_native_listener(&listen, authenticator).await?);
+            let client_ca = if cert_login {
+                let path = crate::pgwire::client_cert::ca().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--rdb-auth cert needs --pg-client-ca: the CA client certificates are verified against",
+                    )
+                })?;
+                Some(rastcp::tls::load_certificates(path).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?)
+            } else {
+                None
+            };
+            let server = Arc::new(bind_native_listener(&listen, authenticator, client_ca).await?);
 
             // Ctrl+C and SIGTERM stop the accept loop and let in-flight queries
             // finish, rather than dropping every connection where it stands.
@@ -5163,6 +5356,27 @@ async fn write_schema_sidecars(
     for field in schema.fields.iter_mut().filter(|f| !f.is_deleted) {
         field.set_text_typmod(crate::core::rql::type_modifier::text_typmod_of(&field.name, &schema.type_modifiers));
     }
+    // The dictionaries the compression markers name, into this table's own
+    // sidecar (`compression::sidecar`): a rewrite's new files, a partitioned
+    // table's shell, a copy. They are registered already (trained by the
+    // statement, or read when their table opened); one that is not is left
+    // out, and the column writes without it (`refresh_compression`).
+    {
+        let mut staged: Vec<u32> = Vec::new();
+        for entry in ct.type_modifiers.iter().filter(|m| m.column.starts_with(crate::core::rql::type_modifier::DICTIONARY_MARKER)) {
+            let column = &entry.column[crate::core::rql::type_modifier::DICTIONARY_MARKER.len()..];
+            let Some(id) = crate::core::rql::type_modifier::dictionary_of(column, &ct.type_modifiers) else { continue };
+            if staged.contains(&id) {
+                continue;
+            }
+            if let Some(dictionary) = crate::core::compression::dictionary(id) {
+                crate::core::compression::sidecar::stage(&*io_schema, &mut writes, &dictionary);
+                staged.push(id);
+            }
+        }
+    }
+    // And which columns compress (`core::compression`), for the same reason.
+    schema.refresh_compression();
 
     for entry in &ct.generated {
         if let Err(e) =
@@ -5190,11 +5404,27 @@ async fn write_schema_sidecars(
         }
         schema.json_columns.push(entry.clone());
     }
+    // A ledger table's or vault's policy, with the other records.
+    if ct.special.is_special() {
+        if ct.ledger_policy.is_empty() {
+            return Err(io::Error::other(format!("{}: a special table needs its policy record", schema.name)));
+        }
+        crate::core::ledger_hooks::policy_sidecar::stage(&*io_schema, &mut writes, &ct.ledger_policy);
+    }
     // Every record above as one transaction, one log sync: after a cut all
     // of them or none (`torn_tail::SidecarWrites`).
     if let Err(e) = writes.commit(&*io_schema).await {
         error!("Failed to persist the constraints of {}: {}", schema.name, e);
         return Err(e);
+    }
+    // Then the header says what kind of table this is. Still before the
+    // catalogue row that commits the CREATE: a cut before it leaves files no
+    // catalogue names, and one after leaves a header whose policy is on
+    // disk. Never a ledger table that opens as a plain one.
+    if ct.special.is_special() {
+        schema.special = ct.special;
+        schema.ledger_policy = ct.ledger_policy.clone();
+        schema.rewrite_header(io_schema.clone()).await?;
     }
     Ok(())
 }
@@ -6097,6 +6327,36 @@ pub(super) async fn discard_files_in(
     name: &str,
     suffixes: &[&str],
 ) -> bool {
+    let mut dirs = Vec::new();
+    let discarded = discard_files_unsynced(io_pointers, pool, own, name, suffixes, &mut dirs).await;
+    sync_discarded_dirs(name, &dirs);
+    discarded
+}
+
+/// Syncs each directory [`discard_files_unsynced`] deleted in, once.
+pub(super) fn sync_discarded_dirs(name: &str, dirs: &[String]) {
+    for dir in dirs {
+        let swept = std::path::Path::new(dir).join(format!("{name}{}", RENAMED_SUFFIXES[0]));
+        if let Err(e) = crate::core::wal::sync_parent_dir(&swept) {
+            error!(
+                "Deleted {}'s files in {} but could not sync the directory: {}",
+                name, dir, e
+            );
+        }
+    }
+}
+
+/// [`discard_files_in`] without its directory syncs: each directory it
+/// deleted in is added to `dirs` (once), for a caller discarding many
+/// relations to sync after all of them (a block's COMMIT).
+pub(super) async fn discard_files_unsynced(
+    io_pointers: &Arc<DbStorageProvider>,
+    pool: &StoragePool,
+    own: Option<&str>,
+    name: &str,
+    suffixes: &[&str],
+    dirs: &mut Vec<String>,
+) -> bool {
     if seed_fell_back(pool, io_pointers, name) {
         return unavailable_kept(name);
     }
@@ -6124,12 +6384,8 @@ pub(super) async fn discard_files_in(
         return true;
     }
     for dir in dirs_reached(io_pointers, pool) {
-        let swept = std::path::Path::new(&dir).join(format!("{name}{}", RENAMED_SUFFIXES[0]));
-        if let Err(e) = crate::core::wal::sync_parent_dir(&swept) {
-            error!(
-                "Deleted {}'s files in {} but could not sync the directory: {}",
-                name, dir, e
-            );
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
         }
     }
     true
@@ -6330,14 +6586,81 @@ pub(crate) fn resolve_native_database(
 pub(crate) struct NativeConnection {
     context: NativeContext,
     principal: StdArc<rastcp::session::Principal>,
+    /// The role a trust connection named ([`crate::pgwire::NATIVE_ROLE_PREFIX`]):
+    /// who it runs as from then on, in place of the anonymous principal.
+    trust_principal: std::sync::OnceLock<StdArc<rastcp::session::Principal>>,
     multiplexed: bool,
     session: std::sync::OnceLock<crate::pgwire::NativeSession>,
     /// The connection asked for notices
     /// ([`crate::pgwire::NATIVE_NOTICES_PREFIX`]): its answers carry them.
     notices: std::sync::atomic::AtomicBool,
+    /// Its admission, decided at its first statement in its database and
+    /// held for the connection's life: the role's place under its
+    /// CONNECTION LIMIT and VALID UNTIL (R2), and the tenancy policy's
+    /// admit (T7), as a pgwire login is admitted. A refusal is kept and
+    /// answers every request.
+    admission: tokio::sync::OnceCell<Result<crate::auth::RoleSlot, String>>,
 }
 
 impl NativeConnection {
+    /// Who the connection runs as: the role a trust connection named, or the
+    /// principal its login proved.
+    fn principal(&self) -> &StdArc<rastcp::session::Principal> {
+        self.trust_principal.get().unwrap_or(&self.principal)
+    }
+
+    /// Answers a [`crate::pgwire::NATIVE_ROLE_PREFIX`] request: `role`, and
+    /// optionally `\x1f` and a database to select with it.
+    async fn name_role(&self, rest: &[u8]) -> Vec<u8> {
+        use crate::pgwire::{native_simple_complete as complete, native_simple_error as refuse};
+
+        let Ok(rest) = std::str::from_utf8(rest) else {
+            return refuse("22021", "the role name is not valid UTF-8", b'I');
+        };
+        let (role, database) = match rest.split_once('\x1f') {
+            Some((role, database)) => (role, Some(database)),
+            None => (rest, None),
+        };
+        if role.is_empty() || database.is_some_and(str::is_empty) {
+            return refuse("08P01", "a role request names a role, and a database after \\x1f if any", b'I');
+        }
+        if self.context.authentication_required {
+            return refuse(
+                "28000",
+                "this listener authenticates: a login names its role, and a connection does not take another",
+                b'I',
+            );
+        }
+        if self.session.get().is_some() || self.trust_principal.get().is_some() {
+            return refuse(
+                "08P01",
+                "a connection names its role before its first statement, once",
+                b'I',
+            );
+        }
+        let name = database.unwrap_or_else(|| self.login_database());
+        let target = match resolve_native_database(self.context.catalog.as_deref(), &self.context.database, name) {
+            Ok(d) => d,
+            Err((code, message)) => return refuse(code, &message, b'I'),
+        };
+        // The role must be one of that database's, allowed to log in (a
+        // database with no roles at all admits any name, as a fresh one does).
+        if let Err(message) = crate::auth::trust_login(&target, role, None).await {
+            return refuse("28000", &message, b'I');
+        }
+        let principal = rastcp::session::Principal { user: role.to_string(), superuser: false, database: None };
+        if self.trust_principal.set(StdArc::new(principal)).is_err() {
+            return refuse("08P01", "a connection names its role once", b'I');
+        }
+        match database {
+            Some(db) => self.select(db.as_bytes()),
+            None => match self.session_in(name) {
+                Ok(_) => complete("SET"),
+                Err((code, message)) => refuse(code, &message, b'I'),
+            },
+        }
+    }
+
     /// The database the login named, or the listener's.
     fn login_database(&self) -> &str {
         self.principal
@@ -6361,7 +6684,7 @@ impl NativeConnection {
         }
         let database =
             resolve_native_database(self.context.catalog.as_deref(), &self.context.database, name)?;
-        let made = native_session_in(&self.context, database, &self.principal, self.multiplexed);
+        let made = native_session_in(&self.context, database, self.principal(), self.multiplexed);
         let _ = self.session.set(made);
         Ok(self.session.get().expect("set just above"))
     }
@@ -6437,9 +6760,11 @@ fn open_native_session(
     NativeConnection {
         context: context.clone(),
         principal: principal.clone(),
+        trust_principal: std::sync::OnceLock::new(),
         multiplexed: connection.multiplexed,
         session: std::sync::OnceLock::new(),
         notices: std::sync::atomic::AtomicBool::new(false),
+        admission: tokio::sync::OnceCell::new(),
     }
 }
 
@@ -6480,13 +6805,18 @@ fn native_session_in(
 /// the connection's session, in the connection's database.
 async fn serve_native_request(
     context: NativeContext,
-    principal: StdArc<rastcp::session::Principal>,
+    _login: StdArc<rastcp::session::Principal>,
     connection: StdArc<NativeConnection>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
+    if let Some(rest) = request_vec.strip_prefix(crate::pgwire::NATIVE_ROLE_PREFIX) {
+        return connection.name_role(rest).await;
+    }
     if let Some(name) = request_vec.strip_prefix(crate::pgwire::NATIVE_DATABASE_PREFIX) {
         return connection.select(name);
     }
+    // Everything below runs as the role a trust connection named, if any.
+    let principal = connection.principal().clone();
     // Ahead of the session, as the database selection is: a setup request,
     // which must not make the session in the default database before a
     // selection does.
@@ -6507,6 +6837,35 @@ async fn serve_native_request(
         Ok(session) => session,
         Err((_, message)) => return error_response(&message),
     };
+    let admitted = connection
+        .admission
+        .get_or_init(|| async {
+            let database = session.database();
+            // Only a password proves a credential here; a listener without
+            // authentication is held to the limit but not to VALID UNTIL.
+            let slot = crate::auth::admit_role_login(
+                database,
+                &principal.user,
+                principal.superuser,
+                context.authentication_required,
+            )
+            .await
+            .map_err(|(_, message)| message)?;
+            let ctx = crate::core::policy_hooks::SessionContext {
+                role: &principal.user,
+                database: &database.name,
+                protocol: "native",
+                superuser: principal.superuser,
+            };
+            crate::core::policy_hooks::tenancy()
+                .admit(&ctx)
+                .map_err(|e| e.trim_start_matches("28000: ").to_string())?;
+            Ok(slot)
+        })
+        .await;
+    if let Err(message) = admitted {
+        return error_response(message);
+    }
     // Everything below reads the database from the context.
     let context = if Arc::ptr_eq(session.database(), &context.database) {
         context
@@ -6520,6 +6879,26 @@ async fn serve_native_request(
     // answer; any other is answered exactly as before.
     let notices = connection.notices.load(std::sync::atomic::Ordering::Relaxed);
     process_native_request_for(context, principal, Some(session), request_vec, notices).await
+}
+
+/// Whether a native request's caller administers: an authenticated
+/// superuser, or on a listener that asks for no credential, what the
+/// caller's role makes it (`NativeSession::resolve_admin`,
+/// `auth::trust_login`). Not having to authenticate is no longer being an
+/// administrator. A caller without a connection session (the statement
+/// tests' embedding) keeps the listener's word.
+async fn native_admin(
+    context: &NativeContext,
+    principal: &rastcp::session::Principal,
+    session: Option<&crate::pgwire::NativeSession>,
+) -> bool {
+    if context.authentication_required {
+        return principal.superuser;
+    }
+    match session {
+        Some(session) => session.resolve_admin().await,
+        None => true,
+    }
 }
 
 /// One request with no connection session: transaction control is refused.
@@ -6548,6 +6927,42 @@ async fn process_native_request(
 /// One request of a connection, with its statement's notices carried in
 /// front of the answer when the connection asked for them (`notices`).
 async fn process_native_request_for(
+    context: NativeContext,
+    principal: StdArc<rastcp::session::Principal>,
+    session: Option<&crate::pgwire::NativeSession>,
+    request_vec: Vec<u8>,
+    notices: bool,
+) -> Vec<u8> {
+    // A cancelable request (`pgwire::native_session::CANCELABLE_PREFIX`): the
+    // request it wraps, run under a token a `CANCEL` can name. Ahead of
+    // everything, EXEC's decoding included, since it may wrap one. The token
+    // is held until the answer is built, so a `CANCEL` finds the statement
+    // for exactly that long; a second request under a token still running is
+    // refused, never run uncancelable.
+    if let Some(split) = crate::pgwire::native_split_cancelable(&request_vec) {
+        let (token, inner) = match split {
+            Ok(parts) => parts,
+            Err(e) => return error_response(&format!("{e} (SQLSTATE 22023)")),
+        };
+        let Some(registration) = crate::core::cancel::register_token(&principal.user, token) else {
+            return error_response(
+                "another statement of this user is still running under the same cancel token: \
+                 choose a fresh token for each statement (SQLSTATE 08P01)",
+            );
+        };
+        let inner = inner.to_vec();
+        return Box::pin(crate::pgwire::with_session_cancel(
+            registration.session(),
+            process_native_request_plain(context, principal, session, inner, notices),
+        ))
+        .await;
+    }
+    process_native_request_plain(context, principal, session, request_vec, notices).await
+}
+
+/// [`process_native_request_for`], past the cancelable form: the request as
+/// it stands.
+async fn process_native_request_plain(
     context: NativeContext,
     principal: StdArc<rastcp::session::Principal>,
     session: Option<&crate::pgwire::NativeSession>,
@@ -6646,18 +7061,16 @@ async fn process_native_request_for(
         return match parsed {
             Err(e) => error_response(&e),
             Ok(statement) => {
-                let verb = match statement {
-                    crate::auth::RoleStatement::Create { .. } => "CREATE ROLE",
-                    crate::auth::RoleStatement::AlterPassword { .. } => "ALTER ROLE",
-                    crate::auth::RoleStatement::Drop { .. } => "DROP ROLE",
-                };
+                let verb = statement.tag();
                 info!("Received {} from {}", verb, principal);
 
-                if context.authentication_required && !principal.superuser {
-                    return error_response(&format!(
-                        "permission denied: {} is not a superuser",
-                        principal
-                    ));
+                if !native_admin(&context, &principal, session).await {
+                    // Its own password, or a CREATEROLE role's (R2).
+                    if let Err(e) =
+                        crate::auth::role_statement_permitted(&context.database, &principal.user, &statement, None).await
+                    {
+                        return error_response(&format!("permission denied: {} is not a superuser ({e})", principal));
+                    }
                 }
 
                 let method = crate::auth::AuthMethod::ScramSha256;
@@ -6687,11 +7100,32 @@ async fn process_native_request_for(
     // needs a superuser, as on pgwire (`pgwire::privileged_statement`). Only
     // the role statements above were gated here, so any authenticated user
     // could restore over the database or reconfigure the process.
-    if context.authentication_required
-        && !principal.superuser
-        && let Some(verb) = crate::pgwire::privileged_statement(&query)
+    if let Some(verb) = crate::pgwire::privileged_statement(&query)
+        && !native_admin(&context, &principal, session).await
     {
         return error_response(&format!("permission denied: {verb} requires superuser ({principal} is not one)"));
+    }
+    if let Some(verb) = crate::pgwire::privileged_statement(&query) {
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &principal.user,
+            database: &context.database.name,
+            protocol: "native",
+            superuser: true,
+        };
+        if let Err(e) = crate::core::policy_hooks::check_privileged(&ctx, verb) {
+            return error_response(&e);
+        }
+    }
+    if crate::core::policy_hooks::installed() {
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &principal.user,
+            database: &context.database.name,
+            protocol: "native",
+            superuser: principal.superuser,
+        };
+        if let Err(e) = crate::core::policy_hooks::check_show(&ctx, &query) {
+            return error_response(&e);
+        }
     }
 
     // A transaction block needs a session that holds it between requests;
@@ -6713,12 +7147,35 @@ async fn process_native_request_for(
     // through this between restarts, so a killed process loads its
     // snapshots instead of rebuilding every index.
     if let Some(name) = crate::pgwire::parse_index_checkpoint(&query) {
-        if context.authentication_required && !principal.superuser {
+        if !native_admin(&context, &principal, session).await {
             return error_response(&format!(
                 "permission denied: rdb_index_checkpoint requires superuser ({principal} is not one)"
             ));
         }
         return Box::pin(native_index_checkpoint(&context.database, name)).await;
+    }
+
+    // A statement naming one of the engine's catalogues (`rdb_roles`,
+    // `__rdb_*`): pgwire's path refuses it, or reads `rdb_roles` through its
+    // masked projection (`privileges::catalog_refusal`, `mask_role_catalog`).
+    // This path does neither, so it never runs one: any role read every
+    // verifier here and could write itself superuser.
+    if crate::core::rql::privileges::may_name_catalog(&query) {
+        if let Some((_, message)) = crate::core::rql::privileges::catalog_refusal(&query) {
+            return error_response(&message);
+        }
+        if crate::core::rql::privileges::mask_role_catalog(&query).is_some() {
+            return match session {
+                Some(session) => {
+                    let run = Box::pin(session.run_alone(&query));
+                    if notices { crate::pgwire::native_with_notices(run).await } else { run.await }
+                }
+                None => error_response(&format!(
+                    "permission denied: \"{}\" is read through a connection session, which this caller does not have",
+                    crate::auth::ROLE_TABLE
+                )),
+            };
+        }
     }
 
     // A correlated scalar subquery (`SELECT id, (SELECT count(*) FROM p
@@ -6736,10 +7193,21 @@ async fn process_native_request_for(
     }
 
     let statement_timeout = context.statement_timeout;
+    // Who reads, for a database with encrypted columns: the executor
+    // decrypts a ciphertext cell for a role holding its vault's SELECT, and
+    // for anyone when no role is said (an in-process caller). This path said
+    // none, so a statement naming no encrypted table (`SELECT 'rdbenc1:…'`,
+    // a copy of a cell in another table) had any connection's ciphertext
+    // decrypted. Asked only where there is something to decrypt.
+    let reader = if crate::core::column_crypto::active(&context.database) {
+        Some((principal.user.clone(), native_admin(&context, &principal, session).await))
+    } else {
+        None
+    };
 
     #[cfg(not(feature = "query_stats"))]
     {
-        run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices).await
+        as_reader(reader, run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices)).await
     }
 
     // Recorded for `SHOW QUERIES` the same way a statement arriving over the
@@ -6748,13 +7216,19 @@ async fn process_native_request_for(
     #[cfg(feature = "query_stats")]
     {
         let Some(recording) = crate::core::query_stats::begin() else {
-            return run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices)
-                .await;
+            return as_reader(
+                reader,
+                run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices),
+            )
+            .await;
         };
         let database_name = context.database.name.clone();
         let response = crate::core::query_stats::observe(recording.probe(), async {
-            let response =
-                run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices).await;
+            let response = as_reader(
+                reader,
+                run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices),
+            )
+            .await;
             // Counted inside the scope: outside it the statement's counters are
             // no longer the ones this task can reach.
             crate::core::query_stats::note_rows(rows_of(&response));
@@ -6773,6 +7247,15 @@ async fn process_native_request_for(
             failure.as_deref(),
         );
         response
+    }
+}
+
+/// `f` under the ledger session `reader` names (`ledger_hooks::session`),
+/// or as it is without one.
+async fn as_reader<F: std::future::Future>(reader: Option<(String, bool)>, f: F) -> F::Output {
+    match reader {
+        Some((role, superuser)) => crate::core::ledger_hooks::with_session(role, superuser, f).await,
+        None => f.await,
     }
 }
 
@@ -6795,18 +7278,22 @@ fn statement_signal(
     StdArc::new(if notices { signal.collecting_notices() } else { signal })
 }
 
-/// `response` saying it was stopped at the statement timeout, with the
-/// SQLSTATE a native error otherwise lacks, when it was.
+/// `response` saying it was stopped at the statement timeout, or by a
+/// `CANCEL`, with the SQLSTATE a native error otherwise lacks, when it was.
 fn timed_out_answer(
     mut response: Vec<u8>,
     signal: &crate::core::cancel::StatementCancel,
 ) -> Vec<u8> {
+    let said: &[u8] = match signal.tripped() {
+        Some(crate::core::cancel::CancelReason::Timeout) => b"statement timeout",
+        Some(crate::core::cancel::CancelReason::UserRequest) => b"user request",
+        _ => return response,
+    };
     if response.first() == Some(&3)
-        && signal.tripped() == Some(crate::core::cancel::CancelReason::Timeout)
         && !response.ends_with(b")")
         && crate::core::sql_scan::contains_ignore_ascii_case(
             std::str::from_utf8(&response[1..]).unwrap_or(""),
-            b"statement timeout",
+            said,
         )
     {
         response.extend_from_slice(b" (SQLSTATE 57014)");
@@ -6884,6 +7371,11 @@ async fn run_native_query_in(
             // it: moved into a scope by value, the statement's future (tens
             // of kilobytes) was copied on every request.
             let signal = statement_signal(statement_timeout, notices);
+            // For a cancelable request: the statement a `CANCEL` carrying its
+            // token stops, for as long as it runs and no longer (the guard
+            // clears the slot on every way out).
+            let _published =
+                crate::pgwire::current_session_cancel().map(|session| session.publish(signal.clone()));
             let response = crate::core::rql::sequence::session::scoped(
                 session.sequence_scope(),
                 crate::core::cancel::STATEMENT_CANCEL.scope(
@@ -7220,7 +7712,7 @@ async fn run_native_statement(query: &str, database: Arc<Database>) -> Vec<u8> {
         // evaluated with no columns (`rql::no_from`), as pgwire answers it.
         // The usual liveness probe; it was "Unrecognized query" here.
         return match crate::core::rql::no_from::parse(query) {
-            Some(Ok(select)) => match select.rows() {
+            Some(Ok(select)) => match select.wait().await.and_then(|()| select.rows()) {
                 Ok(rows) => {
                     let mut response = vec![2u8];
                     for row in &rows {

@@ -192,6 +192,9 @@ A MySQL "database" and a SQL Server database are the engine's databases;
 | `--mysql-auth`, `--mssql-auth` | `password` | `password` or `trust` |
 | `--mysql-socket-auth`, `--mssql-socket-auth` | the TCP method | Authentication on the socket |
 | `--mysql-tls`, `--mssql-tls` | `prefer` | `disable`, `prefer` or `require` |
+| `--mssql-collation` | `ci` | Text columns made over the SQL Server protocol: `ci` case-insensitive (SQL Server's default), `bin` by their bytes |
+| `--mssql-guid-order` | `sqlserver` | `uniqueidentifier` columns made over the SQL Server protocol: `sqlserver` orders them as SQL Server (last six bytes first; a hidden key column each), `binary` by their bytes |
+| `--mssql-unique-index-error` | `2601` | Error number for a duplicate in a unique index over the SQL Server protocol: `2601` (SQL Server's) or `2627` (what PRIMARY KEY/UNIQUE constraints report) |
 | `--mysql-cert`/`--mysql-key`, `--mssql-cert`/`--mssql-key` | `--pg-cert`/`--pg-key`, else self-signed | TLS certificate |
 
 Logins are checked against the role catalogue the PostgreSQL listener uses
@@ -584,7 +587,11 @@ how a service running as another user is given access.
   The role must exist and be allowed to log in.
 - **`trust`** is allowed on a socket only when its mode admits nobody outside
   its owner and group (`660` yes, `666` no), as it is allowed on TCP only on
-  loopback.
+  loopback. A trust connection runs as the role it names, with that role's
+  privileges (the native client's `Client::connect_as_role(addr, options, "role")`, checked to exist
+  and be allowed to log in). One that names none is never an administrator: in
+  a database with roles it reaches the tables it made itself and what PUBLIC is
+  granted, nothing else.
 - A socket file left behind by a server that did not shut down is replaced at
   start-up. One another server is listening on, or a path that is not a socket,
   is refused rather than taken. The file is removed at shutdown.
@@ -1000,6 +1007,8 @@ These are not part of any release:
 
 #### Clients
 [`rasterizeddb_client`](rasterizeddb_client/README.md) is the Rust SDK for the native protocol, with an ORM and migrations built in. There is no dedicated client for other languages: they connect with any PostgreSQL, MySQL or SQL Server driver.
+
+[`RasterizedDb.Data` and `RasterizedDb.EntityFrameworkCore`](dotnet/README.md) are the .NET driver and Entity Framework Core provider for it. What either client puts on the wire is in [docs/native-protocol.md](docs/native-protocol.md).
 
 #### Stability
 Rasterized DB is at version 1.x. What is stable is the server: its command-line flags, its wire protocols and the SQL it answers, along with the [`rasterizeddb_client`](rasterizeddb_client/README.md) and [`rasterizeddb_embedded`](rasterizeddb_embedded/README.md) crates, which follow semver. The Rust API of `rasterizeddb_core` is the server's internals and may change in any release.

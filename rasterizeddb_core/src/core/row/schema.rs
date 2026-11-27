@@ -546,6 +546,51 @@ impl<'a, S: StorageIO> SchemaFieldIterator<'a, S> {
     }
 }
 
+/// The licensed table kinds (docs/ledger-and-vault-plan.md).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpecialTable {
+    /// A plain table.
+    #[default]
+    None,
+    /// An append-only ledger table under a retention lock.
+    Ledger,
+    /// A secret vault (itself a ledger table, of a fixed shape).
+    Vault,
+}
+
+impl SpecialTable {
+    /// Header byte 258 for a table of this kind. A plain table keeps what it
+    /// always wrote there, its `is_immutable` flag (0 or 1); the special
+    /// kinds take values no binary ever wrote, `'L'` and `'V'`.
+    pub fn header_byte(self, is_immutable: bool) -> u8 {
+        match self {
+            SpecialTable::None => is_immutable as u8,
+            SpecialTable::Ledger => b'L',
+            SpecialTable::Vault => b'V',
+        }
+    }
+
+    /// Reads header byte 258 back: `(is_immutable, kind)`. Any value no
+    /// build writes is refused, never read as a plain table: a later kind
+    /// read as plain would drop its guard.
+    pub fn from_header_byte(byte: u8) -> Result<(bool, SpecialTable), String> {
+        match byte {
+            0 => Ok((false, SpecialTable::None)),
+            1 => Ok((true, SpecialTable::None)),
+            b'L' => Ok((false, SpecialTable::Ledger)),
+            b'V' => Ok((false, SpecialTable::Vault)),
+            other => Err(format!(
+                "the table's header records kind {other:#04x}, which this build does not know; \
+                 it was written by a later build"
+            )),
+        }
+    }
+
+    pub fn is_special(self) -> bool {
+        self != SpecialTable::None
+    }
+}
+
 /// Every declaration list but `fields` is a `Vec`, not an inline `SmallVec`:
 /// almost every table has none of them, and inline they were 2.4 KB of empty
 /// slots in every schema — one per open table, and in every clone. See the
@@ -556,6 +601,17 @@ pub struct TableSchema {
     pub fields: SmallVec<[SchemaField; 20]>,
     pub primary_key: Option<String>,
     pub is_immutable: bool,
+    /// Whether a licensed policy governs this table: a ledger table or a
+    /// vault (docs/ledger-and-vault-plan.md). Recorded in the header byte
+    /// `is_immutable` used to hold alone (see [`SpecialTable::header_byte`]),
+    /// so it cannot be lost with a sidecar: a table that says it is a ledger
+    /// table refuses to open in a process with no ledger hooks installed.
+    pub special: SpecialTable,
+    /// The licensed policy's records for a special table, as its sidecar
+    /// holds them (`ledger_hooks::policy_sidecar`). Opaque here: the
+    /// installed hooks read them. Empty for a plain table, and never read
+    /// for one.
+    pub ledger_policy: Vec<u8>,
     /// Foreign keys this table declares, loaded from its sidecar.
     pub foreign_keys: Vec<crate::core::rql::foreign_key::ForeignKey>,
     /// `DEFAULT` expressions, loaded from their sidecar.
@@ -581,6 +637,14 @@ pub struct TableSchema {
     /// `NUMERIC(p, s)`, loaded from their sidecar. A column with no entry keeps
     /// the engine's default scale, which is what its rows were written with.
     pub type_modifiers: Vec<crate::core::rql::type_modifier::TypeModifier>,
+    /// What the table compresses (`core::compression`): the variable-width
+    /// columns that store their values compressed, by `write_order`, and the
+    /// row tail's codec, from their markers in the type-modifier sidecar
+    /// (`type_modifier::COMPRESSION_MARKER`, `ROW_COMPRESSION_MARKER`,
+    /// `DICTIONARY_MARKER`). Empty for a table that asked for none, which is
+    /// every table unless one did: nothing is compressed by default. Rebuilt
+    /// by [`TableSchema::refresh_compression`].
+    pub compression: crate::core::compression::StoragePolicy,
     /// `CHECK` constraints, loaded from their sidecar.
     pub checks: Vec<crate::core::rql::check::CheckConstraint>,
     /// `GENERATED ALWAYS AS (…) STORED` expressions, loaded from their sidecar.
@@ -610,6 +674,8 @@ impl TableSchema {
             fields: SmallVec::new(),
             primary_key: None,
             is_immutable,
+            special: SpecialTable::None,
+            ledger_policy: Vec::new(),
             foreign_keys: Vec::new(),
             defaults: Vec::new(),
             json_columns: Vec::new(),
@@ -617,6 +683,7 @@ impl TableSchema {
             secondary_indexes: Vec::new(),
             unique_keys: Vec::new(),
             type_modifiers: Vec::new(),
+            compression: Default::default(),
             generated: Vec::new(),
             checks: Vec::new(),
             incarnation: mint_incarnation(),
@@ -739,8 +806,25 @@ impl TableSchema {
                 .flatten();
             field.set_text_typmod(typmod);
         }
+        // The dictionaries first, so the markers naming them find them. Only
+        // a table whose markers name one has the file: opening it for every
+        // table would create it for every table.
+        if table_schema
+            .type_modifiers
+            .iter()
+            .any(|m| !m.is_deleted && m.column.starts_with(crate::core::rql::type_modifier::DICTIONARY_MARKER))
+        {
+            crate::core::compression::sidecar::load(&schema_io).await;
+        }
+        table_schema.refresh_compression();
         table_schema.generated = crate::core::rql::generated::load(schema_io.clone()).await;
         table_schema.checks = crate::core::rql::check::load(schema_io.clone()).await;
+        // A ledger table's or vault's policy records. A read that fails is
+        // the table's open failing: run with no policy, it would be run
+        // unguarded or refused for the wrong reason.
+        if table_schema.special.is_special() {
+            table_schema.ledger_policy = crate::core::ledger_hooks::policy_sidecar::load(&schema_io).await?;
+        }
         // A check this binary keeps unenforced, or cannot compile (stored by
         // an older one), is said in the log when the table opens: it was said
         // only to the session that declared it.
@@ -753,6 +837,33 @@ impl TableSchema {
         }
 
         Ok(table_schema)
+    }
+
+    /// Rebuilds [`Self::compression`] from the type modifiers: every live
+    /// variable-width column with a compression marker, and the row tail's.
+    /// A marker on a fixed-width column is ignored, as PostgreSQL ignores
+    /// `SET COMPRESSION` on a plain-storage type: its cells are read in place
+    /// and never compressed. A dictionary no open table holds is left out,
+    /// so new values are written without it. The counters carry over.
+    pub fn refresh_compression(&mut self) {
+        use crate::core::compression::{Codec, ColumnCompression, dictionary};
+        use crate::core::rql::type_modifier::{compression_of, dictionary_of, row_compression_of};
+        let modifiers = &self.type_modifiers;
+        let columns = self
+            .fields
+            .iter()
+            .filter(|f| !f.is_deleted && f.db_type.physical() == DbType::STRING)
+            .filter_map(|f| {
+                compression_of(&f.name, modifiers).map(|level| ColumnCompression {
+                    write_order: f.write_order,
+                    codec: Codec { level, dictionary: dictionary_of(&f.name, modifiers).and_then(dictionary) },
+                })
+            })
+            .collect();
+        let row = row_compression_of(modifiers)
+            .map(|level| Codec { level, dictionary: dictionary_of("", modifiers).and_then(dictionary) });
+        self.compression.columns = columns;
+        self.compression.row = row;
     }
 
     pub fn into_vec(&self) -> Vec<u8> {
@@ -787,7 +898,7 @@ impl TableSchema {
         }
         // If no primary key, this section remains all zeros
 
-        vec[129 + 129] = self.is_immutable as u8; // Null terminator for primary key
+        vec[129 + 129] = self.special.header_byte(self.is_immutable);
 
         vec
     }
@@ -821,13 +932,15 @@ impl TableSchema {
             }
         };
 
-        let immutable = if 0 == vec[129 + 129] { false } else { true };
+        let (immutable, special) = SpecialTable::from_header_byte(vec[129 + 129])?;
 
         Ok(TableSchema {
             name,
             fields: SmallVec::new(), // Fields are stored separately
             primary_key,
             is_immutable: immutable,
+            special,
+            ledger_policy: Vec::new(),
             // Foreign keys and defaults live in their own sidecars; `load`
             // fills them in.
             foreign_keys: Vec::new(),
@@ -837,6 +950,7 @@ impl TableSchema {
             secondary_indexes: Vec::new(),
             unique_keys: Vec::new(),
             type_modifiers: Vec::new(),
+            compression: Default::default(),
             generated: Vec::new(),
             checks: Vec::new(),
             // Not part of the header; `load` reads it from the record after.

@@ -48,6 +48,14 @@ pub struct CreateTable {
     pub table_name: String,
     pub columns: Vec<CreateColumnData>,
     pub is_immutable: bool,
+    /// `CREATE LEDGER TABLE` / `CREATE VAULT`: the licensed kind the new
+    /// table's header records (`ledger_hooks`). Plain for every other
+    /// `CREATE TABLE`.
+    pub special: crate::core::row::schema::SpecialTable,
+    /// The policy sidecar's first record for a special table, built by the
+    /// installed ledger hooks from the statement's ledger clauses
+    /// (`ledger_hooks::LedgerHooks::create_policy`). Empty for a plain table.
+    pub ledger_policy: Vec<u8>,
     /// Foreign keys declared in the body, either as table-level constraints or
     /// inline on a column.
     pub foreign_keys: Vec<crate::core::rql::foreign_key::ForeignKey>,
@@ -134,6 +142,28 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
             rejection.replace(reason);
             return None;
         }
+        // `WITH (…)` storage options after the column list: read here and
+        // cut from the statement, so the body below ends at the column
+        // list's own `)` (it runs to the last one, which was the group's).
+        let with = with_options(sql);
+        let row_compression = match &with {
+            Some((inner, _)) => match crate::core::compression::row_compression_option(inner) {
+                Ok(found) => found.flatten(),
+                Err(reason) => {
+                    rejection.replace(reason);
+                    return None;
+                }
+            },
+            None => None,
+        };
+        let without_options;
+        let sql = match &with {
+            Some((_, range)) => {
+                without_options = format!("{}{}", &sql[..range.start], &sql[range.end..]);
+                without_options.as_str()
+            }
+            None => sql,
+        };
         // Find the start of the table name in the original string
         let mut after_create_table = sql;
         for _ in 0..2 {
@@ -358,7 +388,9 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 return None;
             }
 
-            if crate::core::rql::nullable::is_hidden(&name) {
+            // A time column's 100 ns digit (`__t7_`) is declared, by the
+            // SQL Server front end.
+            if crate::core::rql::nullable::is_hidden(&name) && !crate::core::rql::nullable::is_tick_digit(&name) {
                 rejection.replace(format!(
                     "column names beginning with __null_ are reserved: '{}'",
                     name
@@ -608,6 +640,31 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
             if constraints.primary_key && primary_key.is_none() {
                 primary_key = Some(name.clone());
             }
+            // `COMPRESSION zstd(9)`: recorded as a marker
+            // (`type_modifier::COMPRESSION_MARKER`) for a variable-width
+            // column; refused, as PostgreSQL refuses it, for one whose
+            // values are stored in place. A build without the
+            // `storage_compression` feature accepts the clause and stores
+            // every value as it is, so `pg_dump` output still loads.
+            match crate::core::compression::clause_in(&tokens[1 + tokens_used..]) {
+                Some(Err(reason)) => {
+                    rejection.replace(reason);
+                    return None;
+                }
+                Some(Ok(Some(level))) => {
+                    if data_type.physical() != DbType::STRING {
+                        rejection.replace(format!(
+                            "column data type {} does not support compression",
+                            type_phrase.to_ascii_lowercase()
+                        ));
+                        return None;
+                    }
+                    if crate::core::compression::ENABLED {
+                        type_modifiers.push(crate::core::rql::type_modifier::compression_marker(&name, Some(level)));
+                    }
+                }
+                Some(Ok(None)) | None => {}
+            }
             columns.push(CreateColumnData { name, data_type });
         }
 
@@ -735,10 +792,19 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
             }
         }
 
+        // `row_compression`: the table's tail marker
+        // (`type_modifier::ROW_COMPRESSION_MARKER`). Accepted and ignored by
+        // a build that cannot compress.
+        if let Some(level) = row_compression.filter(|_| crate::core::compression::ENABLED) {
+            type_modifiers.push(crate::core::rql::type_modifier::row_compression_marker(Some(level)));
+        }
+
         Some(CreateTable {
             table_name,
             columns,
             is_immutable: false,
+            special: crate::core::row::schema::SpecialTable::None,
+            ledger_policy: Vec::new(),
             foreign_keys,
             defaults,
             json_columns,
@@ -783,6 +849,28 @@ enum TopLevel {
 fn top_level_pieces(sql: &str) -> (Vec<TopLevel>, bool) {
     let (spans, balanced) = top_level_spans(sql);
     (spans.into_iter().map(|(piece, _)| piece).collect(), balanced)
+}
+
+/// The `WITH (…)` storage options after a `CREATE TABLE`'s column list: the
+/// text inside the group and the byte range of `WITH (…)`. `None` when there
+/// is none, or the statement does not scan balanced (the body's parse
+/// reports that). `WITH OIDS`, `WITHOUT OIDS` and `COLOCATE WITH` are not it.
+fn with_options(sql: &str) -> Option<(String, std::ops::Range<usize>)> {
+    let (pieces, balanced) = top_level_spans(sql);
+    if !balanced {
+        return None;
+    }
+    let list = pieces.iter().position(|(p, _)| *p == TopLevel::Group)?;
+    for at in list + 1..pieces.len() {
+        let is_with = matches!(&pieces[at].0, TopLevel::Word(w) if w == "WITH");
+        let after_colocate = matches!(&pieces[at - 1].0, TopLevel::Word(w) if w == "COLOCATE");
+        if is_with && !after_colocate {
+            if let Some((TopLevel::Group, group)) = pieces.get(at + 1) {
+                return Some((sql[group.start + 1..group.end - 1].to_string(), pieces[at].1.start..group.end));
+            }
+        }
+    }
+    None
 }
 
 /// [`top_level_pieces`] with each piece's byte range in `sql`. A group's
@@ -1015,9 +1103,19 @@ pub fn create_table_with_partition(
         Ok(Some((clause, head_end, name))) => {
             let head = QueryPurpose::CreateTable(sql[..head_end].to_string());
             let (parsed, rejection) = create_table_with_reason(&head);
-            let Some(ct) = parsed else {
+            let Some(mut ct) = parsed else {
                 return (None, None, rejection);
             };
+            // The storage options after the clause, which the head left out.
+            if let Some((inner, _)) = with_options(sql) {
+                match crate::core::compression::row_compression_option(&inner) {
+                    Ok(Some(Some(level))) if crate::core::compression::ENABLED => ct
+                        .type_modifiers
+                        .push(crate::core::rql::type_modifier::row_compression_marker(Some(level))),
+                    Ok(_) => {}
+                    Err(reason) => return (None, None, Some(reason)),
+                }
+            }
             if rejection.is_some() {
                 return (None, None, rejection);
             }
@@ -1134,6 +1232,11 @@ fn hash_partition_clause(sql: &str) -> Result<Option<(PartitionClause, usize, St
                 ));
             }
         }
+        at += 2;
+    }
+    // Storage options, where PostgreSQL puts them: read by the caller
+    // (`with_options`).
+    if word(at, "WITH") && matches!(pieces.get(at + 1), Some((TopLevel::Group, _))) {
         at += 2;
     }
     if matches!(pieces.get(at), Some((TopLevel::Punct(b';'), _))) {
@@ -2156,11 +2259,12 @@ mod partitioning_refusal_tests {
         assert_eq!(parsed.checks[0].expression, "inherits (id) > 0");
     }
 
-    /// Trailers other than partitioning keep exactly what they did before the
-    /// refusal was added, latent bugs included: a `WITH (…)` group still ends
-    /// the body at the *last* `)`, so it is swallowed when the last column has
-    /// a constraint and breaks the type when it does not. Pinned so the fix,
-    /// when it comes, is a decision rather than a side effect.
+    /// Trailers other than partitioning keep what they did before the
+    /// refusal was added, except `WITH (…)`: it ended the body at the *last*
+    /// `)`, so it was swallowed when the last column had a constraint and
+    /// broke the type when it did not. It is read now (`with_options`, for
+    /// `row_compression`) and cut off, PostgreSQL's own options ignored and
+    /// any other refused.
     #[test]
     fn other_trailers_behave_as_they_did_before() {
         assert_eq!(
@@ -2168,8 +2272,12 @@ mod partitioning_refusal_tests {
             ["id:I32"]
         );
         assert_eq!(
-            refusal("CREATE TABLE t (id INT) WITH (fillfactor = 70)"),
-            "column type 'INT)' is not supported yet"
+            columns("CREATE TABLE t (id INT) WITH (fillfactor = 70)"),
+            ["id:I32", "__null_id:BOOL"]
+        );
+        assert_eq!(
+            refusal("CREATE TABLE t (id INT) WITH (no_such_option = 1)"),
+            "unrecognized parameter \"no_such_option\""
         );
         assert_eq!(
             columns("CREATE TABLE t (id INT NOT NULL) TABLESPACE pg_default"),
@@ -2450,6 +2558,22 @@ mod hash_partition_clause_tests {
 
     /// Every partitioning shape but the one is refused, worded "not
     /// supported" (0A000), and names what it refused.
+    /// Storage options where PostgreSQL puts them, after the partitioning:
+    /// `row_compression` taken, PostgreSQL's own ignored, any other refused.
+    #[test]
+    fn storage_options_follow_the_partition_clause() {
+        let (ct, clause) = accepted(
+            "CREATE TABLE t (k INT NOT NULL, v TEXT) PARTITION BY HASH (k) PARTITIONS 4 \
+             WITH (fillfactor = 70, row_compression = 'zstd(5)')",
+        );
+        assert_eq!(clause.partitions, Some(4));
+        let level = crate::core::rql::type_modifier::row_compression_of(&ct.type_modifiers);
+        assert_eq!(level, crate::core::compression::ENABLED.then_some(5));
+        let (ct, _, rejection) = parse("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) WITH (nonsense = 1)");
+        assert!(ct.is_none());
+        assert_eq!(rejection.as_deref(), Some("unrecognized parameter \"nonsense\""));
+    }
+
     #[test]
     fn every_other_partitioning_shape_is_refused_with_its_reason() {
         for (sql, names) in [
@@ -2458,7 +2582,6 @@ mod hash_partition_clause_tests {
             ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH k", "parenthesised"),
             ("CREATE TABLE t (k INT NOT NULL) PARTITION BY (k)", "without HASH"),
             ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) COLOCATE WITH u", "COLOCATE WITH"),
-            ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) WITH (fillfactor = 70)", "WITH"),
             ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) TABLESPACE fast", "TABLESPACE"),
             ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 4 PARTITIONS 8", "PARTITIONS"),
             ("CREATE TABLE t (k INT NOT NULL) PARTITION BY HASH (k) PARTITION BY HASH (k)", "PARTITION"),

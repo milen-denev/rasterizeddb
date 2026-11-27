@@ -122,6 +122,16 @@
 //! Freed memory goes back to the operating system once the engine has been
 //! idle for a few seconds ([`Builder::idle_trim`], on by default, glibc
 //! only).
+//!
+//! Ledger tables and secret vaults need the separately licensed
+//! `rasterizeddb_enterprise` crate: an application that uses them depends on
+//! it and calls `rasterizeddb_enterprise::install_always()` before
+//! [`Builder::start`]. This crate never links it. Without it, a ledger table or
+//! vault in the directory is refused, never opened unguarded.
+
+// The engine's statement futures nest deeply: as the core's own crates,
+// a compiler before 1.100 needs more room to normalise them.
+#![recursion_limit = "256"]
 
 mod settings;
 
@@ -470,6 +480,21 @@ impl Builder {
     /// once.
     pub fn wal_prealloc_kb(self, kib: u64) -> Self {
         self.config("wal.prealloc_kb", kib.to_string())
+    }
+
+    /// Starts past a damaged log, losing what follows the damage
+    /// (`--wal-truncate-damaged`, default off). A log with a record that
+    /// fails its checks and whole records after it is damage, not the torn
+    /// tail of a crash, and the start refuses, naming the log, the byte and
+    /// the commits after it. With this on, the records before the damage are
+    /// replayed, everything from it on is dropped, and an ERROR says what
+    /// went. Writes after the damage that had reached the data files may
+    /// survive in part, so the result is not a clean point in time: check
+    /// it. Restore from a backup instead when those commits matter, and copy
+    /// the log first. This start only: never saved to the settings file.
+    pub fn wal_truncate_damaged(mut self, on: bool) -> Self {
+        self.settings.wal_truncate_damaged = on;
+        self
     }
 
     /// Compacts tables and partitions whose pointer slots are mostly dead

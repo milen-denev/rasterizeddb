@@ -14,11 +14,9 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use subtle::ConstantTimeEq;
 
-type HmacSha256 = Hmac<Sha256>;
 
 /// Iteration count for new verifiers. PostgreSQL's own default.
 pub const SCRAM_DEFAULT_ITERATIONS: u32 = 4096;
@@ -43,6 +41,12 @@ pub enum AuthMethod {
     /// socket, where that answer comes from the kernel rather than from the
     /// caller. A password, if a role has one, is stored as for SCRAM.
     Peer,
+    /// The caller is whoever its TLS client certificate says, verified
+    /// against `--pg-client-ca`: a role may log in without a password if its
+    /// name is the certificate's subject common name, or the role
+    /// `--pg-cert-map` gives the certificate's SHA-256 fingerprint. Only over
+    /// TLS, and only with a certificate the CA signed.
+    Cert,
 }
 
 impl AuthMethod {
@@ -54,6 +58,7 @@ impl AuthMethod {
                 "md5" => AuthMethod::Md5,
                 "scram" | "scramsha256" => AuthMethod::ScramSha256,
                 "peer" => AuthMethod::Peer,
+                "cert" | "certificate" => AuthMethod::Cert,
                 _ => return None,
             },
         )
@@ -66,6 +71,7 @@ impl AuthMethod {
             AuthMethod::Md5 => "md5",
             AuthMethod::ScramSha256 => "scram-sha-256",
             AuthMethod::Peer => "peer",
+            AuthMethod::Cert => "cert",
         }
     }
 }
@@ -139,22 +145,19 @@ fn parse_scram_verifier(rest: &str) -> Option<Verifier> {
     })
 }
 
+// Through `core::fips`: the AWS-LC FIPS module in a `fips` build.
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    crate::core::fips::hmac_sha256(key, data).to_vec()
 }
 
 fn sha256(data: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.finalize().to_vec()
+    crate::core::fips::sha256(data).to_vec()
 }
 
 /// Derives the SCRAM keys from a password and salt.
 pub fn scram_keys(password: &str, salt: &[u8], iterations: u32) -> (Vec<u8>, Vec<u8>) {
     let mut salted = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, iterations, &mut salted);
+    crate::core::fips::pbkdf2_sha256(password.as_bytes(), salt, iterations, &mut salted);
 
     let client_key = hmac(&salted, b"Client Key");
     let stored_key = sha256(&client_key);
@@ -549,7 +552,7 @@ impl ScramClient {
         }
 
         let mut salted = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(self.password.as_bytes(), &salt, iterations, &mut salted);
+        crate::core::fips::pbkdf2_sha256(self.password.as_bytes(), &salt, iterations, &mut salted);
         let client_key = hmac(&salted, b"Client Key");
         let stored_key = sha256(&client_key);
         let server_key = hmac(&salted, b"Server Key");
@@ -721,6 +724,7 @@ pub async fn ensure_role_catalogue(
     let existing = run(database, &format!("SELECT name FROM {}", ROLE_TABLE)).await?;
     let has_roles = existing.first() == Some(&2) && existing.len() > 1;
     if has_roles {
+        prepare_owners(database, bootstrap_user).await;
         return Ok(());
     }
 
@@ -747,7 +751,132 @@ pub async fn ensure_role_catalogue(
         "Created role catalogue with bootstrap role \"{}\"",
         bootstrap_user
     );
+    prepare_owners(database, bootstrap_user).await;
     Ok(())
+}
+
+/// The role that owns `database`: its first superuser by name, or
+/// `fallback` (the bootstrap role) when it has none.
+pub async fn database_owner(database: &rclite::Arc<crate::core::database::Database>, fallback: &str) -> String {
+    let mut superusers: Vec<String> = all_roles(database).await.into_iter().filter(|r| r.is_superuser).map(|r| r.name).collect();
+    superusers.sort();
+    if superusers.iter().any(|n| n == fallback) {
+        return fallback.to_string();
+    }
+    superusers.into_iter().next().unwrap_or_else(|| fallback.to_string())
+}
+
+/// Every role `database` holds; empty without a catalogue.
+pub async fn all_roles(database: &rclite::Arc<crate::core::database::Database>) -> Vec<Role> {
+    use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
+    if !database.has_table(ROLE_TABLE) {
+        return Vec::new();
+    }
+    let sql = format!("SELECT name, password, can_login, is_superuser FROM {}", ROLE_TABLE);
+    let Some(purpose) = recognize_query_purpose(&sql) else {
+        return Vec::new();
+    };
+    let response = executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await;
+    if response.first() != Some(&2) {
+        return Vec::new();
+    }
+    let Ok(rows) = crate::core::row::row::vec_into_rows(&response[1..]) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let text = |index: usize| -> Option<String> {
+                let column = row.columns.get(index)?;
+                if column.column_type == crate::core::db_type::DbType::NULL {
+                    return None;
+                }
+                std::str::from_utf8(column.data.into_slice()).ok().map(str::to_string)
+            };
+            let flag = |index: usize| row.columns.get(index).is_some_and(|c| c.data.into_slice().first().copied().unwrap_or(0) != 0);
+            Some(Role {
+                name: text(0)?,
+                verifier: text(1).map(|stored| Verifier::parse(&stored)),
+                can_login: flag(2),
+                is_superuser: flag(3),
+            })
+        })
+        .collect()
+}
+
+/// What every login with an md5 verifier is told and logged (RD3): md5 is
+/// still accepted where it is configured, but a stolen verifier logs in as
+/// the role (it is the password's equivalent), and SCRAM is the default for
+/// a new password.
+pub fn md5_login_warning(user: &str) -> String {
+    format!(
+        "role \"{user}\" logged in with an md5 password verifier, which is deprecated: whoever holds the \
+         verifier can log in as the role. Set its password again under scram-sha-256 (ALTER ROLE … PASSWORD)"
+    )
+}
+
+/// Logs [`md5_login_warning`] for a login of `user` to `database` over
+/// `protocol`, when `verifier` is md5.
+pub fn warn_if_md5_login(verifier: Option<&Verifier>, user: &str, database: &str, protocol: &str) -> bool {
+    if !matches!(verifier, Some(Verifier::Md5 { .. })) {
+        return false;
+    }
+    log::warn!("{} ({protocol}, database \"{database}\")", md5_login_warning(user));
+    true
+}
+
+/// What a login that proves nothing (`trust`, a native listener asking for
+/// no credential) is in `database`: `Ok(true)` for an administrator,
+/// `Ok(false)` for an ordinary role, or why it is refused (28000).
+///
+/// The role it names decides, with that role's attributes, as PostgreSQL's
+/// `trust` authenticates as the named role. It is never an administrator by
+/// itself: only a database with no roles at all, where there is no account
+/// to be yet and the first has to be created, and the bootstrap role
+/// (`bootstrap_user`) when the catalogue has none of that name, as
+/// PostgreSQL's initdb user. Any other name with no role is refused.
+pub async fn trust_login(
+    database: &rclite::Arc<crate::core::database::Database>,
+    user: &str,
+    bootstrap_user: Option<&str>,
+) -> Result<bool, String> {
+    if let Some(role) = lookup_role(database, user).await {
+        if !role.can_login {
+            return Err(format!("role \"{user}\" is not permitted to log in"));
+        }
+        return Ok(role.is_superuser);
+    }
+    if all_roles(database).await.is_empty() {
+        return Ok(true);
+    }
+    if bootstrap_user.is_some_and(|b| b == user) {
+        return Ok(true);
+    }
+    Err(format!("role \"{user}\" does not exist"))
+}
+
+/// Gives `database`'s relations without an owner its owner
+/// (`privileges::assign_owners`). The rows are keyed by relation, grantee and
+/// privilege, so two nodes that each run this write the same rows. A failure
+/// is logged, not a reason not to start: the relations stay unowned, which
+/// refuses every role but a superuser (fails closed).
+pub async fn prepare_owners(database: &rclite::Arc<crate::core::database::Database>, bootstrap_user: &str) {
+    let owner = database_owner(database, bootstrap_user).await;
+    if let Err(e) = crate::core::rql::privileges::assign_owners(database, &owner).await {
+        log::warn!(
+            "Database \"{}\": its relations could not be given an owner ({e}); until they are, only a superuser \
+             can use one that has none",
+            database.name
+        );
+    }
+    // The broker's built-in exchanges: the owner's, usable by PUBLIC.
+    #[cfg(feature = "broker")]
+    if let Err(e) = crate::core::broker::acl::prepare_owners(database, &owner).await {
+        log::warn!(
+            "Database \"{}\": the broker's built-in exchanges could not be given an owner ({e}); until they are, \
+             only a superuser can publish through them or bind to them",
+            database.name
+        );
+    }
 }
 
 /// Looks a role up by name, or `None` when there is none.
@@ -833,6 +962,39 @@ pub async fn copy_role_catalogue(
     from: &rclite::Arc<crate::core::database::Database>,
     to: &rclite::Arc<crate::core::database::Database>,
 ) -> Result<(), String> {
+    copy_roles(from, to, None).await
+}
+
+/// Whether `CREATE DATABASE` gives the new database every role of the
+/// default one (`roles.create_database_roles = all`, the behaviour before
+/// RD1), rather than only its creator and its `OWNER` (`owner`, the
+/// default).
+static CREATE_DATABASE_COPIES_ALL_ROLES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `roles.create_database_roles`, as `SHOW CONFIG` shows it.
+pub fn create_database_roles() -> &'static str {
+    if CREATE_DATABASE_COPIES_ALL_ROLES.load(std::sync::atomic::Ordering::Relaxed) { "all" } else { "owner" }
+}
+
+/// Sets `roles.create_database_roles`: `owner` or `all`.
+pub fn set_create_database_roles(value: &str) -> Result<(), String> {
+    let all = match value.trim().trim_matches(|c| c == '\'' || c == '"').to_ascii_lowercase().as_str() {
+        "owner" => false,
+        "all" => true,
+        other => return Err(format!("`{other}` is not a value for roles.create_database_roles (use owner or all)")),
+    };
+    CREATE_DATABASE_COPIES_ALL_ROLES.store(all, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// [`copy_role_catalogue`], copying only the roles `keep` names when it is
+/// given (RD1: a new database's creator and owner). A name with no role in
+/// `from` is skipped.
+pub async fn copy_roles(
+    from: &rclite::Arc<crate::core::database::Database>,
+    to: &rclite::Arc<crate::core::database::Database>,
+    keep: Option<&[String]>,
+) -> Result<(), String> {
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
 
     if !from.has_table(ROLE_TABLE) {
@@ -887,6 +1049,9 @@ pub async fn copy_role_catalogue(
                 .unwrap_or(false)
         };
         let Some(name) = text(0) else { continue };
+        if keep.is_some_and(|keep| !keep.iter().any(|k| *k == name)) {
+            continue;
+        }
         let password = match text(1) {
             Some(stored) => quote(&stored),
             None => "NULL".to_string(),
@@ -961,10 +1126,31 @@ pub enum RoleStatement {
         password: Option<String>,
         can_login: bool,
         is_superuser: bool,
+        attrs: RoleAttrs,
     },
     AlterPassword {
         name: String,
         password: Option<String>,
+    },
+    /// `ALTER ROLE` with anything besides a password alone.
+    Alter {
+        name: String,
+        password: Option<Option<String>>,
+        login: Option<bool>,
+        superuser: Option<bool>,
+        attrs: RoleAttrs,
+    },
+    /// `ALTER ROLE a RENAME TO b`.
+    Rename {
+        name: String,
+        to: String,
+    },
+    /// `ALTER ROLE a SET p = v` (`value` Some), `RESET p` (None), `RESET
+    /// ALL` (`param` "all", None).
+    SetConfig {
+        name: String,
+        param: String,
+        value: Option<String>,
     },
     Drop {
         name: String,
@@ -972,138 +1158,655 @@ pub enum RoleStatement {
     },
 }
 
-/// Recognises role management SQL, or `None` when the statement is something
-/// else.
-pub fn parse_role_statement(sql: &str) -> Option<Result<RoleStatement, String>> {
-    let trimmed = sql.trim().trim_end_matches(';');
-    // Keywords and flags are read from the text with its string literals
-    // emptied. Read from the whole text, a password was searched too, so
-    // `CREATE ROLE app LOGIN PASSWORD 'x NOLOGIN SUPERUSER'` made a superuser
-    // that could not log in.
-    let upper = without_string_literals(trimmed).to_ascii_uppercase();
+/// The role attributes kept beside `rdb_roles`, as ACL rows (relation
+/// [`ROLE_ATTR_RELATION`]): `None` leaves one as it is.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RoleAttrs {
+    pub create_db: Option<bool>,
+    pub create_role: Option<bool>,
+    /// `-1` is no limit.
+    pub conn_limit: Option<i64>,
+    /// `Some(None)` is `VALID UNTIL 'infinity'`.
+    pub valid_until: Option<Option<String>>,
+    /// BYPASSRLS: row-level security policies do not hold it (R3).
+    pub bypass_rls: Option<bool>,
+}
 
-    let is_role_word = |word: &str| word == "ROLE" || word == "USER";
-    let mut words = upper.split_whitespace();
-    let verb = words.next()?;
-    let noun = words.next()?;
-    if !is_role_word(noun) {
-        return None;
+impl RoleStatement {
+    /// The command tag it completes with.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            RoleStatement::Create { .. } => "CREATE ROLE",
+            RoleStatement::AlterPassword { .. }
+            | RoleStatement::Alter { .. }
+            | RoleStatement::Rename { .. }
+            | RoleStatement::SetConfig { .. } => "ALTER ROLE",
+            RoleStatement::Drop { .. } => "DROP ROLE",
+        }
     }
+}
 
-    // Names and passwords are read from the original text, since case matters.
-    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+/// The ACL relation role attributes are kept under: one row per attribute
+/// set, `grantee` the role, `privilege` the attribute, `grantor` its value.
+/// Kept out of `rdb_roles`, whose four columns every catalogue already has,
+/// so no catalogue is migrated; `DROP ROLE` clears them with its grants.
+pub const ROLE_ATTR_RELATION: &str = "@attr";
 
-    match verb {
-        "CREATE" => {
-            let Some(name) = tokens.get(2).map(|n| n.trim_matches('"').to_string()) else {
-                return Some(Err("CREATE ROLE names no role".to_string()));
-            };
-            let password = match extract_password(trimmed) {
-                Ok(p) => p,
-                Err(e) => return Some(Err(e)),
-            };
-            // PostgreSQL's `CREATE USER` implies LOGIN; `CREATE ROLE` does not.
-            let can_login = noun == "USER" || upper.contains(" LOGIN");
-            Some(Ok(RoleStatement::Create {
-                name,
-                password,
-                can_login: can_login && !upper.contains(" NOLOGIN"),
-                is_superuser: upper.contains(" SUPERUSER") && !upper.contains(" NOSUPERUSER"),
-            }))
-        }
-        "ALTER" => {
-            let Some(name) = tokens.get(2).map(|n| n.trim_matches('"').to_string()) else {
-                return Some(Err("ALTER ROLE names no role".to_string()));
-            };
-            if !upper.contains("PASSWORD") {
-                return Some(Err(
-                    "only ALTER ROLE ... PASSWORD is supported yet".to_string()
-                ));
+/// One token of a role statement: a keyword or bare name (`Word`, as
+/// written), a quoted name, a string literal's value, a number, or
+/// punctuation.
+#[derive(Debug, Clone, PartialEq)]
+enum RoleTok {
+    Word(String),
+    Quoted(String),
+    Str(String),
+    Number(String),
+    Punct(char),
+}
+
+/// The tokens of a role statement. Literals and quoted names are read whole,
+/// so no word inside one is a keyword: a password `'x NOLOGIN SUPERUSER'`
+/// and a role named `"in role superusers"` are values, nothing more.
+fn role_tokens(sql: &str) -> Result<Vec<RoleTok>, String> {
+    let mut out = Vec::new();
+    let mut chars = sql.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else if c == '\'' || c == '"' {
+            chars.next();
+            // A doubled quote inside is one quote. Read as characters, so a
+            // password's non-ASCII characters are kept whole.
+            let mut text = String::new();
+            loop {
+                match chars.next() {
+                    None => {
+                        return Err(if c == '\'' {
+                            "PASSWORD literal is not terminated".to_string()
+                        } else {
+                            "a quoted role name is not terminated".to_string()
+                        });
+                    }
+                    Some(q) if q == c => {
+                        if chars.peek() == Some(&c) {
+                            chars.next();
+                            text.push(c);
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(other) => text.push(other),
+                }
             }
-            match extract_password(trimmed) {
-                Ok(password) => Some(Ok(RoleStatement::AlterPassword { name, password })),
-                Err(e) => Some(Err(e)),
+            out.push(if c == '\'' { RoleTok::Str(text) } else { RoleTok::Quoted(text) });
+        } else if c == '-' && sql.contains("--") && {
+            let mut probe = chars.clone();
+            probe.next();
+            probe.peek() == Some(&'-')
+        } {
+            // A comment runs to the end of its line.
+            for n in chars.by_ref() {
+                if n == '\n' {
+                    break;
+                }
             }
+        } else if c.is_ascii_digit() || (c == '-' && out.last().is_some_and(|t| matches!(t, RoleTok::Word(w) if w.eq_ignore_ascii_case("LIMIT")))) {
+            let mut text = String::new();
+            text.push(c);
+            chars.next();
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    text.push(d);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            out.push(RoleTok::Number(text));
+        } else if c.is_alphanumeric() || c == '_' || c == '$' {
+            let mut text = String::new();
+            while let Some(&d) = chars.peek() {
+                if d.is_alphanumeric() || d == '_' || d == '$' {
+                    text.push(d);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            out.push(RoleTok::Word(text));
+        } else {
+            out.push(RoleTok::Punct(c));
+            chars.next();
         }
-        "DROP" => {
-            let if_exists = upper.contains("IF EXISTS");
-            let index = if if_exists { 4 } else { 2 };
-            let Some(name) = tokens.get(index).map(|n| n.trim_matches('"').to_string()) else {
-                return Some(Err("DROP ROLE names no role".to_string()));
-            };
-            Some(Ok(RoleStatement::Drop { name, if_exists }))
-        }
+    }
+    while out.last() == Some(&RoleTok::Punct(';')) {
+        out.pop();
+    }
+    Ok(out)
+}
+
+fn is_word(tok: Option<&RoleTok>, word: &str) -> bool {
+    matches!(tok, Some(RoleTok::Word(w)) if w.eq_ignore_ascii_case(word))
+}
+
+/// A role's name: a bare word as written, or a quoted name's text.
+fn role_name(tok: Option<&RoleTok>) -> Option<String> {
+    match tok {
+        Some(RoleTok::Word(w)) | Some(RoleTok::Quoted(w)) => Some(w.clone()),
         _ => None,
     }
 }
 
-/// `sql` with the inside of every single-quoted literal removed (`'x'` becomes
-/// `''`), so no keyword search can match inside one.
-fn without_string_literals(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        out.push(c);
-        if c != '\'' {
-            continue;
-        }
-        // Inside a literal: skip to its closing quote, a doubled one being an
-        // escaped quote.
-        while let Some(c) = chars.next() {
-            if c == '\'' {
-                if chars.peek() == Some(&'\'') {
-                    chars.next();
-                    continue;
-                }
-                out.push('\'');
-                break;
+/// What a role statement's options set. Options this engine does not model
+/// yet (`CREATEDB`, `INHERIT`, `CONNECTION LIMIT`, `IN ROLE …`, …) are read
+/// whole and kept nowhere, as before; each is a word of its own, so a name
+/// in a list (`IN ROLE superusers`) is never taken for an option.
+#[derive(Default)]
+struct RoleOptions {
+    password: Option<Option<String>>,
+    login: Option<bool>,
+    superuser: Option<bool>,
+    attrs: RoleAttrs,
+    /// Whether any option besides `PASSWORD` was given.
+    others: bool,
+}
+
+/// Reads the options after a role's name, PostgreSQL's grammar for `CREATE
+/// ROLE` and `ALTER ROLE`, as whole tokens. An option it does not know is
+/// refused rather than skipped.
+fn role_options(tokens: &[RoleTok]) -> Result<RoleOptions, String> {
+    let mut options = RoleOptions::default();
+    let mut at = 0;
+    if is_word(tokens.first(), "WITH") {
+        at = 1;
+    }
+    // A list of role names, `a, "b", c`.
+    let names = |at: &mut usize| -> Result<(), String> {
+        loop {
+            if role_name(tokens.get(*at)).is_none() {
+                return Err("a role name was expected in the role list".to_string());
             }
+            *at += 1;
+            if tokens.get(*at) == Some(&RoleTok::Punct(',')) {
+                *at += 1;
+                continue;
+            }
+            return Ok(());
+        }
+    };
+    while at < tokens.len() {
+        let RoleTok::Word(word) = &tokens[at] else {
+            return Err(format!("syntax error in role options at {:?}", tokens[at]));
+        };
+        let upper = word.to_ascii_uppercase();
+        at += 1;
+        match upper.as_str() {
+            "SUPERUSER" => options.superuser = Some(true),
+            "NOSUPERUSER" => options.superuser = Some(false),
+            "LOGIN" => options.login = Some(true),
+            "NOLOGIN" => options.login = Some(false),
+            "ENCRYPTED" | "UNENCRYPTED" | "PASSWORD" => {
+                if upper != "PASSWORD" {
+                    if !is_word(tokens.get(at), "PASSWORD") {
+                        return Err(format!("{upper} must be followed by PASSWORD"));
+                    }
+                    at += 1;
+                }
+                match tokens.get(at) {
+                    Some(RoleTok::Str(password)) => options.password = Some(Some(password.clone())),
+                    Some(RoleTok::Word(w)) if w.eq_ignore_ascii_case("NULL") => options.password = Some(None),
+                    _ => return Err("PASSWORD must be given as a quoted string".to_string()),
+                }
+                at += 1;
+                continue;
+            }
+            "CREATEDB" => options.attrs.create_db = Some(true),
+            "NOCREATEDB" => options.attrs.create_db = Some(false),
+            // PostgreSQL's old `CREATEUSER` is `SUPERUSER`, not `CREATEROLE`.
+            "CREATEUSER" => options.superuser = Some(true),
+            "NOCREATEUSER" => options.superuser = Some(false),
+            "CREATEROLE" => options.attrs.create_role = Some(true),
+            "NOCREATEROLE" => options.attrs.create_role = Some(false),
+            "BYPASSRLS" => options.attrs.bypass_rls = Some(true),
+            "NOBYPASSRLS" => options.attrs.bypass_rls = Some(false),
+            "INHERIT" | "NOINHERIT" | "REPLICATION" | "NOREPLICATION" => {}
+            "CONNECTION" => {
+                let Some(RoleTok::Number(n)) = tokens.get(at + 1).filter(|_| is_word(tokens.get(at), "LIMIT")) else {
+                    return Err("CONNECTION LIMIT takes a number".to_string());
+                };
+                let n: i64 = n.parse().map_err(|_| format!("CONNECTION LIMIT {n} is out of range"))?;
+                if n < -1 {
+                    return Err(format!("invalid connection limit: {n}"));
+                }
+                options.attrs.conn_limit = Some(n);
+                at += 2;
+            }
+            "VALID" => {
+                let Some(RoleTok::Str(when)) = tokens.get(at + 1).filter(|_| is_word(tokens.get(at), "UNTIL")) else {
+                    return Err("VALID UNTIL takes a quoted timestamp".to_string());
+                };
+                options.attrs.valid_until = Some(if when.trim().eq_ignore_ascii_case("infinity") {
+                    None
+                } else {
+                    let us = crate::core::value_codec::parse_timestamp_us(when)
+                        .ok_or_else(|| format!("invalid input syntax for type timestamp with time zone: \"{when}\""))?;
+                    Some(us.to_string())
+                });
+                at += 2;
+            }
+            "SYSID" => {
+                if !matches!(tokens.get(at), Some(RoleTok::Number(_))) {
+                    return Err("SYSID takes a number".to_string());
+                }
+                at += 1;
+            }
+            "IN" => {
+                if !is_word(tokens.get(at), "ROLE") && !is_word(tokens.get(at), "GROUP") {
+                    return Err("IN must be followed by ROLE or GROUP".to_string());
+                }
+                at += 1;
+                names(&mut at)?;
+            }
+            "ROLE" | "ADMIN" | "USER" => names(&mut at)?,
+            _ => return Err(format!("unrecognized role option \"{word}\"")),
+        }
+        options.others = true;
+    }
+    Ok(options)
+}
+
+/// Recognises role management SQL, or `None` when the statement is something
+/// else.
+///
+/// Read by tokens, every option a word of its own. Searched as substrings,
+/// `IN ROLE superusers` made a superuser, a password holding `NOLOGIN` was an
+/// option, and a role named `password_admin` was read as `PASSWORD`.
+pub fn parse_role_statement(sql: &str) -> Option<Result<RoleStatement, String>> {
+    let trimmed = sql.trim().trim_end_matches(';');
+    // The first two words decide whether this is one at all, before a
+    // tokenizer reads anything of a statement that is not.
+    let mut words = trimmed.split_whitespace();
+    let verb = words.next()?.to_ascii_uppercase();
+    let noun = words.next()?.to_ascii_uppercase();
+    if !matches!(verb.as_str(), "CREATE" | "ALTER" | "DROP") || !(noun == "ROLE" || noun == "USER") {
+        return None;
+    }
+    let tokens = match role_tokens(trimmed) {
+        Ok(tokens) => tokens,
+        Err(e) => return Some(Err(e)),
+    };
+    // `verb noun`, as the two words above.
+    let rest = &tokens[2.min(tokens.len())..];
+
+    match verb.as_str() {
+        "CREATE" => {
+            let Some(name) = role_name(rest.first()) else {
+                return Some(Err("CREATE ROLE names no role".to_string()));
+            };
+            let options = match role_options(&rest[1..]) {
+                Ok(options) => options,
+                Err(e) => return Some(Err(e)),
+            };
+            // PostgreSQL's `CREATE USER` implies LOGIN; `CREATE ROLE` does not.
+            Some(Ok(RoleStatement::Create {
+                name,
+                password: options.password.flatten(),
+                can_login: options.login.unwrap_or(noun == "USER"),
+                is_superuser: options.superuser.unwrap_or(false),
+                attrs: options.attrs,
+            }))
+        }
+        "ALTER" => {
+            let Some(name) = role_name(rest.first()) else {
+                return Some(Err("ALTER ROLE names no role".to_string()));
+            };
+            if is_word(rest.get(1), "RENAME") && is_word(rest.get(2), "TO") {
+                let Some(to) = role_name(rest.get(3)).filter(|_| rest.len() == 4) else {
+                    return Some(Err("ALTER ROLE … RENAME TO names one role".to_string()));
+                };
+                return Some(Ok(RoleStatement::Rename { name, to }));
+            }
+            if is_word(rest.get(1), "IN") {
+                return Some(Err(
+                    "ALTER ROLE … IN DATABASE is not supported: roles belong to one database here, so set it without IN DATABASE"
+                        .to_string(),
+                ));
+            }
+            if is_word(rest.get(1), "SET") || is_word(rest.get(1), "RESET") {
+                return Some(role_set_config(name, &rest[1..]));
+            }
+            let options = match role_options(&rest[1..]) {
+                Ok(options) => options,
+                Err(e) => return Some(Err(e)),
+            };
+            match options.password {
+                Some(password) if !options.others => Some(Ok(RoleStatement::AlterPassword { name, password })),
+                password => Some(Ok(RoleStatement::Alter {
+                    name,
+                    password,
+                    login: options.login,
+                    superuser: options.superuser,
+                    attrs: options.attrs,
+                })),
+            }
+        }
+        _ => {
+            let if_exists = is_word(rest.first(), "IF") && is_word(rest.get(1), "EXISTS");
+            let at = if if_exists { 2 } else { 0 };
+            let Some(name) = role_name(rest.get(at)) else {
+                return Some(Err("DROP ROLE names no role".to_string()));
+            };
+            if rest.len() > at + 1 {
+                return Some(Err("DROP ROLE drops one role at a time here".to_string()));
+            }
+            Some(Ok(RoleStatement::Drop { name, if_exists }))
+        }
+    }
+}
+
+/// Writes the attributes `attrs` sets for `role`: each one's row replaced,
+/// or removed when it is back at its default.
+async fn write_role_attrs(
+    database: &rclite::Arc<crate::core::database::Database>,
+    role: &str,
+    attrs: &RoleAttrs,
+    tx: Option<crate::core::mvcc::TxId>,
+) -> Result<(), String> {
+    let flag = |b: Option<bool>| b.map(|b| b.then(|| "true".to_string()));
+    let limit = attrs.conn_limit.map(|n| (n >= 0).then(|| n.to_string()));
+    for (attr, value) in [
+        ("CREATEDB", flag(attrs.create_db)),
+        ("CREATEROLE", flag(attrs.create_role)),
+        ("BYPASSRLS", flag(attrs.bypass_rls)),
+        ("CONNECTION LIMIT", limit),
+        ("VALID UNTIL", attrs.valid_until.clone()),
+    ] {
+        let Some(value) = value else { continue };
+        crate::core::rql::privileges::set_role_attr(database, role, attr, value, tx).await?;
+    }
+    Ok(())
+}
+
+/// A role's attributes as kept in the ACL: (CREATEDB, CREATEROLE,
+/// CONNECTION LIMIT, VALID UNTIL in microseconds).
+pub struct StoredAttrs {
+    pub create_db: bool,
+    pub create_role: bool,
+    pub conn_limit: Option<u64>,
+    pub valid_until_us: Option<i64>,
+}
+
+/// [`StoredAttrs`] of `role`, read through the ACL cache.
+pub async fn role_attrs(
+    database: &rclite::Arc<crate::core::database::Database>,
+    role: &str,
+    tx: Option<crate::core::mvcc::TxId>,
+) -> StoredAttrs {
+    let mut out = StoredAttrs { create_db: false, create_role: false, conn_limit: None, valid_until_us: None };
+    if !database.has_table(crate::core::rql::privileges::ACL_TABLE) {
+        return out;
+    }
+    let Ok(rows) = crate::core::rql::privileges::load_shared(database, tx).await else {
+        return out;
+    };
+    for r in rows.iter().filter(|r| r.relation == ROLE_ATTR_RELATION && r.grantee == role) {
+        match r.privilege.as_str() {
+            "CREATEDB" => out.create_db = true,
+            "CREATEROLE" => out.create_role = true,
+            "CONNECTION LIMIT" => out.conn_limit = r.grantor.parse().ok(),
+            "VALID UNTIL" => out.valid_until_us = r.grantor.parse().ok(),
+            _ => {}
         }
     }
     out
 }
 
-/// Reads the quoted value after `PASSWORD`, or `None` for `PASSWORD NULL`.
-fn extract_password(sql: &str) -> Result<Option<String>, String> {
-    // The keyword is found outside literals, where it is one: a role name or
-    // an earlier literal holding the word must not move the search.
-    let outside = without_string_literals(sql);
-    let Some(at) = outside.to_ascii_uppercase().find("PASSWORD") else {
-        return Ok(None);
-    };
-    // The offset is `sql`'s too only when no literal comes before the
-    // keyword, which this grammar never has; anything else is refused rather
-    // than read from the wrong place.
-    if sql.get(..at) != Some(&outside[..at]) {
-        return Err("PASSWORD must follow the role name".to_string());
+/// Whether `actor`, no superuser, may run `statement` (roles plan R2): a
+/// role changes its own password; a CREATEROLE role creates, alters and
+/// drops roles that are not superusers, and gives none SUPERUSER.
+/// `Err` with the refusal otherwise.
+pub async fn role_statement_permitted(
+    database: &rclite::Arc<crate::core::database::Database>,
+    actor: &str,
+    statement: &RoleStatement,
+    tx: Option<crate::core::mvcc::TxId>,
+) -> Result<(), String> {
+    if let RoleStatement::AlterPassword { name, .. } | RoleStatement::SetConfig { name, .. } = statement
+        && name == actor
+    {
+        return Ok(());
     }
-    let rest = sql[at + "PASSWORD".len()..].trim();
-
-    if rest.to_ascii_uppercase().starts_with("NULL") {
-        return Ok(None);
+    let denied = || Err(format!("permission denied: {} requires superuser or CREATEROLE", statement.tag()));
+    if !role_attrs(database, actor, tx).await.create_role {
+        return denied();
     }
-    let Some(stripped) = rest.strip_prefix('\'') else {
-        return Err("PASSWORD must be given as a quoted string".to_string());
-    };
-
-    // A doubled quote inside the literal is an escaped quote. Read as
-    // characters: read as bytes, each byte of a non-ASCII character became a
-    // character of its own and the stored verifier was for another password.
-    let mut out = String::new();
-    let mut chars = stripped.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\'' {
-            if chars.peek() == Some(&'\'') {
-                out.push('\'');
-                chars.next();
-                continue;
+    let target = match statement {
+        RoleStatement::Create { name, is_superuser, attrs, .. } => {
+            if *is_superuser {
+                return Err("permission denied: only a superuser can create a superuser".to_string());
             }
-            return Ok(Some(out));
+            if attrs.bypass_rls.is_some() {
+                return Err("permission denied: only a superuser can give BYPASSRLS".to_string());
+            }
+            name
         }
-        out.push(c);
+        RoleStatement::Alter { name, superuser, attrs, .. } => {
+            if superuser.is_some() {
+                return Err("permission denied: only a superuser can change SUPERUSER".to_string());
+            }
+            if attrs.bypass_rls.is_some() {
+                return Err("permission denied: only a superuser can change BYPASSRLS".to_string());
+            }
+            name
+        }
+        RoleStatement::AlterPassword { name, .. }
+        | RoleStatement::Rename { name, .. }
+        | RoleStatement::SetConfig { name, .. }
+        | RoleStatement::Drop { name, .. } => name,
+    };
+    if lookup_role_in(database, target, tx).await.is_some_and(|r| r.is_superuser) {
+        return Err(format!("permission denied: only a superuser can alter or drop the superuser \"{target}\""));
     }
+    Ok(())
+}
 
-    Err("PASSWORD literal is not terminated".to_string())
+/// One session's place under its role's `CONNECTION LIMIT`, given back when
+/// the session ends.
+pub struct RoleSlot(Option<(String, String)>);
+
+static ROLE_SESSIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(String, String), u64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+impl Drop for RoleSlot {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            let mut map = ROLE_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = map.get_mut(&key) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+/// Admits a session that authenticated as `role` (roles plan R2): refused
+/// past its `VALID UNTIL` when a password was proven (28P01, as
+/// PostgreSQL's), or beyond its `CONNECTION LIMIT` (53300). A superuser is
+/// held to neither limit, as in PostgreSQL. A role with no limit counts
+/// nothing, so the common case takes no lock.
+pub async fn admit_role_login(
+    database: &rclite::Arc<crate::core::database::Database>,
+    role: &str,
+    superuser: bool,
+    by_password: bool,
+) -> Result<RoleSlot, (&'static str, String)> {
+    if superuser {
+        return Ok(RoleSlot(None));
+    }
+    let attrs = role_attrs(database, role, None).await;
+    if by_password
+        && let Some(until) = attrs.valid_until_us
+        && std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as i64) > until
+    {
+        return Err(("28P01", format!("password authentication failed for user \"{role}\"")));
+    }
+    let Some(limit) = attrs.conn_limit else {
+        return Ok(RoleSlot(None));
+    };
+    let key = (database.name.clone(), role.to_string());
+    let mut map = ROLE_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let n = map.entry(key.clone()).or_insert(0);
+    if *n >= limit {
+        return Err(("53300", format!("too many connections for role \"{role}\"")));
+    }
+    *n += 1;
+    Ok(RoleSlot(Some(key)))
+}
+
+/// `SET p {TO|=} v`, `RESET p` or `RESET ALL` after `ALTER ROLE name`.
+/// A dotted name (`rdb.shape_change`) and a value with a unit (`5s`) come
+/// in several tokens, put back together here.
+fn role_set_config(name: String, tokens: &[RoleTok]) -> Result<RoleStatement, String> {
+    let set = is_word(tokens.first(), "SET");
+    let mut at = 1;
+    let mut param = String::new();
+    while let Some(tok) = tokens.get(at) {
+        match tok {
+            RoleTok::Word(w) if set && (w.eq_ignore_ascii_case("TO")) => break,
+            RoleTok::Punct('=') => break,
+            RoleTok::Word(w) | RoleTok::Quoted(w) => param.push_str(&w.to_ascii_lowercase()),
+            RoleTok::Punct('.') => param.push('.'),
+            _ => return Err("ALTER ROLE … SET names a parameter".to_string()),
+        }
+        at += 1;
+    }
+    if param.is_empty() {
+        return Err("ALTER ROLE … SET names a parameter".to_string());
+    }
+    if !set {
+        if at != tokens.len() {
+            return Err("ALTER ROLE … RESET takes a parameter name only".to_string());
+        }
+        return Ok(RoleStatement::SetConfig { name, param, value: None });
+    }
+    let value_tokens = tokens.get(at + 1..).unwrap_or_default();
+    let value = match value_tokens {
+        [RoleTok::Str(s)] => s.clone(),
+        [RoleTok::Word(w)] if w.eq_ignore_ascii_case("DEFAULT") => {
+            return Ok(RoleStatement::SetConfig { name, param, value: None });
+        }
+        [] => return Err(format!("ALTER ROLE … SET {param} needs a value")),
+        many => many
+            .iter()
+            .map(|t| match t {
+                RoleTok::Word(w) | RoleTok::Quoted(w) | RoleTok::Str(w) | RoleTok::Number(w) => w.clone(),
+                RoleTok::Punct(c) => c.to_string(),
+            })
+            .collect(),
+    };
+    if !crate::pgwire::ROLE_SETTINGS.contains(&param.as_str()) {
+        return Err(format!(
+            "ALTER ROLE … SET {param} is not supported: a role keeps only {}, which a session applies at its start",
+            crate::pgwire::ROLE_SETTINGS.join(", ")
+        ));
+    }
+    if !crate::pgwire::role_setting_valid(&param, &value) {
+        return Err(format!("invalid value for parameter \"{param}\": \"{value}\""));
+    }
+    Ok(RoleStatement::SetConfig { name, param, value: Some(value) })
+}
+
+/// The `ALTER ROLE … SET` values `role` keeps, as (parameter, value).
+pub async fn role_settings(database: &rclite::Arc<crate::core::database::Database>, role: &str) -> Vec<(String, String)> {
+    if !database.has_table(crate::core::rql::privileges::ACL_TABLE) {
+        return Vec::new();
+    }
+    let Ok(rows) = crate::core::rql::privileges::load_shared(database, None).await else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter(|r| r.relation == ROLE_ATTR_RELATION && r.grantee == role)
+        .filter_map(|r| r.privilege.strip_prefix("SET:").map(|p| (p.to_string(), r.grantor.clone())))
+        .collect()
+}
+
+/// Removes `name`'s rows from the ACL (`privileges::ACL_TABLE`): its grants,
+/// its memberships and the memberships in it, and its default privileges.
+/// A role that still owns a relation is refused (2BP01, as PostgreSQL's
+/// `DROP ROLE` is): dropping it would leave the relation with no owner,
+/// which only a superuser could reach.
+///
+/// A grant names a role folded as an identifier (`GRANT … TO Alice` is to
+/// `alice`), while a role keeps the case it was created with, so the folded
+/// name is cleared too, unless another role holds that name.
+async fn drop_role_privileges(
+    database: &rclite::Arc<crate::core::database::Database>,
+    name: &str,
+    tx: Option<crate::core::mvcc::TxId>,
+) -> Result<(), String> {
+    use crate::core::rql::privileges;
+    if !database.has_table(privileges::ACL_TABLE) {
+        return Ok(());
+    }
+    let mut names = vec![name.to_string()];
+    let folded = name.to_ascii_lowercase();
+    if folded != name && lookup_role_in(database, &folded, tx).await.is_none() {
+        names.push(folded);
+    }
+    let rows = privileges::load(database, tx).await?;
+    let owned: Vec<&str> = rows
+        .iter()
+        // Every object's OWNER row: a function's, a type's or a domain's
+        // (`@kind:name`) too. Skipped, a role owning only a function was
+        // dropped and left it owned by no one.
+        .filter(|r| r.privilege == "OWNER" && names.contains(&r.grantee))
+        .map(|r| r.relation.as_str())
+        .collect();
+    if !owned.is_empty() {
+        let mut listed: Vec<String> = owned
+            .iter()
+            .take(10)
+            .map(|o| match o.strip_prefix('@').and_then(|k| k.split_once(':')) {
+                Some((kind, object)) => format!("{kind} {object}"),
+                None => o.to_string(),
+            })
+            .collect();
+        listed.sort_unstable();
+        return Err(format!(
+            "role \"{name}\" cannot be dropped because some objects depend on it: it owns {}{}; \
+             REASSIGN OWNED BY or ALTER … OWNER TO another role first",
+            listed.join(", "),
+            if owned.len() > listed.len() { ", …" } else { "" }
+        ));
+    }
+    for n in &names {
+        let [tables, sequences, functions] = privileges::default_relations(n);
+        let filter = format!(
+            "grantee = {q} OR relation = {member} OR relation = {tables} OR relation = {sequences} OR relation = {functions}",
+            q = quote(n),
+            member = quote(&format!("@role:{n}")),
+            tables = quote(&tables),
+            sequences = quote(&sequences),
+            functions = quote(&functions),
+        );
+        privileges::delete_where(database, &filter, tx).await?;
+    }
+    Ok(())
+}
+
+/// The SQLSTATE of a role statement's failure, read off its message:
+/// 42704 for a missing role, 2BP01 for one other objects depend on, 42710
+/// otherwise (one that exists already).
+pub fn role_statement_sqlstate(message: &str) -> &'static str {
+    if message.contains("does not exist") {
+        "42704"
+    } else if message.contains("cannot be dropped because some objects depend on it") {
+        "2BP01"
+    } else {
+        "42710"
+    }
 }
 
 /// Executes a role statement against the catalogue.
@@ -1152,9 +1855,16 @@ pub async fn execute_role_statement_in(
 
     // The verifier format follows the configured method, as
     // `password_encryption` does in PostgreSQL.
-    let verifier_for = |name: &str, password: &str| match method {
-        AuthMethod::Md5 => md5_verifier(name, password),
-        _ => build_scram_verifier(password),
+    // A password already in a verifier's form (`SCRAM-SHA-256$…`, `md5` and
+    // 32 hex digits), as `pg_dumpall --roles-only` writes them, is stored as
+    // given, as PostgreSQL stores it (R2): hashed again, no password would
+    // match it and every restored role was locked out.
+    let verifier_for = |name: &str, password: &str| match Verifier::parse(password) {
+        given @ (Verifier::Scram { .. } | Verifier::Md5 { .. }) => given,
+        Verifier::Plain(_) => match method {
+            AuthMethod::Md5 => md5_verifier(name, password),
+            _ => build_scram_verifier(password),
+        },
     };
 
     match statement {
@@ -1163,6 +1873,7 @@ pub async fn execute_role_statement_in(
             password,
             can_login,
             is_superuser,
+            attrs,
         } => {
             if lookup_role_in(database, &name, tx).await.is_some() {
                 return Err(format!("role \"{}\" already exists", name));
@@ -1173,7 +1884,72 @@ pub async fn execute_role_statement_in(
                 can_login,
                 is_superuser,
             };
-            run(database, &role.insert_statement(), tx).await
+            run(database, &role.insert_statement(), tx).await?;
+            write_role_attrs(database, &role.name, &attrs, tx).await
+        }
+        RoleStatement::Alter { name, password, login, superuser, attrs } => {
+            if lookup_role_in(database, &name, tx).await.is_none() {
+                return Err(format!("role \"{}\" does not exist", name));
+            }
+            let mut sets = Vec::new();
+            if let Some(password) = password {
+                sets.push(format!(
+                    "password = {}",
+                    match password.as_deref() {
+                        Some(p) => quote(&verifier_for(&name, p).to_stored()),
+                        None => "NULL".to_string(),
+                    }
+                ));
+            }
+            if let Some(login) = login {
+                sets.push(format!("can_login = {}", u8::from(login)));
+            }
+            if let Some(superuser) = superuser {
+                sets.push(format!("is_superuser = {}", u8::from(superuser)));
+            }
+            if !sets.is_empty() {
+                run(
+                    database,
+                    &format!("UPDATE {} SET {} WHERE name = {}", ROLE_TABLE, sets.join(", "), quote(&name)),
+                    tx,
+                )
+                .await?;
+            }
+            write_role_attrs(database, &name, &attrs, tx).await
+        }
+        RoleStatement::SetConfig { name, param, value } => {
+            if lookup_role_in(database, &name, tx).await.is_none() {
+                return Err(format!("role \"{}\" does not exist", name));
+            }
+            let params: Vec<&str> = if param == "all" { crate::pgwire::ROLE_SETTINGS.to_vec() } else { vec![param.as_str()] };
+            for p in params {
+                crate::core::rql::privileges::set_role_attr(database, &name, &format!("SET:{p}"), value.clone(), tx).await?;
+            }
+            Ok(())
+        }
+        RoleStatement::Rename { name, to } => {
+            let Some(role) = lookup_role_in(database, &name, tx).await else {
+                return Err(format!("role \"{}\" does not exist", name));
+            };
+            if lookup_role_in(database, &to, tx).await.is_some() {
+                return Err(format!("role \"{}\" already exists", to));
+            }
+            // An md5 verifier is salted with the name, so it cannot match
+            // under the new one: cleared, as PostgreSQL clears it.
+            let clear = matches!(role.verifier, Some(Verifier::Md5 { .. }));
+            run(
+                database,
+                &format!(
+                    "UPDATE {} SET name = {}{} WHERE name = {}",
+                    ROLE_TABLE,
+                    quote(&to),
+                    if clear { ", password = NULL" } else { "" },
+                    quote(&name)
+                ),
+                tx,
+            )
+            .await?;
+            crate::core::rql::privileges::rename_role(database, &name, &to, tx).await
         }
         RoleStatement::AlterPassword { name, password } => {
             if lookup_role_in(database, &name, tx).await.is_none() {
@@ -1203,6 +1979,10 @@ pub async fn execute_role_statement_in(
                     Err(format!("role \"{}\" does not exist", name))
                 };
             }
+            // Its rows in the ACL go with it, in the same transaction: kept,
+            // a role created later under the name was given every grant,
+            // membership and default the dropped one had.
+            drop_role_privileges(database, &name, tx).await?;
             run(
                 database,
                 &format!("DELETE FROM {} WHERE name = {}", ROLE_TABLE, quote(&name)),
@@ -1230,6 +2010,7 @@ mod tests {
                 // `CREATE USER` implies LOGIN; `CREATE ROLE` does not.
                 can_login: true,
                 is_superuser: false,
+                attrs: RoleAttrs::default(),
             }
         );
     }
@@ -1244,6 +2025,7 @@ mod tests {
                 password: None,
                 can_login: false,
                 is_superuser: false,
+                attrs: RoleAttrs::default(),
             }
         );
 
@@ -1273,6 +2055,7 @@ mod tests {
                 password: Some("pw NOLOGIN SUPERUSER".to_string()),
                 can_login: true,
                 is_superuser: false,
+                attrs: RoleAttrs::default(),
             }
         );
         let parsed = parse_role_statement("CREATE ROLE esc2 PASSWORD 'a LOGIN'").unwrap().unwrap();
@@ -1334,6 +2117,36 @@ mod tests {
                 if_exists: true
             }
         );
+    }
+
+    #[test]
+    fn r2r3_alter_role_reads_attributes_settings_and_renames() {
+        let Some(Ok(RoleStatement::Alter { attrs, login, .. })) =
+            parse_role_statement("ALTER ROLE w NOLOGIN CREATEDB CONNECTION LIMIT 5 VALID UNTIL 'infinity' BYPASSRLS")
+        else {
+            panic!()
+        };
+        assert_eq!(login, Some(false));
+        assert_eq!(
+            attrs,
+            RoleAttrs { create_db: Some(true), create_role: None, conn_limit: Some(5), valid_until: Some(None), bypass_rls: Some(true) }
+        );
+        assert_eq!(
+            parse_role_statement("ALTER ROLE w SET statement_timeout = 5s").unwrap().unwrap(),
+            RoleStatement::SetConfig { name: "w".into(), param: "statement_timeout".into(), value: Some("5s".into()) }
+        );
+        assert_eq!(
+            parse_role_statement("ALTER ROLE w RESET rdb.shape_change").unwrap().unwrap(),
+            RoleStatement::SetConfig { name: "w".into(), param: "rdb.shape_change".into(), value: None }
+        );
+        assert!(parse_role_statement("ALTER ROLE w SET search_path = x").unwrap().is_err(), "only the applied settings");
+        assert!(parse_role_statement("ALTER ROLE w SET statement_timeout = 'soon'").unwrap().is_err());
+        assert_eq!(
+            parse_role_statement("ALTER USER a RENAME TO b").unwrap().unwrap(),
+            RoleStatement::Rename { name: "a".into(), to: "b".into() }
+        );
+        // The old CREATEUSER is SUPERUSER, not CREATEROLE.
+        assert!(matches!(parse_role_statement("CREATE ROLE x CREATEUSER").unwrap().unwrap(), RoleStatement::Create { is_superuser: true, .. }));
     }
 
     #[test]
@@ -1722,7 +2535,7 @@ mod tests {
         nonce: &str,
     ) -> String {
         let mut salted = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, iterations, &mut salted);
+        crate::core::fips::pbkdf2_sha256(password.as_bytes(), salt, iterations, &mut salted);
         let client_key = hmac(&salted, b"Client Key");
         let stored_key = sha256(&client_key);
 

@@ -209,6 +209,8 @@ async fn create_employees_table(database: &Arc<Database>) {
                 },
             ],
             is_immutable: false,
+            special: rasterizeddb_core::core::row::schema::SpecialTable::None,
+            ledger_policy: Vec::new(),
             foreign_keys: Vec::new(),
             defaults: Vec::new(),
             json_columns: Vec::new(),

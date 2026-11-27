@@ -32,6 +32,11 @@ fn ready_status(replies: &[Reply]) -> char {
     }
 }
 
+/// The NOTICE that the statements before a failure were rolled back with it.
+fn rolled_back_notice(replies: &[Reply], says: &str) -> bool {
+    replies.iter().any(|r| matches!(r, Reply::Notice(n) if n.contains(says) && n.contains("rolled back with it")))
+}
+
 async fn ids(admin: &mut Wire) -> Vec<String> {
     wire::text_rows(&admin.simple_ok("SELECT id FROM ib ORDER BY id").await)
         .into_iter()
@@ -67,6 +72,9 @@ async fn a_batch_and_a_multi_statement_string_are_one_transaction() {
     assert_eq!(wire::error_code(&r).as_deref(), Some("23505"), "{}", wire::render(&r));
     assert_eq!(ready_status(&r), 'I');
     assert_eq!(ids(&mut admin).await, ["1", "2", "3"], "a failed batch kept its earlier statements");
+    // And says so: the first INSERT was answered as a success. (Not
+    // PostgreSQL's: it sends nothing more than the error.)
+    assert!(rolled_back_notice(&r, "the statement before"), "{}", wire::render(&r));
     // In step afterwards: the next batch runs normally.
     let r = c.exchange(&batch(&["INSERT INTO ib (id) VALUES (4)"])).await;
     assert_eq!(wire::error_code(&r), None, "{}", wire::render(&r));
@@ -132,6 +140,7 @@ async fn a_batch_and_a_multi_statement_string_are_one_transaction() {
     assert_eq!(wire::error_code(&r).as_deref(), Some("23505"), "{}", wire::render(&r));
     assert_eq!(ready_status(&r), 'I');
     assert_eq!(ids(&mut admin).await, ["1", "2", "3", "4", "7", "8", "9"], "a failed string kept its earlier statements");
+    assert!(rolled_back_notice(&r, "the statement before"), "{:?}", r);
     // And a good one commits all of them.
     c.simple_ok("INSERT INTO ib (id) VALUES (12); INSERT INTO ib (id) VALUES (13)").await;
     assert_eq!(ids(&mut admin).await, ["1", "2", "3", "4", "7", "8", "9", "12", "13"]);

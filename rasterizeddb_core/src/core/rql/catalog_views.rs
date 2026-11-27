@@ -60,6 +60,9 @@ const VIEWS: &[&str] = &[
     "pg_constraint",
     "pg_am",
     "pg_roles",
+    "pg_authid",
+    "pg_auth_members",
+    "pg_default_acl",
     "pg_user",
     "pg_collation",
     "pg_description",
@@ -77,6 +80,10 @@ const VIEWS: &[&str] = &[
     "table_constraints",
     "key_column_usage",
     "referential_constraints",
+    "table_privileges",
+    "role_table_grants",
+    "usage_privileges",
+    "routine_privileges",
 ];
 
 /// The relations built from [`crate::core::rql::catalog_model::Model`].
@@ -341,7 +348,7 @@ const SCHEMA: &str = "public";
 /// COLUMNS FROM "rdb_roles"` became `SHOW __cat_columns_… FROM "rdb_roles"`,
 /// which returned one empty column and left every client that asks a table for
 /// its columns believing it had none.
-const QUALIFIED_ONLY: [&str; 7] = [
+const QUALIFIED_ONLY: [&str; 11] = [
     "columns",
     "tables",
     "views",
@@ -349,6 +356,10 @@ const QUALIFIED_ONLY: [&str; 7] = [
     "table_constraints",
     "key_column_usage",
     "referential_constraints",
+    "table_privileges",
+    "role_table_grants",
+    "usage_privileges",
+    "routine_privileges",
 ];
 
 /// Whether `view` may only be matched with its schema in front of it.
@@ -1236,7 +1247,7 @@ pub(crate) async fn model_for(
 /// [`build`], with the model made first when the relation needs one, as
 /// [`materialize`] makes it.
 #[cfg(test)]
-async fn build_alone(
+pub(crate) async fn build_alone(
     view: &str,
     database: &Arc<Database>,
     tx: crate::core::mvcc::transaction::TxId,
@@ -1832,9 +1843,10 @@ async fn build(
         "pg_database" => {
             // `datallowconn` and `datistemplate` are constants: every database
             // here accepts connections and none is a template.
+            // Strict tenant mode shows a session only its own database (T3).
             let names: Vec<String> = match catalog {
-                Some(catalog) => catalog.names(),
-                None => vec![database.name.clone()],
+                Some(catalog) if !crate::core::policy_hooks::installed() => catalog.names(),
+                _ => vec![database.name.clone()],
             };
             let rows = names
                 .iter()

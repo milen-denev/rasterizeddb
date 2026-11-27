@@ -242,7 +242,13 @@ jobs:
             server="$client"
           fi
           echo "baselines: $client (client crates, rastcp), $server (embedded SDK)"
-          cargo semver-checks --baseline-rev "$client" -p rastcp -p rasterizeddb_client -p rasterizeddb_client_derive
+          cargo semver-checks --baseline-rev "$client" -p rastcp -p rasterizeddb_client_derive
+          # The client's features but `fips`: semver-checks builds every
+          # feature by default, and `fips` builds the AWS-LC FIPS module,
+          # which needs Go and CMake this runner does not carry. `fips` adds
+          # no API of its own (it swaps SCRAM's hash implementation).
+          cargo semver-checks --baseline-rev "$client" -p rasterizeddb_client \
+            --default-features --features chrono --features uuid --features serde_json
           cargo semver-checks --baseline-rev "$server" -p rasterizeddb_embedded
 
   package:
@@ -257,8 +263,14 @@ jobs:
       # One invocation, so the crates that depend on each other verify
       # against the packaged versions of each other (cargo >= 1.90), exactly
       # as crates.io would build them.
-      - name: cargo package (the five published crates)
+      # rasterizeddb_router (the client's `sharding` feature, the engine) and
+      # rasterizeddb_raft (the engine's `sharding_raft`) are published too:
+      # crates.io resolves optional dependencies as well, so without them the
+      # client and the engine cannot be packaged at all. rasterizeddb_mq (the
+      # client's and the engine's `broker` feature) for the same reason.
+      - name: cargo package (the eight published crates)
         run: >
           cargo package --locked
-          -p rastcp -p rasterizeddb_client_derive -p rasterizeddb_client
+          -p rastcp -p rasterizeddb_mq -p rasterizeddb_router -p rasterizeddb_raft
+          -p rasterizeddb_client_derive -p rasterizeddb_client
           -p rasterizeddb_core -p rasterizeddb_embedded

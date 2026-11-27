@@ -1,6 +1,6 @@
 [package]
 name = "rasterizeddb_client"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 description = "A client SDK and ORM for RasterizedDB's native protocol that does not compile the engine"
 repository = "https://github.com/milen-denev/rasterizeddb"
@@ -27,7 +27,7 @@ cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
 # the tests in `tests/` run them against a real server so the
 # copies cannot drift unnoticed.
 [dependencies]
-rastcp = { path = "../rastcp", version = "1.0.1" }
+rastcp = { path = "../rastcp", version = "1.0.2" }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 libc = "0.2"
 # The operating system's random generator on every platform (Linux's
@@ -41,16 +41,45 @@ pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 base64 = "0.23"
 # RowStream is a futures_core::Stream (the trait only, no executor).
 futures-core = { version = "0.3", default-features = false }
-rasterizeddb_client_derive = { path = "../rasterizeddb_client_derive", version = "1.0.1", optional = true }
+rasterizeddb_client_derive = { path = "../rasterizeddb_client_derive", version = "1.0.2", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
 uuid = { version = "1", default-features = false, optional = true }
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
+# route_v1 and the shard map (feature `sharding`): the same code the engine
+# routes with. No dependencies of its own.
+rasterizeddb_router = { path = "../rasterizeddb_router", version = "1.0.0", optional = true }
+# The message broker's batch format and wire protocol (feature `broker`):
+# the same crate the server lays batches out with.
+rasterizeddb_mq = { path = "../rasterizeddb_mq", version = "1.0.1", optional = true }
+# TLS for the broker's native port (feature `broker`); rastcp brings it
+# already, with the certificate trust this reuses.
+tokio-rustls = { version = "0.26", optional = true, default-features = false }
+# Ed25519 for signing cluster maps in `rdb-shard` (sharding-plan.md B2);
+# already in the tree as rustls's crypto provider.
+aws-lc-rs = { version = "1.19", optional = true }
 
 [features]
-default = ["derive"]
+default = ["derive", "sharding", "broker"]
 # `#[derive(Model)]`, `#[derive(FromRow)]` and `#[derive(SqlEnum)]`.
 derive = ["dep:rasterizeddb_client_derive"]
+# FIPS 140-3: SCRAM's SHA-256, HMAC and PBKDF2 through the AWS-LC FIPS module
+# (needs CMake, Go and Perl to build). TLS follows the process's rustls
+# provider: install rustls's FIPS provider before connecting.
+fips = ["dep:aws-lc-rs", "aws-lc-rs/fips"]
+# Client-side sharding: `shard::Router` over N servers, the ORM routed by
+# `#[rdb(shard_by)]`, fan-out reads, and the `rdb-shard` tool
+# (docs/sharding-client.md). Dormant until a `Router` is built.
+sharding = ["dep:rasterizeddb_router", "dep:aws-lc-rs"]
+# The message broker's native client (`broker::Broker`, docs/broker.md):
+# topics, queues, exchanges, a batching producer and push subscriptions.
+broker = ["dep:rasterizeddb_mq", "dep:tokio-rustls", "tokio/io-util"]
+# Test-only failure injection in `rdb-shard` (`RDB_SHARD_FAIL`, read from the
+# environment): a move made to fail, or the process to exit, at a named point.
+# Off by default and never in a release build: a stray variable on a
+# production box would break a move on purpose. tests/cluster/cluster_e2e.py
+# needs it for its failed_moves phase.
+fault_points = ["sharding"]
 # ToSql/FromSql for chrono's DateTime<Utc>, NaiveDateTime, NaiveDate, NaiveTime.
 chrono = ["dep:chrono"]
 # ToSql/FromSql for uuid::Uuid.
@@ -83,3 +112,25 @@ required-features = ["derive"]
 name = "kv"
 doc-scrape-examples = true
 required-features = ["derive"]
+
+# The offline shard tool: init, show, move-tenant, rollback, retire.
+[[bin]]
+name = "rdb-shard"
+path = "src/bin/rdb_shard.rs"
+required-features = ["sharding"]
+
+[[example]]
+name = "broker_bench"
+required-features = ["broker"]
+
+[[example]]
+name = "broker_crash"
+required-features = ["broker"]
+
+[[example]]
+name = "broker_acl"
+required-features = ["broker"]
+
+[[example]]
+name = "broker_repl"
+required-features = ["broker"]

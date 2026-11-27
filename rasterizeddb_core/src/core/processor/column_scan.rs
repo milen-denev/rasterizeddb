@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use crate::core::db_type::DbType;
 use crate::core::row::row::RowFetch;
-use crate::core::row::row_pointer::{string_extent, STRING_HEADER_BYTES};
+use crate::core::row::row_pointer::{string_cell, tail_value, StringCell, STRING_HEADER_BYTES};
 use crate::core::storage_providers::traits::StorageIO;
 
 /// 0 = not read yet, 1 = on, 2 = off.
@@ -413,16 +413,27 @@ impl<'l> Gather<'l> {
         }
         // The strings: every header checked as `fetch_row` checks it, then
         // every value read to where it stays, in one read.
-        let mut extents: Vec<(u64, usize)> = Vec::new();
+        // Each value's stored bytes and size, and whether they are read where
+        // the value stays (a value in its row's tail frame is not: it is
+        // copied there once the frame is decompressed).
+        let mut extents: Vec<(u64, usize, bool)> = Vec::new();
         let mut reads: Vec<(u64, &mut [u8])> = Vec::new();
         let mut string_columns = 0;
-        for (((buf, ends), headers), col) in self
+        // The columns holding a compressed value (`core::compression`): the
+        // column, where its batch starts in its buffer and in its ends, and
+        // which of the batch's values are frames. Decoded once read.
+        let mut frames: Vec<(usize, usize, usize, Vec<bool>)> = Vec::new();
+        // The values in a row's tail frame: the column, where the value goes
+        // in its buffer, the frame, and where in the frame the value is.
+        let mut tails: Vec<(usize, usize, u64, usize, usize, usize)> = Vec::new();
+        for (column, (((buf, ends), headers), col)) in self
             .chunk
             .cols
             .iter_mut()
             .zip(self.chunk.ends.iter_mut())
             .zip(self.headers.iter())
             .zip(layout.columns.iter())
+            .enumerate()
         {
             if !col.text {
                 continue;
@@ -430,19 +441,37 @@ impl<'l> Gather<'l> {
             string_columns += 1;
             extents.clear();
             let at = buf.len();
+            let ends_at = ends.len();
             let mut end = at;
-            for (header, &(position, length)) in headers.chunks_exact(STRING_HEADER_BYTES).zip(rows) {
-                let extent = string_extent(position, length, header)?;
-                end += extent.1;
+            let mut flags: Option<Vec<bool>> = None;
+            for (k, (header, &(position, length))) in headers.chunks_exact(STRING_HEADER_BYTES).zip(rows).enumerate() {
+                match string_cell(position, length, header)? {
+                    StringCell::Bytes { at, len, frame } => {
+                        if frame {
+                            flags.get_or_insert_with(|| vec![false; rows.len()])[k] = true;
+                        }
+                        extents.push((at, len, true));
+                        end += len;
+                    }
+                    StringCell::InTail { frame_at, frame_len, pos, len } => {
+                        if len != 0 {
+                            tails.push((column, end, frame_at, frame_len, pos, len));
+                        }
+                        extents.push((0, len, false));
+                        end += len;
+                    }
+                }
                 ends.push(end);
-                extents.push(extent);
+            }
+            if let Some(flags) = flags {
+                frames.push((column, at, ends_at, flags));
             }
             buf.resize(end, 0);
             let mut rest = &mut buf[at..];
-            for &(from, size) in &extents {
+            for &(from, size, read) in &extents {
                 let (value, after) = rest.split_at_mut(size);
                 rest = after;
-                if size != 0 {
+                if read && size != 0 {
                     reads.push((from, value));
                 }
             }
@@ -453,6 +482,32 @@ impl<'l> Gather<'l> {
         }
         if !reads.is_empty() && !io.try_read_vectored_sync(&mut reads) {
             io.read_vectored(&mut reads).await?;
+        }
+        drop(reads);
+        if !tails.is_empty() {
+            // A row's values together, so its frame is decompressed once.
+            tails.sort_unstable_by_key(|t| (t.2, t.0));
+            let mut decoded: Option<(u64, crate::memory_pool::MemoryBlock)> = None;
+            for &(column, to, frame_at, frame_len, pos, len) in &tails {
+                if decoded.as_ref().map(|(at, _)| *at) != Some(frame_at) {
+                    let mut frame = vec![0u8; frame_len];
+                    {
+                        let mut read = vec![(frame_at, &mut frame[..])];
+                        if !io.try_read_vectored_sync(&mut read) {
+                            io.read_vectored(&mut read).await?;
+                        }
+                    }
+                    decoded = Some((frame_at, crate::core::compression::decompress(&frame)?));
+                }
+                let tail = &decoded.as_ref().expect("decoded above").1;
+                let value = tail_value(tail.into_slice(), pos, len)?;
+                self.chunk.cols[column][to..to + len].copy_from_slice(value);
+            }
+        }
+        // After the tails: their values stand in the buffer as values, which
+        // this moves with the rest.
+        for (column, at, ends_at, flags) in frames {
+            decode_frames(&mut self.chunk.cols[column], &mut self.chunk.ends[column], at, ends_at, &flags)?;
         }
         Ok(together)
     }
@@ -476,4 +531,25 @@ impl<'l> Gather<'l> {
         );
         read.map(|()| chunk)
     }
+}
+
+/// Replaces the stored frames among one batch of a string column's values
+/// with the values they hold. The batch is `buf[at..]`, its values ending at
+/// `ends[ends_at..]`; `flags[k]` says the `k`-th is a frame. The ends move
+/// with the values.
+fn decode_frames(buf: &mut Vec<u8>, ends: &mut [usize], at: usize, ends_at: usize, flags: &[bool]) -> std::io::Result<()> {
+    let stored = buf.split_off(at);
+    let mut from = 0;
+    for (k, &frame) in flags.iter().enumerate() {
+        let to = ends[ends_at + k] - at;
+        let value = &stored[from..to];
+        from = to;
+        if frame {
+            buf.extend_from_slice(crate::core::compression::decompress(value)?.into_slice());
+        } else {
+            buf.extend_from_slice(value);
+        }
+        ends[ends_at + k] = buf.len();
+    }
+    Ok(())
 }

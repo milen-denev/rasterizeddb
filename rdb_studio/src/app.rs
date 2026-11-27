@@ -136,6 +136,12 @@ pub struct Studio {
     pub query_notices: Vec<String>,
     /// The server's roles, for the ROLES tab.
     pub roles: Vec<RoleInfo>,
+    /// What each role may reach: grants, default privileges, policies.
+    pub role_access: crate::model::RoleAccess,
+    /// The role whose detail the ROLES tab shows.
+    pub role_selected: Option<String>,
+    /// The ROLES tab's form inputs, by key; reset when another role is chosen.
+    pub role_inputs: std::collections::BTreeMap<String, String>,
     /// What Ctrl+Space offered for the word before the editor's cursor.
     pub completions: Vec<String>,
     /// The KEYS tab.
@@ -187,8 +193,26 @@ pub struct Studio {
     pub branch_form: BranchForm,
     /// The branch whose diff is shown, and the diff: `None` while it loads.
     pub branch_diff: Option<(String, Option<Result<Vec<BranchDiffRow>, String>>)>,
+
+    // --- broker
+    /// Everything the broker page reads, or `None` before the first load.
+    pub broker: Option<BrokerSnapshot>,
+    pub broker_form: BrokerForm,
+    pub broker_publish: BrokerPublishForm,
+    pub broker_read: BrokerReadForm,
+    /// What the message panel shows: a READ, a POP or a topic's partitions.
+    pub broker_browse: Option<BrokerBrowse>,
+    pub broker_perm: BrokerPermForm,
     pub merge_policy: MergePolicy,
     pub merge_allow_drop: bool,
+
+    // --- shards
+    pub shards: Option<ShardsSnapshot>,
+    // --- ledger (enterprise)
+    #[cfg(feature = "enterprise")]
+    pub ledger: Option<rdb_studio_enterprise::LedgerPage>,
+    /// The last `SHOW REBALANCE PLAN` on the shards page, or why it failed.
+    pub rebalance_plan: Option<Result<Vec<RebalanceStep>, String>>,
 
     // --- replication
     pub replication: Option<ReplicationSnapshot>,
@@ -257,14 +281,32 @@ pub enum Tab {
     Branches,
     Storage,
     Replication,
+    Shards,
     Migrate,
     Keys,
+    Broker,
     Roles,
     Config,
+    /// Ledger tables and secret vaults (the enterprise build).
+    #[cfg(feature = "enterprise")]
+    Ledger,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 16] = [
+    #[cfg(feature = "enterprise")]
+    pub const ALL: [Tab; 19] = {
+        let mut all = [Tab::Ledger; 19];
+        let mut i = 0;
+        while i < 18 {
+            all[i] = Self::GPL[i];
+            i += 1;
+        }
+        all
+    };
+    #[cfg(not(feature = "enterprise"))]
+    pub const ALL: [Tab; 18] = Self::GPL;
+
+    const GPL: [Tab; 18] = [
         Tab::Dashboard,
         Tab::Overview,
         Tab::Tables,
@@ -288,9 +330,15 @@ impl Tab {
         // opening one usually wants the other.
         Tab::Storage,
         Tab::Replication,
+        // After REPLICATION: both are about the other nodes, one holding
+        // copies of this one's rows, the other holding the rest of them.
+        Tab::Shards,
         Tab::Migrate,
         // The key/value store: data, but not tables.
         Tab::Keys,
+        // Next to KEYS: the other thing a server holds that is not a table,
+        // messages instead of values.
+        Tab::Broker,
         // Before CONFIG: who may connect, then how the server behaves.
         Tab::Roles,
         Tab::Config,
@@ -310,10 +358,14 @@ impl Tab {
             Tab::Branches => "BRANCHES",
             Tab::Storage => "STORAGE",
             Tab::Replication => "REPLICATION",
+            Tab::Shards => "SHARDS",
             Tab::Migrate => "MIGRATE",
             Tab::Keys => "KEYS",
+            Tab::Broker => "BROKER",
             Tab::Roles => "ROLES",
             Tab::Config => "CONFIG",
+            #[cfg(feature = "enterprise")]
+            Tab::Ledger => "LEDGER",
         }
     }
 }
@@ -381,6 +433,9 @@ pub enum Modal {
     Confirm { title: String, body: String, statement: String, refresh: Refresh },
     /// Renaming a column, changing its type, or whether it takes NULL.
     EditColumn { table: String, edit: ColumnEdit, error: Option<String> },
+    /// A table's row compression (RasterizedDB): every row's variable-width
+    /// values stored as one zstd frame.
+    RowCompression { table: String, edit: RowCompressionEdit, error: Option<String> },
     CreateRole {
         name: String,
         password: String,
@@ -415,10 +470,16 @@ pub struct ColumnEdit {
     /// included.
     pub data_type: String,
     pub nullable: bool,
+    /// What `SHOW TABLE STATS` says the column is compressed with (`zstd(9)`),
+    /// empty for none or when the server does not say.
+    pub original_compression: String,
+    pub compression: String,
 }
 
 impl ColumnEdit {
-    pub fn of(column: &ColumnInfo) -> Self {
+    /// `compression`: the column's current method, as `SHOW TABLE STATS`'
+    /// `compressed_columns` names it, or empty.
+    pub fn of(column: &ColumnInfo, compression: &str) -> Self {
         ColumnEdit {
             original: column.name.clone(),
             original_type: column.data_type.clone(),
@@ -426,6 +487,8 @@ impl ColumnEdit {
             name: column.name.clone(),
             data_type: column.data_type.clone(),
             nullable: column.nullable,
+            original_compression: compression.to_string(),
+            compression: compression.to_string(),
         }
     }
 
@@ -459,6 +522,18 @@ impl ColumnEdit {
                 if self.nullable { "DROP" } else { "SET" }
             ));
         }
+        // New values only, as in PostgreSQL: rows already written keep what
+        // they have until the table is recompressed.
+        if !self.compression.trim().eq_ignore_ascii_case(self.original_compression.trim()) {
+            let method = if self.compression.trim().is_empty() {
+                "default".to_string()
+            } else {
+                compression_method(&self.compression)?
+            };
+            statements.push(format!(
+                "ALTER TABLE {table} ALTER COLUMN {column} SET COMPRESSION {method}"
+            ));
+        }
         if name != self.original {
             statements.push(format!(
                 "ALTER TABLE {table} RENAME COLUMN {column} TO {}",
@@ -489,6 +564,8 @@ pub struct NewColumn {
     pub primary_key: bool,
     pub unique: bool,
     pub default: String,
+    /// `COMPRESSION …`, empty for the server's default (none).
+    pub compression: String,
 }
 
 impl NewColumn {
@@ -506,6 +583,7 @@ impl NewColumn {
             primary_key: false,
             unique: false,
             default: String::new(),
+            compression: String::new(),
         }
     }
 
@@ -524,6 +602,7 @@ impl NewColumn {
             primary_key: true,
             unique: false,
             default: String::new(),
+            compression: String::new(),
         }
     }
 
@@ -723,6 +802,15 @@ pub enum Refresh {
     /// A branch was made, reset, swapped, merged or dropped: the branch list,
     /// and the databases, which branches are.
     Branches,
+    /// A rebalance was started: the shards page and its status.
+    Shards,
+    /// A topic, queue, subscription, exchange or binding was made or
+    /// dropped, or a message published: the broker page.
+    Broker,
+    /// A ledger table or vault changed (a confirmed hold, release, delete,
+    /// purge or key rotation): the LEDGER page.
+    #[cfg(feature = "enterprise")]
+    Ledger,
 }
 
 #[derive(Debug, Clone)]
@@ -779,6 +867,13 @@ pub enum Message {
     SchemaLoaded(Result<SchemaGraph, String>),
     ConfigLoaded(Result<Vec<ConfigEntry>, String>),
     RolesLoaded(Result<Vec<RoleInfo>, String>),
+    RoleAccessLoaded(Box<crate::model::RoleAccess>),
+    /// Show (or, with `None`, close) one role's detail.
+    RoleManage(Option<String>),
+    /// A ROLES form input changed: (key, value).
+    RoleInput(String, String),
+    /// Run a statement the ROLES detail built, then reload the tab.
+    RoleRun(String),
     /// The KEYS tab's pattern box.
     KvPattern(String),
     /// Scan from the start (`false`) or on from the last page (`true`).
@@ -862,6 +957,68 @@ pub enum Message {
     ResetBranch(String),
     PromoteBranch(String),
     DropBranch(String),
+    // --- broker
+    ReloadBroker,
+    BrokerLoaded(Box<BrokerSnapshot>),
+    BrokerKind(BrokerCreateKind),
+    BrokerField(views::broker::BrokerField, String),
+    BrokerViaExchange(bool),
+    BrokerCreate,
+    BrokerPublish,
+    /// READ a topic (or a queue: it is a topic) into the message panel.
+    BrokerRead(String),
+    /// POP a queue: takes and acknowledges what it shows.
+    BrokerPop(String),
+    BrokerPartitions(String),
+    /// A READ, POP or SHOW PARTITIONS answered: its statement and rows.
+    BrokerBrowseLoaded(String, Result<Grid, String>),
+    BrokerCloseBrowse,
+    /// TOPIC, QUEUE or EXCHANGE, and its name.
+    BrokerDrop(&'static str, String),
+    /// A subscription's topic and name.
+    BrokerDropSubscription(String, String),
+    BrokerUnbind(BrokerBinding),
+    BrokerPermKind(BrokerObjectKind),
+    /// The first (`true`) or second privilege of the kind, on or off.
+    BrokerPermToggle(bool, bool),
+    /// GRANT (`false`) or REVOKE (`true`) what the form says.
+    BrokerGrant(bool),
+    BrokerOwner,
+    /// REVOKE one listed grant.
+    BrokerRevokeRow(BrokerGrant),
+
+    // --- shards
+    ReloadShards,
+    // --- ledger (enterprise)
+    #[cfg(feature = "enterprise")]
+    ReloadLedger,
+    #[cfg(feature = "enterprise")]
+    LedgerLoaded(Box<rdb_studio_enterprise::LedgerPage>),
+    #[cfg(feature = "enterprise")]
+    VerifyLedger,
+    #[cfg(feature = "enterprise")]
+    LedgerVerified(Vec<String>),
+    #[cfg(feature = "enterprise")]
+    LedgerAudit(String),
+    #[cfg(feature = "enterprise")]
+    LedgerAuditLoaded(String, Vec<String>),
+    /// Runs a statement the LEDGER page built, then reloads the page.
+    #[cfg(feature = "enterprise")]
+    LedgerRun(String),
+    #[cfg(feature = "enterprise")]
+    LedgerRan(Box<(String, Result<Vec<String>, String>)>),
+    /// A LEDGER page input changed: (key, value).
+    #[cfg(feature = "enterprise")]
+    LedgerInput(String, String),
+    /// Open a ledger table on the DATA tab.
+    #[cfg(feature = "enterprise")]
+    LedgerOpenTable(String),
+    ShardsLoaded(Box<ShardsSnapshot>),
+    /// Asks the gateway for the planner's moves.
+    PlanRebalance,
+    RebalancePlanned(Result<Vec<RebalanceStep>, String>),
+    /// Confirms, then starts a rebalance on the gateway.
+    StartRebalance,
 
     // --- replication
     ReloadReplication,
@@ -1153,10 +1310,16 @@ pub enum ModalKind {
     CreateDatabase,
     AddColumn,
     CreateIndex,
+    /// A table's `row_compression`, and a rewrite of its rows under it.
+    RowCompression,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalField {
+    /// A compression method: `zstd`, `zstd(9)`, `none`, `default`.
+    Compression,
+    /// Whether to rewrite the existing rows (`ALTER TABLE … RECOMPRESS`).
+    Recompress,
     Name,
     Length,
     Precision,
@@ -1271,6 +1434,9 @@ impl Studio {
             row_limit: RowLimit::default(),
             query_notices: Vec::new(),
             roles: Vec::new(),
+            role_access: crate::model::RoleAccess::default(),
+            role_selected: None,
+            role_inputs: std::collections::BTreeMap::new(),
             completions: Vec::new(),
             kv: KvBrowser::default(),
             editor_transaction: None,
@@ -1291,8 +1457,18 @@ impl Studio {
             branches: None,
             branch_form: BranchForm::default(),
             branch_diff: None,
+            broker: None,
+            broker_form: BrokerForm::default(),
+            broker_publish: BrokerPublishForm::default(),
+            broker_read: BrokerReadForm::default(),
+            broker_browse: None,
+            broker_perm: BrokerPermForm::default(),
             merge_policy: MergePolicy::Fail,
             merge_allow_drop: false,
+            shards: None,
+            #[cfg(feature = "enterprise")]
+            ledger: None,
+            rebalance_plan: None,
             replication: None,
             peer_name: String::new(),
             peer_address: String::new(),
@@ -1351,6 +1527,10 @@ impl Studio {
     /// nobody is looking at.
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subscriptions = Vec::new();
+        // A rebalance running: its status every two seconds.
+        if self.session.is_some() && self.tab == Tab::Shards && self.shards.as_ref().is_some_and(ShardsSnapshot::rebalance_running) {
+            subscriptions.push(iced::time::every(Duration::from_secs(2)).map(|_| Message::ReloadShards));
+        }
         if self.session.is_some() && self.live && self.tab == Tab::Dashboard {
             subscriptions.push(
                 iced::time::every(Duration::from_secs(self.interval.max(1))).map(|_| Message::Tick),
@@ -1658,6 +1838,8 @@ impl Studio {
                 self.backup = None;
                 self.activity = None;
                 self.replication = None;
+                self.shards = None;
+                self.rebalance_plan = None;
                 self.storage = None;
                 self.storage_report.clear();
                 self.tables.clear();
@@ -1671,6 +1853,14 @@ impl Studio {
             // ---- navigation ------------------------------------------------
             Message::SelectTab(tab) => {
                 self.tab = tab;
+                // A revealed vault value does not outlive the page it was
+                // revealed on.
+                #[cfg(feature = "enterprise")]
+                if tab != Tab::Ledger {
+                    if let Some(page) = self.ledger.as_mut() {
+                        page.hide();
+                    }
+                }
                 match tab {
                     // Sampled on arrival so the page is not blank for a tick.
                     Tab::Dashboard if self.live => self.sample(),
@@ -1694,11 +1884,17 @@ impl Studio {
                     // Same reasoning as the backup catalogue: a stale answer on
                     // this page is worse than a slow one.
                     Tab::Replication => self.load_replication(),
+                    // A map changes when a shard is added or a range moves.
+                    Tab::Shards => self.load_shards(),
+                    #[cfg(feature = "enterprise")]
+                    Tab::Ledger => self.load_ledger(),
                     // And again: free space is the figure this page exists to
                     // report, and a cached one is worse than useless.
                     Tab::Storage => self.load_storage(),
                     // A list of databases, which other consoles make and drop.
                     Tab::Branches => self.load_branches(),
+                    // Depths and backlogs move all the time.
+                    Tab::Broker => self.load_broker(),
                     _ => Task::none(),
                 }
             }
@@ -1876,7 +2072,48 @@ impl Studio {
             }),
             Message::RolesLoaded(result) => self.absorb(result, |studio, roles| {
                 studio.roles = roles;
+                if studio.role_selected.as_ref().is_some_and(|r| !studio.roles.iter().any(|x| &x.name == r)) {
+                    studio.role_selected = None;
+                }
             }),
+            Message::RoleAccessLoaded(access) => {
+                self.role_access = *access;
+                Task::none()
+            }
+            Message::RoleManage(role) => {
+                self.role_inputs.clear();
+                if let Some(r) = role.as_ref().and_then(|n| self.roles.iter().find(|r| &r.name == n)) {
+                    // The attribute form starts from what the role has.
+                    for (k, on) in [
+                        ("login", r.can_login),
+                        ("superuser", r.superuser),
+                        ("createdb", r.create_db),
+                        ("createrole", r.create_role),
+                        ("bypassrls", r.bypass_rls),
+                    ] {
+                        self.role_inputs.insert(k.to_string(), on.to_string());
+                    }
+                    if r.conn_limit >= 0 {
+                        self.role_inputs.insert("connlimit".into(), r.conn_limit.to_string());
+                    }
+                    if let Some(v) = &r.valid_until {
+                        self.role_inputs.insert("validuntil".into(), v.clone());
+                    }
+                }
+                self.role_selected = role;
+                Task::none()
+            }
+            Message::RoleInput(key, value) => {
+                self.role_inputs.insert(key, value);
+                Task::none()
+            }
+            Message::RoleRun(sql) => {
+                // A form's text is spent once sent; the attribute toggles stay.
+                for k in ["password", "rename", "grant_table", "policy_name", "policy_using", "policy_check", "member"] {
+                    self.role_inputs.remove(k);
+                }
+                self.statement(sql, Refresh::Roles)
+            }
             Message::ConfigLoaded(result) => self.absorb(result, |studio, config| {
                 studio.config = config;
                 studio.config_edits.clear();
@@ -2333,7 +2570,300 @@ impl Studio {
                 });
                 Task::none()
             }
+            Message::ReloadBroker => self.load_broker(),
+            Message::BrokerLoaded(snapshot) => {
+                self.broker = Some(*snapshot);
+                Task::none()
+            }
+            Message::BrokerKind(kind) => {
+                self.broker_form.kind = kind;
+                Task::none()
+            }
+            Message::BrokerField(field, value) => {
+                use views::broker::BrokerField as F;
+                let (f, p, r) = (&mut self.broker_form, &mut self.broker_publish, &mut self.broker_read);
+                match field {
+                    F::Name => f.name = value,
+                    F::Partitions => f.partitions = value,
+                    F::Durability => f.durability = value,
+                    F::Retention => f.retention = value,
+                    F::RetentionBytes => f.retention_bytes = value,
+                    F::MaxDeliveries => f.max_deliveries = value,
+                    F::DeadLetter => f.dead_letter = value,
+                    F::AckTimeout => f.ack_timeout = value,
+                    F::ExchangeType => f.exchange_type = value,
+                    F::Target => f.target = value,
+                    F::Mode => f.mode = value,
+                    F::From => f.from = value,
+                    F::Key => f.key = value,
+                    F::PublishTarget => p.target = value,
+                    F::PublishRoutingKey => p.routing_key = value,
+                    F::PublishValue => p.value = value,
+                    F::PublishKey => p.key = value,
+                    F::PublishHeaderName => p.header_name = value,
+                    F::PublishHeaderValue => p.header_value = value,
+                    F::ReadPartition => r.partition = value,
+                    F::ReadFrom => r.from = value,
+                    F::ReadLimit => r.limit = value,
+                    F::PermObject => self.broker_perm.object = value,
+                    F::PermGrantee => self.broker_perm.grantee = value,
+                    F::PermOwner => self.broker_perm.owner = value,
+                }
+                Task::none()
+            }
+            Message::BrokerViaExchange(via) => {
+                self.broker_publish.via_exchange = via;
+                Task::none()
+            }
+            Message::BrokerCreate => match dialect::broker_create_sql(&self.broker_form) {
+                Ok(sql) => {
+                    // The kind stays: making several of one kind is the usual case.
+                    self.broker_form = BrokerForm { kind: self.broker_form.kind, ..BrokerForm::default() };
+                    self.statement(sql, Refresh::Broker)
+                }
+                Err(e) => {
+                    self.status = Status::Failed(e);
+                    Task::none()
+                }
+            },
+            Message::BrokerPublish => match dialect::broker_publish_sql(&self.broker_publish) {
+                // The form is kept: publishing a few in a row is the usual case.
+                Ok(sql) => self.statement(sql, Refresh::Broker),
+                Err(e) => {
+                    self.status = Status::Failed(e);
+                    Task::none()
+                }
+            },
+            Message::BrokerRead(topic) => match dialect::broker_read_sql(&topic, &self.broker_read) {
+                Ok(sql) => self.broker_browse(format!("{} (READ, nothing taken)", topic.to_uppercase()), sql),
+                Err(e) => {
+                    self.status = Status::Failed(e);
+                    Task::none()
+                }
+            },
+            Message::BrokerPop(queue) => match dialect::broker_pop_sql(&queue, &self.broker_read.limit) {
+                Ok(sql) => self.broker_browse(format!("{} (POPPED: taken and acknowledged)", queue.to_uppercase()), sql),
+                Err(e) => {
+                    self.status = Status::Failed(e);
+                    Task::none()
+                }
+            },
+            Message::BrokerPartitions(topic) => {
+                let sql = dialect::broker_partitions_sql(&topic);
+                self.broker_browse(format!("{} PARTITIONS", topic.to_uppercase()), sql)
+            }
+            Message::BrokerBrowseLoaded(sql, result) => {
+                let popped = sql.starts_with("BROKER POP");
+                // Only for the statement still shown: a slow answer for an
+                // earlier one must not replace it.
+                if let Some(browse) = &mut self.broker_browse
+                    && browse.statement == sql
+                {
+                    browse.result = Some(result);
+                }
+                // A POP changed the queue's depth.
+                if popped { self.load_broker() } else { Task::none() }
+            }
+            Message::BrokerCloseBrowse => {
+                self.broker_browse = None;
+                Task::none()
+            }
+            Message::BrokerDrop(what, name) => {
+                let body = match what {
+                    "TOPIC" => format!("Topic {name} is deleted with every message in it, and its subscriptions with it."),
+                    "QUEUE" => format!("Queue {name} is deleted with every message in it, delivered or not."),
+                    _ => format!("Exchange {name} is deleted with its bindings. The topics and queues it routed to stay."),
+                };
+                self.modal = Some(Modal::Confirm {
+                    title: format!("Drop {} {name}", what.to_lowercase()),
+                    body,
+                    statement: dialect::broker_drop_sql(what, &name),
+                    refresh: Refresh::Broker,
+                });
+                Task::none()
+            }
+            Message::BrokerDropSubscription(topic, name) => {
+                self.modal = Some(Modal::Confirm {
+                    title: format!("Drop subscription {name}"),
+                    body: format!(
+                        "Subscription {name} on {topic} is deleted with its position and its unacknowledged \
+                         deliveries. The topic's messages stay."
+                    ),
+                    statement: dialect::broker_drop_subscription_sql(&topic, &name),
+                    refresh: Refresh::Broker,
+                });
+                Task::none()
+            }
+            Message::BrokerUnbind(binding) => self.statement(dialect::broker_unbind_sql(&binding), Refresh::Broker),
+            Message::BrokerPermKind(kind) => {
+                if self.broker_perm.kind != kind {
+                    // The privileges are the kind's own.
+                    self.broker_perm.first = false;
+                    self.broker_perm.second = false;
+                }
+                self.broker_perm.kind = kind;
+                Task::none()
+            }
+            Message::BrokerPermToggle(first, on) => {
+                if first {
+                    self.broker_perm.first = on;
+                } else {
+                    self.broker_perm.second = on;
+                }
+                Task::none()
+            }
+            Message::BrokerGrant(revoke) => match dialect::broker_grant_sql(&self.broker_perm, revoke) {
+                Ok(sql) => self.statement(sql, Refresh::Broker),
+                Err(e) => {
+                    self.status = Status::Failed(e);
+                    Task::none()
+                }
+            },
+            Message::BrokerOwner => match dialect::broker_owner_sql(&self.broker_perm) {
+                Ok(sql) => {
+                    let (kind, object, owner) =
+                        (self.broker_perm.kind, self.broker_perm.object.trim().to_string(), self.broker_perm.owner.trim().to_string());
+                    self.modal = Some(Modal::Confirm {
+                        title: format!("Give {} {object} to {owner}", kind.label().to_lowercase()),
+                        body: format!(
+                            "{owner} becomes the owner of {object}: only it (or a superuser) may then alter or drop \
+                             it, or grant on it."
+                        ),
+                        statement: sql,
+                        refresh: Refresh::Broker,
+                    });
+                    Task::none()
+                }
+                Err(e) => {
+                    self.status = Status::Failed(e);
+                    Task::none()
+                }
+            },
+            Message::BrokerRevokeRow(grant) => self.statement(dialect::broker_revoke_row_sql(&grant), Refresh::Broker),
 
+            Message::ReloadShards => self.load_shards(),
+            #[cfg(feature = "enterprise")]
+            Message::ReloadLedger => self.load_ledger(),
+            #[cfg(feature = "enterprise")]
+            Message::LedgerLoaded(page) => {
+                let mut page = *page;
+                match self.ledger.take() {
+                    Some(old) => page.carry_over(old),
+                    None => page.prefill(),
+                }
+                self.ledger = Some(page);
+                Task::none()
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerRun(sql) => {
+                let Some(session) = self.session.clone() else { return Task::none() };
+                Task::perform(
+                    async move {
+                        let result = session.query(&sql).await.map(|grid| first_column(&grid));
+                        Box::new((sql, result))
+                    },
+                    Message::LedgerRan,
+                )
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerRan(answer) => {
+                let (sql, result) = *answer;
+                if let Some(page) = self.ledger.as_mut() {
+                    page.ran(&sql, result);
+                }
+                // A reveal keeps the page as it is; anything else may have
+                // changed what it shows.
+                let reveal = sql.split_whitespace().nth(2).is_some_and(|w| w.eq_ignore_ascii_case("GET"));
+                if reveal { Task::none() } else { self.load_ledger() }
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerInput(key, value) => {
+                if let Some(page) = self.ledger.as_mut() {
+                    page.input(key, value);
+                }
+                Task::none()
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerOpenTable(name) => {
+                let select = self.update(Message::SelectTable(name));
+                Task::batch([select, self.update(Message::SelectTab(Tab::Data))])
+            }
+            #[cfg(feature = "enterprise")]
+            Message::VerifyLedger => {
+                let Some(session) = self.session.clone() else { return Task::none() };
+                Task::perform(
+                    async move {
+                        match session.query(rdb_studio_enterprise::VERIFY_SQL).await {
+                            Ok(grid) => first_column(&grid),
+                            Err(e) => vec![format!("UNKNOWN   {e}")],
+                        }
+                    },
+                    Message::LedgerVerified,
+                )
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerVerified(lines) => {
+                if let Some(page) = self.ledger.as_mut() {
+                    page.verify = Some(lines);
+                }
+                Task::none()
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerAudit(vault) => {
+                let Some(session) = self.session.clone() else { return Task::none() };
+                Task::perform(
+                    async move {
+                        let lines = match session.query(&rdb_studio_enterprise::audit_sql(&vault)).await {
+                            Ok(grid) => first_column(&grid),
+                            Err(e) => vec![e],
+                        };
+                        (vault, lines)
+                    },
+                    |(vault, lines)| Message::LedgerAuditLoaded(vault, lines),
+                )
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerAuditLoaded(vault, lines) => {
+                if let Some(v) = self.ledger.as_mut().and_then(|p| p.vaults.iter_mut().find(|v| v.name == vault)) {
+                    v.audit = Some(lines);
+                }
+                Task::none()
+            }
+            Message::ShardsLoaded(snapshot) => {
+                self.shards = Some(*snapshot);
+                Task::none()
+            }
+            Message::PlanRebalance => {
+                let Some(session) = self.session.clone() else { return Task::none() };
+                self.rebalance_plan = None;
+                Task::perform(
+                    async move { session.query(dialect::SHOW_REBALANCE_PLAN_SQL).await.map(|g| dialect::parse_rebalance_plan(&g)) },
+                    Message::RebalancePlanned,
+                )
+            }
+            Message::RebalancePlanned(plan) => {
+                self.rebalance_plan = Some(plan);
+                Task::none()
+            }
+            Message::StartRebalance => {
+                let moves = match &self.rebalance_plan {
+                    Some(Ok(steps)) => steps.iter().filter(|s| s.kind == "move").count(),
+                    _ => 0,
+                };
+                self.modal = Some(Modal::Confirm {
+                    title: "Rebalance the cluster".to_string(),
+                    body: format!(
+                        "The gateway runs rdb-shard rebalance --apply --online: each planned range \
+                         ({moves} in the last plan) is copied to its new shard at one snapshot, \
+                         verified, and handed off one map epoch up, while writes go on. Each move \
+                         copies its rows across the network and the disks; the source rows stay until \
+                         `rdb-shard retire`. Progress shows on this page."
+                    ),
+                    statement: dialect::REBALANCE_SQL.to_string(),
+                    refresh: Refresh::Shards,
+                });
+                Task::none()
+            }
             Message::ReloadReplication => self.load_replication(),
             Message::ReplicationLoaded(snapshot) => {
                 self.replication = Some(*snapshot);
@@ -3033,6 +3563,13 @@ impl Studio {
                         column: NewColumn::new(self.flavor()),
                         error: None,
                     },
+                    ModalKind::RowCompression => Modal::RowCompression {
+                        table: self.selected_table.clone().unwrap_or_default(),
+                        edit: RowCompressionEdit::of(
+                            &stat_value(&self.table_stats, "row_compression").unwrap_or_default(),
+                        ),
+                        error: None,
+                    },
                     ModalKind::CreateIndex => Modal::CreateIndex {
                         table: self.selected_table.clone().unwrap_or_default(),
                         index: NewIndex::new(
@@ -3178,9 +3715,14 @@ impl Studio {
                 ) else {
                     return Task::none();
                 };
+                let compression = column_compressions(&self.table_stats)
+                    .into_iter()
+                    .find(|(column, _)| column == &name)
+                    .map(|(_, method)| method)
+                    .unwrap_or_default();
                 self.modal = Some(Modal::EditColumn {
                     table,
-                    edit: ColumnEdit::of(info),
+                    edit: ColumnEdit::of(info, &compression),
                     error: None,
                 });
                 self.modal_pending = false;
@@ -3216,8 +3758,12 @@ impl Studio {
                     ]),
                     Refresh::Backups => self.load_backups(),
                     Refresh::Replication => self.load_replication(),
+                    Refresh::Shards => self.load_shards(),
                     Refresh::Storage => self.load_storage(),
                     Refresh::Activity => self.load_activity(),
+                    Refresh::Broker => self.load_broker(),
+                    #[cfg(feature = "enterprise")]
+                    Refresh::Ledger => self.load_ledger(),
                     Refresh::Branches => {
                         // A merge changed what a diff would say.
                         self.branch_diff = None;
@@ -3415,9 +3961,127 @@ impl Studio {
         )
     }
 
+    /// Reads the broker's topics, queues, subscriptions, exchanges and
+    /// bindings in one task. A server that refuses the first has no broker.
+    fn load_broker(&self) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        Task::perform(
+            async move {
+                let topics = match session.query(dialect::BROKER_TOPICS_SQL).await {
+                    Ok(grid) => grid,
+                    Err(refusal) => return Box::new(BrokerSnapshot { refusal, ..BrokerSnapshot::default() }),
+                };
+                let read = |grid: Result<Grid, String>| grid.unwrap_or_default();
+                let queues = read(session.query(dialect::BROKER_QUEUES_SQL).await);
+                let subscriptions = read(session.query(dialect::BROKER_SUBSCRIPTIONS_SQL).await);
+                let exchanges = read(session.query(dialect::BROKER_EXCHANGES_SQL).await);
+                let bindings = read(session.query(dialect::BROKER_BINDINGS_SQL).await);
+                // Refused by a server without broker permissions: no grants.
+                let grants = read(session.query(dialect::BROKER_GRANTS_SQL).await);
+                Box::new(BrokerSnapshot {
+                    supported: true,
+                    refusal: String::new(),
+                    topics: dialect::parse_broker_topics(&topics),
+                    queues: dialect::parse_broker_queues(&queues),
+                    subscriptions: dialect::parse_broker_subscriptions(&subscriptions),
+                    exchanges: dialect::parse_broker_exchanges(&exchanges),
+                    bindings: dialect::parse_broker_bindings(&bindings),
+                    grants: dialect::parse_broker_grants(&grants),
+                })
+            },
+            Message::BrokerLoaded,
+        )
+    }
+
+    /// Runs a READ, POP or SHOW PARTITIONS into the message panel.
+    fn broker_browse(&mut self, title: String, sql: String) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        self.broker_browse = Some(BrokerBrowse { title, statement: sql.clone(), result: None });
+        Task::perform(
+            async move {
+                let result = session.query(&sql).await;
+                (sql, result)
+            },
+            |(sql, result)| Message::BrokerBrowseLoaded(sql, result),
+        )
+    }
+
     /// The database this console is connected to.
     pub fn current_database(&self) -> String {
         self.session.as_ref().map(|s| s.database.clone()).unwrap_or_default()
+    }
+
+    /// Reads the cluster map, the gateway's rows (when the connection is to
+    /// one), this shard's load and its prepared two-phase parts, in one task.
+    /// Each statement a node does not answer leaves its part empty: a shard
+    /// refuses `SHOW GATEWAY`, and a plain node answers `SHOW SHARDS` with no
+    /// rows.
+    #[cfg(feature = "enterprise")]
+    fn load_ledger(&self) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        Task::perform(
+            async move {
+                let mut page = rdb_studio_enterprise::LedgerPage::default();
+                match session.query(rdb_studio_enterprise::SHOW_SQL).await {
+                    Err(e) => page.error = Some(e),
+                    Ok(grid) => {
+                        page.show = first_column(&grid);
+                        for name in rdb_studio_enterprise::LedgerPage::ledger_names(&page.show) {
+                            if let Ok(grid) = session.query(&rdb_studio_enterprise::count_sql(&name)).await {
+                                if let Some(n) = first_column(&grid).first().and_then(|c| c.trim().parse().ok()) {
+                                    page.counts.insert(name, n);
+                                }
+                            }
+                        }
+                        for name in rdb_studio_enterprise::LedgerPage::vault_names(&page.show) {
+                            let secrets = match session.query(&rdb_studio_enterprise::list_sql(&name)).await {
+                                Ok(grid) => first_column(&grid),
+                                Err(e) => vec![e],
+                            };
+                            page.vaults.push(rdb_studio_enterprise::VaultView { name, secrets, audit: None });
+                        }
+                    }
+                }
+                Box::new(page)
+            },
+            Message::LedgerLoaded,
+        )
+    }
+
+    fn load_shards(&self) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        let Some(shards_sql) = dialect::shards_sql(session.flavor) else {
+            return Task::done(Message::ShardsLoaded(Box::default()));
+        };
+        Task::perform(
+            async move {
+                let mut snapshot = ShardsSnapshot::default();
+                if let Ok(grid) = session.query(shards_sql).await {
+                    dialect::parse_shards(&grid, &mut snapshot);
+                }
+                if let Ok(grid) = session.query(dialect::SHOW_GATEWAY_SQL).await {
+                    snapshot.gateway = dialect::parse_gateway(&grid);
+                }
+                // Through a gateway, its rebalance: refused for a role it does
+                // not name, which the page then says instead of the controls.
+                if !snapshot.gateway.is_empty() {
+                    match session.query(dialect::SHOW_REBALANCE_STATUS_SQL).await {
+                        Ok(grid) => snapshot.rebalance = dialect::parse_gateway(&grid),
+                        Err(e) => snapshot.rebalance_refused = Some(e),
+                    }
+                }
+                if snapshot.supported {
+                    if let Ok(grid) = session.query(dialect::SHOW_SHARD_LOAD_SQL).await {
+                        snapshot.load = dialect::parse_shard_load(&grid);
+                    }
+                    if let Ok(grid) = session.query(dialect::SHOW_PREPARED_SQL).await {
+                        snapshot.prepared = dialect::parse_prepared(&grid);
+                    }
+                }
+                Box::new(snapshot)
+            },
+            Message::ShardsLoaded,
+        )
     }
 
     fn load_replication(&self) -> Task<Message> {
@@ -3459,6 +4123,7 @@ impl Studio {
         let stats_sql = dialect::storage_stats_sql(flavor).to_string();
         let locations_sql = dialect::storage_locations_sql(flavor).to_string();
         let placements_sql = dialect::storage_placements_sql(flavor).to_string();
+        let stores_sql = dialect::storage_stores_sql(flavor).map(str::to_string);
 
         Task::perform(
             async move {
@@ -3480,7 +4145,19 @@ impl Studio {
                     }
                     _ => Vec::new(),
                 };
-                Box::new(StorageSnapshot { stats, supported, locations, placements })
+                // Not an error when absent: a server built without
+                // `kv_storage` answers an unknown SHOW as a parameter, and one
+                // with it but no stores answers no rows.
+                let stores = match stores_sql {
+                    Some(sql) => match session.query(&sql).await {
+                        Ok(grid) if grid.column_index("store").is_some() => {
+                            dialect::parse_storage_stores(&grid)
+                        }
+                        _ => Vec::new(),
+                    },
+                    None => Vec::new(),
+                };
+                Box::new(StorageSnapshot { stats, supported, locations, stores, placements })
             },
             Message::StorageLoaded,
         )
@@ -3887,10 +4564,50 @@ impl Studio {
     }
 
     fn load_roles(&self) -> Task<Message> {
+        Task::batch([self.load_role_list(), self.load_role_access()])
+    }
+
+    /// Grants, default privileges and policies. Each part a server refuses
+    /// is left empty and named in `errors`; the rest still shows.
+    fn load_role_access(&self) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        Task::perform(
+            async move {
+                let mut access = crate::model::RoleAccess::default();
+                match session.query(dialect::table_grants_sql()).await {
+                    Ok(g) => (access.grants, access.owned) = dialect::parse_table_grants(&g),
+                    Err(e) => access.errors.push(format!("table grants: {e}")),
+                }
+                match session.query(dialect::default_privileges_sql()).await {
+                    Ok(g) => access.defaults = dialect::parse_default_privileges(&g),
+                    Err(e) => access.errors.push(format!("default privileges: {e}")),
+                }
+                match session.query(dialect::policies_sql(session.flavor)).await {
+                    Ok(g) => access.policies = dialect::parse_policies(&g),
+                    Err(e) => access.errors.push(format!("policies: {e}")),
+                }
+                if let Ok(g) = session.query(dialect::rls_tables_sql()).await {
+                    access.rls_tables = (0..g.rows.len()).filter_map(|r| g.value(r, "name").map(str::to_string)).collect();
+                }
+                Box::new(access)
+            },
+            Message::RoleAccessLoaded,
+        )
+    }
+
+    fn load_role_list(&self) -> Task<Message> {
         let Some(session) = self.session.clone() else { return Task::none() };
         let sql = dialect::roles_sql(session.flavor);
         Task::perform(
-            async move { session.query(sql).await.map(|g| dialect::parse_roles(&g)) },
+            async move {
+                let roles = dialect::parse_roles(&session.query(sql).await?);
+                // Memberships are an addition: a server without them still
+                // lists its roles.
+                Ok(match session.query(dialect::memberships_sql()).await {
+                    Ok(grid) => dialect::add_memberships(roles, &grid),
+                    Err(_) => roles,
+                })
+            },
             Message::RolesLoaded,
         )
     }
@@ -4233,14 +4950,19 @@ impl Studio {
             Some(Modal::EditColumn { edit, .. }) => match field {
                 ModalField::Name => edit.name = value,
                 ModalField::DataType => edit.data_type = value,
+                ModalField::Compression => edit.compression = value,
                 _ => {}
             },
+            Some(Modal::RowCompression { edit, .. }) if field == ModalField::Compression => {
+                edit.setting = value
+            }
             Some(Modal::AddColumn { column, .. }) => match field {
                 ModalField::Name => column.rename(value, flavor),
                 ModalField::Length => column.length = digits(&value),
                 ModalField::Precision => column.precision = digits(&value),
                 ModalField::Scale => column.scale = digits(&value),
                 ModalField::Default => column.default = value,
+                ModalField::Compression => column.compression = value,
                 _ => {}
             },
             _ => {}
@@ -4259,6 +4981,11 @@ impl Studio {
             && field == ModalField::Nullable
         {
             edit.nullable = value;
+        }
+        if let Some(Modal::RowCompression { edit, .. }) = &mut self.modal
+            && field == ModalField::Recompress
+        {
+            edit.recompress = value;
         }
         if let Some(Modal::AddColumn { column, .. }) = &mut self.modal {
             match field {
@@ -4402,6 +5129,18 @@ impl Studio {
                 }
             },
 
+            Modal::RowCompression { table, edit, .. } => match edit.statements(&table) {
+                Ok(sql) => self.modal_statement(
+                    Modal::RowCompression { table, edit, error: None },
+                    sql,
+                    Refresh::CurrentTable,
+                ),
+                Err(e) => {
+                    self.modal = Some(Modal::RowCompression { table, edit, error: Some(e) });
+                    Task::none()
+                }
+            },
+
             Modal::AddColumn { table, column, .. } => match add_column_sql(&table, &column) {
                 Ok(sql) => self.modal_statement(
                     Modal::AddColumn { table, column, error: None },
@@ -4458,6 +5197,7 @@ impl Studio {
             | Modal::CreateDatabase { error, .. }
             | Modal::AddColumn { error, .. }
             | Modal::EditColumn { error, .. }
+            | Modal::RowCompression { error, .. }
             | Modal::CreateRole { error, .. }
             | Modal::RolePassword { error, .. }
             | Modal::CreateIndex { error, .. },
@@ -4765,7 +5505,95 @@ pub fn add_column_sql(table: &str, column: &NewColumn) -> Result<String, String>
     if !column.default.trim().is_empty() {
         sql.push_str(&format!(" DEFAULT {}", column.default.trim()));
     }
+    if !column.compression.trim().is_empty() {
+        sql.push_str(&format!(" COMPRESSION {}", compression_method(&column.compression)?));
+    }
     Ok(sql)
+}
+
+/// One `SHOW TABLE STATS` row's value, by metric.
+pub fn stat_value(stats: &[Stat], metric: &str) -> Option<String> {
+    stats.iter().find(|s| s.metric == metric).map(|s| s.value.trim().to_string())
+}
+
+/// `SHOW TABLE STATS`' `compressed_columns` (RasterizedDB), as (column,
+/// method): `body=zstd(9) +dictionary, note=zstd` gives `("body", "zstd(9)")`
+/// and `("note", "zstd")`. Empty for a table with none, or a server that
+/// does not report it.
+pub fn column_compressions(stats: &[Stat]) -> Vec<(String, String)> {
+    let Some(list) = stat_value(stats, "compressed_columns") else { return Vec::new() };
+    list.split(", ")
+        .filter_map(|item| {
+            let (column, method) = item.trim().split_once('=')?;
+            let method = method.split_whitespace().next()?;
+            Some((column.to_string(), method.to_string()))
+        })
+        .collect()
+}
+
+/// A compression method as the server takes it, lower-cased: `zstd`,
+/// `zstd(1)` to `zstd(22)` (1 fastest, 22 smallest), `none`, `default`, and
+/// PostgreSQL's `lz4` and `pglz`. Anything else is refused here, so the
+/// dialog says so before a statement is sent.
+pub fn compression_method(text: &str) -> Result<String, String> {
+    let method = text.trim().to_ascii_lowercase().replace(' ', "");
+    if matches!(method.as_str(), "zstd" | "none" | "default" | "lz4" | "pglz") {
+        return Ok(method);
+    }
+    if let Some(level) = method.strip_prefix("zstd(").and_then(|r| r.strip_suffix(')'))
+        && let Ok(n) = level.parse::<u8>()
+        && (1..=22).contains(&n)
+    {
+        return Ok(format!("zstd({n})"));
+    }
+    Err(format!(
+        "`{}` is not a compression method: zstd, zstd(1) to zstd(22), none or default",
+        text.trim()
+    ))
+}
+
+/// A table's row compression being changed in a dialog.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowCompressionEdit {
+    /// What `SHOW TABLE STATS`' `row_compression` says (`zstd(6)`), `none`
+    /// when off.
+    pub original: String,
+    /// Empty or `none` turns it off.
+    pub setting: String,
+    /// Rewrite the rows already there under the new setting.
+    pub recompress: bool,
+}
+
+impl RowCompressionEdit {
+    pub fn of(current: &str) -> Self {
+        let current = current.split_whitespace().next().unwrap_or("none").to_string();
+        RowCompressionEdit { setting: current.clone(), original: current, recompress: false }
+    }
+
+    /// The statements, as one script: the setting (if it changed), then the
+    /// rewrite (if asked for).
+    pub fn statements(&self, table: &str) -> Result<String, String> {
+        let table = dialect::quote_ident(table.trim());
+        let wanted = if self.setting.trim().is_empty() { "none".to_string() } else { compression_method(&self.setting)? };
+        if matches!(wanted.as_str(), "lz4" | "pglz" | "default") {
+            return Err("row compression is zstd or zstd(1) to zstd(22), or none to turn it off".to_string());
+        }
+        let mut statements = Vec::new();
+        if !wanted.eq_ignore_ascii_case(self.original.trim()) {
+            statements.push(if wanted == "none" {
+                format!("ALTER TABLE {table} RESET (row_compression)")
+            } else {
+                format!("ALTER TABLE {table} SET (row_compression = '{wanted}')")
+            });
+        }
+        if self.recompress {
+            statements.push(format!("ALTER TABLE {table} RECOMPRESS"));
+        }
+        if statements.is_empty() {
+            return Err("nothing is changed".to_string());
+        }
+        Ok(statements.join(";\n"))
+    }
 }
 
 /// How many keys a scan asks for at a time.
@@ -4868,7 +5696,7 @@ mod tests {
             nullable: true,
             ..ColumnInfo::default()
         };
-        let mut edit = ColumnEdit::of(&info);
+        let mut edit = ColumnEdit::of(&info, "");
         assert_eq!(edit.statements("t"), Err("nothing is changed".to_string()));
         edit.data_type = " numeric(12,1) ".into();
         assert_eq!(edit.statements("t"), Err("nothing is changed".to_string()));
@@ -4881,17 +5709,76 @@ mod tests {
              ALTER TABLE \"t\" ALTER COLUMN \"amt\" SET NOT NULL;\n\
              ALTER TABLE \"t\" RENAME COLUMN \"amt\" TO \"amount\""
         );
-        let mut only_null = ColumnEdit::of(&ColumnInfo { nullable: false, ..info.clone() });
+        let mut only_null = ColumnEdit::of(&ColumnInfo { nullable: false, ..info.clone() }, "");
         only_null.nullable = true;
         assert_eq!(
             only_null.statements("t").unwrap(),
             "ALTER TABLE \"t\" ALTER COLUMN \"amt\" DROP NOT NULL"
         );
         for bad in ["BIGINT; DROP TABLE t", "BIGINT -- x", "", "  "] {
-            let mut edit = ColumnEdit::of(&info);
+            let mut edit = ColumnEdit::of(&info, "");
             edit.data_type = bad.into();
             assert!(edit.statements("t").is_err(), "{bad}");
         }
+    }
+
+    /// Compression in the dialogs: what each takes, the statement it makes,
+    /// and what it refuses before anything is sent.
+    #[test]
+    fn compression_reaches_the_column_and_table_statements() {
+        assert_eq!(compression_method(" ZSTD ( 9 ) ").unwrap(), "zstd(9)");
+        for ok in ["zstd", "none", "default", "lz4", "pglz", "zstd(1)", "zstd(22)"] {
+            assert!(compression_method(ok).is_ok(), "{ok}");
+        }
+        for bad in ["zstd(0)", "zstd(23)", "gzip", "zstd(9); DROP TABLE t", ""] {
+            assert!(compression_method(bad).is_err(), "{bad}");
+        }
+
+        // A new column.
+        let mut c = column("body", "TEXT");
+        c.compression = "zstd(9)".into();
+        assert_eq!(add_column_sql("docs", &c).unwrap(), "ALTER TABLE \"docs\" ADD COLUMN \"body\" TEXT COMPRESSION zstd(9)");
+        c.compression = "brotli".into();
+        assert!(add_column_sql("docs", &c).is_err());
+
+        // An existing column: only a change makes a statement, before a rename.
+        let info = ColumnInfo { name: "note".into(), data_type: "TEXT".into(), nullable: true, ..ColumnInfo::default() };
+        let mut edit = ColumnEdit::of(&info, "zstd");
+        assert_eq!(edit.statements("docs").unwrap_err(), "nothing is changed");
+        edit.compression = "zstd(19)".into();
+        edit.name = "memo".into();
+        assert_eq!(
+            edit.statements("docs").unwrap(),
+            "ALTER TABLE \"docs\" ALTER COLUMN \"note\" SET COMPRESSION zstd(19);\nALTER TABLE \"docs\" RENAME COLUMN \"note\" TO \"memo\""
+        );
+        edit.name = "note".into();
+        edit.compression = String::new();
+        assert_eq!(edit.statements("docs").unwrap(), "ALTER TABLE \"docs\" ALTER COLUMN \"note\" SET COMPRESSION default");
+
+        // A table's row compression, and the rewrite.
+        let mut row = RowCompressionEdit::of("zstd(6) +dictionary");
+        assert_eq!(row.original, "zstd(6)");
+        assert_eq!(row.statements("events").unwrap_err(), "nothing is changed");
+        row.recompress = true;
+        assert_eq!(row.statements("events").unwrap(), "ALTER TABLE \"events\" RECOMPRESS");
+        row.setting = "none".into();
+        assert_eq!(row.statements("events").unwrap(), "ALTER TABLE \"events\" RESET (row_compression);\nALTER TABLE \"events\" RECOMPRESS");
+        let mut off = RowCompressionEdit::of("none");
+        off.setting = "zstd".into();
+        assert_eq!(off.statements("events").unwrap(), "ALTER TABLE \"events\" SET (row_compression = 'zstd')");
+        off.setting = "lz4".into();
+        assert!(off.statements("events").is_err(), "row compression is zstd only");
+
+        // What SHOW TABLE STATS says, read back.
+        let stats = vec![
+            Stat { metric: "compressed_columns".into(), value: "body=zstd(9) +dictionary, note=zstd".into(), detail: String::new() },
+            Stat { metric: "row_compression".into(), value: "none".into(), detail: String::new() },
+        ];
+        assert_eq!(
+            column_compressions(&stats),
+            vec![("body".to_string(), "zstd(9)".to_string()), ("note".to_string(), "zstd".to_string())]
+        );
+        assert!(column_compressions(&[]).is_empty());
     }
 
     fn column(name: &str, ty: &str) -> NewColumn {
@@ -5397,4 +6284,11 @@ mod tests {
         assert!(NewColumn::key(Flavor::Postgres).primary_key);
         assert!(!NewColumn::key(Flavor::Postgres).nullable);
     }
+}
+
+/// Each row's first cell, as text: the answer of a statement that returns
+/// lines (`SHOW LEDGER`, `VERIFY LEDGER`, `VAULT … LIST`).
+#[cfg(feature = "enterprise")]
+fn first_column(grid: &Grid) -> Vec<String> {
+    grid.rows.iter().map(|r| r.first().cloned().flatten().unwrap_or_default()).collect()
 }

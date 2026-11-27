@@ -2510,11 +2510,21 @@ pub fn parse_from_clause(from_clause: &str) -> Result<Vec<RelationRef>, String> 
 
 fn split_relation_alias(text: &str) -> Result<(String, String), String> {
     let mut parts = text.split_whitespace();
-    let table = parts
+    // The last segment outside double quotes, as a one-table read names its
+    // relation (`lexer_s1::normalize_table_name`): the catalogue has one
+    // namespace. Trimming the quotes off the whole of `"public"."t"` left
+    // `public"."t`, and `public.t` was looked up under that name, so a join
+    // over schema-qualified tables (an ORM with a default schema writes every
+    // one so) failed "relation does not exist" where the same tables, read
+    // one at a time, were found.
+    let written = parts
         .next()
-        .ok_or_else(|| "FROM clause names no relation".to_string())?
-        .trim_matches('"')
-        .to_string();
+        .ok_or_else(|| "FROM clause names no relation".to_string())?;
+    let last = crate::core::sql_scan::last_name_segment(written);
+    let table = match last.strip_prefix('"').and_then(|l| l.strip_suffix('"')) {
+        Some(inner) if !inner.is_empty() => inner.replace("\"\"", "\""),
+        _ => last.trim_matches('"').to_string(),
+    };
 
     let alias = match parts.next() {
         None => None,
@@ -2568,10 +2578,12 @@ fn qualify_on_clauses(mut relations: Vec<RelationRef>, schemas: &[SmallVec<[Sche
 /// Whether the text before a word ends in the keyword `AS`: the word is then
 /// a type (`CAST(x AS text)`) or an alias, never a column.
 fn follows_as(before: &str) -> bool {
-    let t = before.trim_end();
+    // By bytes: the text may end in a multibyte character (`… = 'ЩЕ'`),
+    // inside which a `str` slice two bytes from the end panicked.
+    let t = before.trim_end().as_bytes();
     t.len() >= 2
-        && t[t.len() - 2..].eq_ignore_ascii_case("AS")
-        && !t[..t.len() - 2].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        && t[t.len() - 2..].eq_ignore_ascii_case(b"AS")
+        && !t[..t.len() - 2].last().is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
 }
 
 /// A bare name in an `ON` clause that more than one relation in its scope
@@ -3692,28 +3704,119 @@ pub fn plan(
             schema_of(&r.table).ok_or_else(|| format!("relation '{}' does not exist", r.table))
         })
         .collect::<Result<_, _>>()?;
+    // A caller may hand the select list with its `DISTINCT` (`parse_join`):
+    // a DISTINCT over a column with a nondeterministic collation is a
+    // grouping (below); any other is reported in `JoinPlan::distinct`.
+    let (select_list, mut distinct) = match crate::core::rql::lexer_query::leading_word(select_list.trim(), "DISTINCT") {
+        Some(rest) => (rest, true),
+        None => (select_list, false),
+    };
     let relations = qualify_on_clauses(relations, &schemas);
     if let Some(name) = ambiguous_on(&relations, &schemas) {
         return Err(format!("column reference \"{}\" is ambiguous", name));
     }
 
-    // A column with a nondeterministic collation compared anywhere here is
-    // refused (`collation::refuse_in_join`).
-    if schemas.iter().any(|s| crate::core::rql::collation::any(s)) {
-        let labelled: Vec<(&str, &[SchemaField])> =
-            relations.iter().zip(&schemas).map(|(r, s)| (r.label.as_str(), &s[..])).collect();
-        let order_text: Vec<String> = order_by.iter().map(|t| t.token.clone()).collect();
-        let mut compared: Vec<&str> = vec![where_clause];
-        compared.extend(group_by_clause);
-        compared.extend(having_clause);
-        compared.extend(order_text.iter().map(String::as_str));
-        for r in &relations {
-            if let Some(j) = &r.join {
-                compared.push(&j.left_qualified);
-                compared.push(&j.right_qualified);
-                compared.extend(j.extra.iter().map(String::as_str));
+    // Columns with a nondeterministic collation compare by their keys: a
+    // join key on two such columns joins their companions, `WHERE` and `ON`
+    // comparisons read them (`collate_rewrite`), `GROUP BY` groups by them
+    // (`build_aggregate_stage`), `ORDER BY` sorts by them first, and a
+    // `SELECT DISTINCT` of plain columns is that grouping. What still cannot
+    // be carried over is refused (`collation::refuse_in_join`).
+    let mut relations = relations;
+    let ci_where: String;
+    let ci_group: String;
+    let ci_select: String;
+    let ci_windows: String;
+    let mut where_clause = where_clause;
+    let mut group_by_clause = group_by_clause;
+    let mut select_list = select_list;
+    let mut order_by = order_by;
+    if schemas.iter().any(|s| crate::core::rql::collation::any_order(s)) {
+        let labelled: Vec<(String, SmallVec<[SchemaField; 20]>)> =
+            relations.iter().zip(&schemas).map(|(r, s)| (r.label.clone(), s.clone())).collect();
+        let columns = crate::core::tokenizer::collate_rewrite::Relations(
+            labelled.iter().map(|(l, s)| (l.as_str(), &s[..])).collect(),
+        );
+        use crate::core::tokenizer::collate_rewrite::Columns;
+        for r in relations.iter_mut() {
+            let Some(j) = r.join.as_mut() else { continue };
+            if !j.left_qualified.is_empty() {
+                match (columns.ci(&j.left_qualified), columns.ci(&j.right_qualified)) {
+                    // `uuid`s in SQL Server's order join on their values.
+                    (Some((_, a)), Some((_, b))) if a == b && a.orders_only() => {}
+                    (Some((_, a)), None) | (None, Some((_, a))) if a.orders_only() => {}
+                    (Some((l, a)), Some((rr, b))) if a == b => {
+                        j.left_qualified = l;
+                        j.right_qualified = rr;
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(
+                            "could not determine which collation to use for string comparison".to_string()
+                        );
+                    }
+                }
+            }
+            for term in j.extra.iter_mut() {
+                *term = crate::core::tokenizer::collate_rewrite::rewrite_with(term, &columns)?;
             }
         }
+        ci_where = crate::core::tokenizer::collate_rewrite::rewrite_with(where_clause, &columns)?;
+        where_clause = &ci_where;
+        // `SELECT DISTINCT a.name, b.x`: grouped by what it selects.
+        let list = select_list;
+        if distinct
+            && group_by_clause.is_none()
+            && split_top_level(list).iter().all(|item| {
+                let (expr, _) = split_expr_alias(item.trim());
+                is_column_reference(expr)
+            })
+            && (split_top_level(list)
+                .iter()
+                .any(|item| columns.ci(split_expr_alias(item.trim()).0).is_some_and(|(_, s)| !s.orders_only()))
+                // Sorted by a uuid in SQL Server's order: the grouping's
+                // output sorts by its key (`min`, marked by the order).
+                || order_by.iter().any(|t| columns.ci(t.token.trim()).is_some_and(|(_, s)| s.orders_only())))
+        {
+            ci_group = split_top_level(list)
+                .iter()
+                .map(|item| split_expr_alias(item.trim()).0.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            ci_select = list.to_string();
+            group_by_clause = Some(&ci_group);
+            select_list = &ci_select;
+            distinct = false;
+        }
+        // A row's sort key under the collation, then its spelling, as one
+        // table sorts (`collation::plan_single`). A grouped query sorts its
+        // output instead (`aggregate::sort_output`).
+        let grouped = group_by_clause.is_some()
+            || split_top_level(select_list).iter().any(|item| {
+                !crate::core::rql::lexer_query::find_aggregate_calls(split_expr_alias(item.trim()).0).is_empty()
+            });
+        if !grouped {
+            let mut keyed = Vec::with_capacity(order_by.len());
+            for term in order_by {
+                if let Some((companion, _)) = columns.ci(term.token.trim()) {
+                    keyed.push(crate::core::rql::order_by::SortTerm {
+                        token: companion,
+                        descending: term.descending,
+                        nulls_first: term.nulls_first,
+                    });
+                }
+                keyed.push(term);
+            }
+            order_by = keyed;
+        }
+        if let Some(windowed) = crate::core::tokenizer::collate_rewrite::rewrite_windows(select_list, &columns) {
+            ci_windows = windowed;
+            select_list = &ci_windows;
+        }
+        let labelled: Vec<(&str, &[SchemaField])> =
+            relations.iter().zip(&schemas).map(|(r, s)| (r.label.as_str(), &s[..])).collect();
+        let mut compared: Vec<&str> = Vec::new();
+        compared.extend(having_clause);
         crate::core::rql::collation::refuse_in_join(&labelled, select_list, &compared)?;
     }
 
@@ -4789,6 +4892,16 @@ pub fn plan(
                     continue;
                 }
                 Some(item) => format!("{}.{}", out_relations[item.rel].label, item.field.name),
+                // A quoted qualified column, `"case"."updated_at"` (SeaORM's
+                // spelling), unquoted so the renames below meet it: kept
+                // quoted, a column two relations share was never renamed to
+                // the layout's and read as nothing.
+                None if term.token.contains('"') && is_column_reference(&term.token) && term.token.contains('.') => {
+                    match split_qualified(&term.token) {
+                        (Some(q), c) => format!("{q}.{c}"),
+                        (None, c) => c,
+                    }
+                }
                 None => term.token.clone(),
             };
             let mut rewritten = written;
@@ -4817,9 +4930,9 @@ pub fn plan(
         offset,
         aggregate,
         post_join,
-        // Set by the caller that parsed the select list; `plan` is also reached
-        // from paths that have no DISTINCT to report.
-        distinct: false,
+        // A `DISTINCT` the select list was handed with (most callers strip
+        // it and set this themselves).
+        distinct,
     })
 }
 
@@ -5272,6 +5385,47 @@ fn column_references(text: &str) -> Vec<String> {
     out
 }
 
+/// A two-part `qualifier.column` reference starting at `i`, either part
+/// quoted (`""` inside a quoted part is one `"`): its end and both names
+/// unquoted. `None` when what starts at `i` is not one, or is followed by a
+/// third part.
+fn qualified_at(bytes: &[u8], i: usize) -> Option<(usize, String, String)> {
+    fn part(bytes: &[u8], i: usize) -> Option<(usize, String)> {
+        if bytes.get(i) == Some(&b'"') {
+            let mut name = Vec::new();
+            let mut j = i + 1;
+            loop {
+                match bytes.get(j)? {
+                    b'"' if bytes.get(j + 1) == Some(&b'"') => {
+                        name.push(b'"');
+                        j += 2;
+                    }
+                    b'"' => return Some((j + 1, String::from_utf8(name).ok()?)),
+                    b => {
+                        name.push(*b);
+                        j += 1;
+                    }
+                }
+            }
+        }
+        let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || !b.is_ascii();
+        let mut j = i;
+        while j < bytes.len() && word(bytes[j]) {
+            j += 1;
+        }
+        (j > i && !bytes[i].is_ascii_digit()).then(|| (j, String::from_utf8_lossy(&bytes[i..j]).into_owned()))
+    }
+    let (after_qualifier, qualifier) = part(bytes, i)?;
+    if bytes.get(after_qualifier) != Some(&b'.') {
+        return None;
+    }
+    let (end, column) = part(bytes, after_qualifier + 1)?;
+    if matches!(bytes.get(end), Some(b'.') | Some(b'"')) || bytes.get(end).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_') {
+        return None;
+    }
+    Some((end, qualifier, column))
+}
+
 /// Replaces a qualified name with another, matching whole identifiers only and
 /// skipping string literals.
 ///
@@ -5293,6 +5447,28 @@ fn replace_qualified(sql: &str, from: &str, to: &str) -> String {
                 quote = None;
             }
             i += 1;
+            continue;
+        }
+        // A quoted spelling of `from`: `"d"."c"`, `d."c"` or `"d".c`, as EF
+        // Core and SeaORM write every reference. Copied verbatim as a quoted
+        // identifier, it was never renamed: a column two relations share is
+        // renamed in the join's layout, so `COALESCE("d"."c", 0)` read as
+        // "neither a column nor a value".
+        let starts_identifier = i == 0
+            || !(bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] == b'.'
+                || bytes[i - 1] == b'"'
+                || !bytes[i - 1].is_ascii());
+        if starts_identifier
+            && (c == b'"' || c.is_ascii_alphabetic() || c == b'_')
+            && let Some((end, qualifier, column)) = qualified_at(bytes, i)
+            && let Some((fq, fc)) = from.split_once('.')
+            && qualifier.eq_ignore_ascii_case(fq)
+            && column.eq_ignore_ascii_case(fc)
+        {
+            out.extend_from_slice(to.as_bytes());
+            i = end;
             continue;
         }
         if c == b'\'' || c == b'"' {
@@ -5441,8 +5617,15 @@ fn build_aggregate_stage(
     // every group holds at most one of its rows — so its other columns may be
     // selected without being grouped, as PostgreSQL allows for a primary key.
     let mut determined: Vec<bool> = vec![false; schemas.len()];
+    // Grouping columns with a nondeterministic collation, grouped by key.
+    let mut ci_keys: Vec<(usize, u64)> = Vec::new();
     if let Some(list) = group_by_clause {
         for raw in list.split(',') {
+            // `GROUP BY 1` and `GROUP BY k` (an output name) stand for a
+            // select-list item; read that item instead. The number was looked
+            // up as a column named `1`.
+            let key = select_item_for_group_key(select_list, raw.trim(), |name| resolve(name).is_ok())?;
+            let raw = key.as_str();
             let name = raw.trim().split_whitespace().next().unwrap_or("");
             if name.is_empty() {
                 continue;
@@ -5450,7 +5633,7 @@ fn build_aggregate_stage(
             // A computed key (`a.doc->>'k'`, `upper(a.s)`) is not grouped
             // over a join. Resolved as a name, it was reported as a missing
             // column of whatever preceded its last dot.
-            if !is_column_reference(raw.trim()) && name.parse::<usize>().is_err() {
+            if !is_column_reference(raw.trim()) {
                 return Err(format!(
                     "GROUP BY {} over a join is not supported yet; group by a column, or by \
                      the expression's value in a derived table",
@@ -5463,7 +5646,19 @@ fn build_aggregate_stage(
             }) {
                 determined[rel] = true;
             }
-            group_by.push(positional(rel, field, items));
+            // A column with a nondeterministic collation groups by its key:
+            // its companion. The column itself is then the group's least
+            // spelling (below).
+            let keyed = schemas.get(rel).and_then(|schema| {
+                crate::core::rql::collation::companion(&field.name, schema).map(|(c, _)| c.clone())
+            });
+            match keyed {
+                Some(companion) => {
+                    ci_keys.push((rel, field.write_order));
+                    group_by.push(positional(rel, companion, items));
+                }
+                None => group_by.push(positional(rel, field, items)),
+            }
         }
     }
 
@@ -5684,14 +5879,16 @@ fn build_aggregate_stage(
                 let slot = inputs.len();
                 let ty = func.result_type(arg.as_ref().map(|f: &SchemaField| &f.db_type));
                 let synth_name = format!("__agg_{}", slot);
-                synth_schema.push(SchemaField::new(
-                    synth_name.clone(),
-                    ty.clone(),
-                    ty.get_size(),
-                    0,
-                    slot as u64,
-                    false,
-                ));
+                let mut synth = SchemaField::new(synth_name.clone(), ty.clone(), ty.get_size(), 0, slot as u64, false);
+                // At the scale the fold produces it at, as `computed_synth_schema`
+                // types it. Left unset, a `NUMERIC(19,6)` sum read through a
+                // cast (`SUM(b.q)::text`, `(SUM(b.q)+0)`, `MAX(b.q)::text`)
+                // was taken at nine places: a thousand times too small, with
+                // no error, over every join.
+                if ty == DbType::DECIMAL {
+                    synth.scale = func.synthetic_scale(arg.as_ref());
+                }
+                synth_schema.push(synth);
                 inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg, arg_expr: None, filter, call: extras });
                 rewritten.push_str(&synth_name);
                 cursor = end;
@@ -5783,6 +5980,25 @@ fn build_aggregate_stage(
         } else {
             let (rel, field) = resolve(expr)?;
             let label = alias.unwrap_or_else(|| field.name.clone());
+            if ci_keys.contains(&(rel, field.write_order)) {
+                // Its order's view: a uuid in SQL Server's order is binary
+                // to equality, and its groups sorted by their bytes.
+                let strength = crate::core::rql::collation::order_of(&field.name, &schemas[rel]);
+                let arg = positional(rel, field, items);
+                fold_items.push(SelectItem::Aggregate {
+                    distinct: false,
+                    func: AggFunc::Min,
+                    arg: Some(arg),
+                    label,
+                    filter: None,
+                    arg_expr: None,
+                    call: Some(Box::new(crate::core::rql::aggregate::AggCall {
+                        collation: Some(strength),
+                        ..Default::default()
+                    })),
+                });
+                continue;
+            }
             let synthetic = positional(rel, field, items);
             if !group_by
                 .iter()
@@ -5904,6 +6120,39 @@ fn build_aggregate_stage(
         fold_order.push((label, term.descending, term.nulls_first));
     }
 
+    // An aggregate over a column with a nondeterministic collation compares
+    // by it (`collation::mark_aggregates` does this over one table): the
+    // argument is a projected position, whose relation column says.
+    {
+        let strength_at = |arg: &Option<SchemaField>| -> Option<crate::core::rql::collation::Strength> {
+            let item = items.get(arg.as_ref()?.write_order as usize)?;
+            if !item.reads_column() {
+                return None;
+            }
+            Some(crate::core::rql::collation::order_of(&item.field.name, schemas.get(item.rel)?)).filter(|s| !s.is_binary())
+        };
+        let mark = |call: &mut Option<Box<crate::core::rql::aggregate::AggCall>>, strength| {
+            if let Some(strength) = strength {
+                call.get_or_insert_with(Default::default).collation = Some(strength);
+            }
+        };
+        for item in fold_items.iter_mut() {
+            match item {
+                SelectItem::Aggregate { arg, call, .. } => {
+                    let strength = strength_at(arg);
+                    mark(call, strength);
+                }
+                SelectItem::Computed { inputs, .. } => {
+                    for input in inputs.iter_mut() {
+                        let strength = strength_at(&input.arg);
+                        mark(&mut input.call, strength);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     Ok(Some(crate::core::rql::aggregate::AggregatePlan {
         items: fold_items,
         group_by,
@@ -5952,6 +6201,38 @@ fn split_top_level(list: &str) -> Vec<String> {
     out
 }
 
+/// The text a `GROUP BY` key of a join stands for: a position (`1`) names
+/// that select-list item, and a name that is no column but is a select item's
+/// output name (`k` of `t.x AS k`) names that item, as in PostgreSQL, where a
+/// column wins over an output name. Anything else is returned as written.
+fn select_item_for_group_key(
+    select_list: &str,
+    key: &str,
+    is_column: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let items = split_top_level_commas(select_list);
+    if let Ok(position) = key.parse::<usize>() {
+        if position == 0 || position > items.len() {
+            return Err(format!(
+                "GROUP BY position {} is not in the select list, which has {} item(s)",
+                position,
+                items.len()
+            ));
+        }
+        return Ok(select_entry(items[position - 1].trim()).0);
+    }
+    if is_column_reference(key) && !is_column(key) {
+        let wanted = key.trim_matches('"');
+        for item in &items {
+            let (expression, alias) = select_entry(item.trim());
+            if alias.is_some_and(|a| a.trim_matches('"').eq_ignore_ascii_case(wanted)) {
+                return Ok(expression);
+            }
+        }
+    }
+    Ok(key.to_string())
+}
+
 /// Separates a select item from its output name.
 ///
 /// The single-relation splitter, so a join reads an alias exactly as a plain
@@ -5959,7 +6240,7 @@ fn split_top_level(list: &str) -> Vec<String> {
 /// the last `)`: `COALESCE(a.n, -1) + b.m AS s` kept `AS s` in the
 /// expression, and the item was refused as "'b__m AS s' is neither a column
 /// nor a value".
-fn split_expr_alias(entry: &str) -> (&str, Option<String>) {
+pub(crate) fn split_expr_alias(entry: &str) -> (&str, Option<String>) {
     crate::core::rql::lexer_query::split_alias(entry)
 }
 
@@ -6270,6 +6551,40 @@ pub fn plan_statement(
     sql: &str,
     schema_of: &dyn Fn(&str) -> Option<SmallVec<[SchemaField; 20]>>,
 ) -> Result<JoinPlan, String> {
+    // The plan made for this statement already, by whichever of its
+    // readers came first (`lexer_query::join_plan_memo`).
+    if let Some(plan) = crate::core::rql::lexer_query::join_plan_memo(sql, schema_of) {
+        return plan;
+    }
+    // Each relation's fields as the planner is told them: what the plan
+    // holds for, and what a later reader checks before taking it.
+    let asked: std::cell::RefCell<Vec<(String, Option<SmallVec<[SchemaField; 20]>>)>> = std::cell::RefCell::new(Vec::new());
+    let recording = |name: &str| {
+        let fields = schema_of(name);
+        let mut asked = asked.borrow_mut();
+        if !asked.iter().any(|(n, _)| n == name) {
+            asked.push((name.to_string(), fields.clone()));
+        }
+        fields
+    };
+    let plan = plan_statement_now(sql, &recording);
+    crate::core::rql::lexer_query::remember_join_plan(sql, asked.into_inner(), &plan);
+    plan
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Joins actually planned on this thread, for the memo's tests.
+    pub(crate) static PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`plan_statement`], planned now whatever was planned before.
+fn plan_statement_now(
+    sql: &str,
+    schema_of: &dyn Fn(&str) -> Option<SmallVec<[SchemaField; 20]>>,
+) -> Result<JoinPlan, String> {
+    #[cfg(test)]
+    PLANS.with(|n| n.set(n.get() + 1));
     // Same normalisation the single-table path applies: the clause split below
     // only recognises `LIMIT` and `OFFSET`.
     let sql = crate::core::tokenizer::pagination::normalize_pagination(sql.trim())?;
@@ -6421,9 +6736,12 @@ pub fn plan_statement(
             return Err(crate::core::sql_scan::missing_from_entry(&q));
         }
     }
-    let mut planned = plan(
+    // Handed over with its DISTINCT: one over a nondeterministic column is
+    // planned as a grouping.
+    let written = if distinct { format!("DISTINCT {select_list}") } else { select_list.to_string() };
+    let planned = plan(
         relations,
-        select_list,
+        &written,
         where_clause,
         group_by_clause,
         having_clause,
@@ -6432,7 +6750,6 @@ pub fn plan_statement(
         offset,
         schema_of,
     )?;
-    planned.distinct = distinct;
     Ok(planned)
 }
 
@@ -6546,6 +6863,27 @@ fn relations_referenced(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `GROUP BY 1` and `GROUP BY k` stand for select-list items; a column of
+    /// that name wins over an output name, and a position past the list is an
+    /// error, not a column named `3`.
+    #[test]
+    fn a_group_by_position_or_output_name_reads_its_select_item() {
+        let list = "t.system_key AS k, count(*), upper(t.s) u";
+        let none = |_: &str| false;
+        assert_eq!(select_item_for_group_key(list, "1", none).unwrap(), "t.system_key");
+        assert_eq!(select_item_for_group_key(list, "2", none).unwrap(), "count(*)");
+        assert_eq!(select_item_for_group_key(list, "3", none).unwrap(), "upper(t.s)");
+        assert_eq!(select_item_for_group_key(list, "k", none).unwrap(), "t.system_key");
+        assert_eq!(select_item_for_group_key(list, "\"K\"", none).unwrap(), "t.system_key");
+        // A real column named like an output name is that column.
+        assert_eq!(select_item_for_group_key(list, "k", |n| n == "k").unwrap(), "k");
+        assert_eq!(select_item_for_group_key(list, "t.x", none).unwrap(), "t.x");
+        for bad in ["0", "4"] {
+            let e = select_item_for_group_key(list, bad, none).unwrap_err();
+            assert!(e.contains("is not in the select list, which has 3 item(s)"), "{e}");
+        }
+    }
 
     /// The join budget is read once: the value in effect can be set again
     /// (two engines in a process asking for the same), another cannot, and
@@ -8102,5 +8440,24 @@ mod outer_join_reference {
             let p = planned("ta a, tb b", term);
             assert_eq!(join(&p, 1).kind, JoinKind::Cross, "{term}");
         }
+    }
+}
+
+#[cfg(test)]
+mod replace_qualified_tests {
+    use super::replace_qualified;
+
+    /// Every spelling of a qualified reference is renamed; a longer name, a
+    /// third part, a string literal and another qualifier are not.
+    #[test]
+    fn quoted_spellings_are_renamed() {
+        let r = |s: &str| replace_qualified(s, "d.c", "d__c");
+        assert_eq!(r("COALESCE(d.c, 0)"), "COALESCE(d__c, 0)");
+        assert_eq!(r(r#"COALESCE("d"."c", 0)"#), "COALESCE(d__c, 0)");
+        assert_eq!(r(r#"d."c" + "d".c"#), "d__c + d__c");
+        assert_eq!(r(r#""D"."C""#), "d__c");
+        assert_eq!(r(r#""d"."cc" + "dd"."c" + "x"."d"."c""#), r#""d"."cc" + "dd"."c" + "x"."d"."c""#);
+        assert_eq!(r(r#"'"d"."c"' || d.c"#), r#"'"d"."c"' || d__c"#);
+        assert_eq!(r(r#""é"."c" || "d"."c""#), r#""é"."c" || d__c"#);
     }
 }

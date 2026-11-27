@@ -268,8 +268,15 @@ pub fn parse(clause: &str) -> Result<Vec<SortTerm>, String> {
             return Err(format!("unexpected '{}' after ORDER BY '{}'", word, token));
         }
 
+        // One quoted name (`"title"`) loses its quotes; a qualified one
+        // (`"case"."updated_at"`, as SeaORM writes it) keeps them, as the
+        // join resolves each part. Trimmed from both ends, it was
+        // `case"."updated_at`, which no relation has.
+        let whole_quoted = token.len() >= 2
+            && token.starts_with('"')
+            && crate::core::sql_scan::quoted_end(token.as_bytes(), 0, b'"') == token.len();
         terms.push(SortTerm {
-            token: token.trim_matches('"').to_string(),
+            token: if whole_quoted { token[1..token.len() - 1].replace("\"\"", "\"") } else { token.to_string() },
             descending,
             nulls_first,
         });

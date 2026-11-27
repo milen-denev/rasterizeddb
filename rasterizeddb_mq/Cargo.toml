@@ -1,0 +1,16 @@
+[package]
+name = "rasterizeddb_mq"
+version = "1.0.1"
+edition = "2024"
+description = "RasterizedDB's message broker batch format and native wire protocol, shared by the engine and the client"
+repository = "https://github.com/milen-denev/rasterizeddb"
+license = "GPL-3.0-only"
+authors = ["Milen Denev"]
+keywords = ["rasterizeddb", "broker", "queue", "pubsub", "messaging"]
+categories = ["database", "encoding"]
+
+# The engine and the client both link this, so a batch is laid out by exactly
+# one piece of code. The CRC is the only dependency, and the engine already
+# has it.
+[dependencies]
+crc32fast = "1.5"

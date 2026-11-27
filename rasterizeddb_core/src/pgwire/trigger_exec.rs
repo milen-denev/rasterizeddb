@@ -1176,12 +1176,37 @@ pub(super) async fn run_triggered_write<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    run_triggered_write_checked(database, state, stream, stmt, event, table, result_formats, omit_description, None).await
+}
+
+/// [`run_triggered_write`], each stored row also checked against `check`,
+/// a row-level security policy's WITH CHECK (R3): one that is not true of
+/// it fails the statement, which takes back what it wrote.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_triggered_write_checked<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    stmt: &str,
+    event: Event,
+    table: &str,
+    result_formats: &[i16],
+    omit_description: bool,
+    check: Option<String>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let tx = state.current_tx();
-    let all = match triggers_for(database, tx, table, event).await {
-        Ok(all) => all,
-        Err((code, message)) => return fail_statement(state, stream, &code, &message).await,
+    let all = if database.has_table(triggers::TRIGGER_TABLE) && !state.triggers_suppressed.iter().any(|t| t == table) {
+        match triggers_for(database, tx, table, event).await {
+            Ok(all) => all,
+            Err((code, message)) => return fail_statement(state, stream, &code, &message).await,
+        }
+    } else {
+        Vec::new()
     };
-    if all.is_empty() {
+    if all.is_empty() && check.is_none() {
         // The registry said maybe; the catalogue says none for this event.
         state.triggers_suppressed.push(table.to_string());
         let ran = Box::pin(execute_single_statement(database, state, stream, stmt, result_formats, omit_description)).await;
@@ -1203,7 +1228,9 @@ where
         }
     }
     let mut out = Vec::<u8>::new();
-    let result = Box::pin(fire_write(database, state, &mut out, stmt, event, table, &schema, &fields, &all, result_formats, omit_description)).await?;
+    let result =
+        Box::pin(fire_write(database, state, &mut out, stmt, event, table, &schema, &fields, &all, result_formats, omit_description, check.as_deref()))
+            .await?;
     if own_block {
         let end = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
         let ended = super::view_statements::run_internal(database, state, end).await?;
@@ -1242,6 +1269,7 @@ async fn fire_write(
     all: &[(TriggerDef, PlBlock)],
     result_formats: &[i16],
     omit_description: bool,
+    rls_check: Option<&str>,
 ) -> io::Result<Result<String, Failure>> {
     let statement_triggers = |timing: Timing| -> Vec<&(TriggerDef, PlBlock)> {
         all.iter().filter(|(t, _)| !t.row_level && t.timing == timing).collect()
@@ -1412,6 +1440,19 @@ async fn fire_write(
         for row in stored.rows {
             count += 1;
             let after: Values = stored.names.iter().cloned().zip(row.into_iter()).collect();
+            // Row-level security: the row as stored, defaults filled.
+            if let Some(check) = rls_check {
+                let columns = after.iter().map(|(c, _)| quote_ident(c)).collect::<Vec<_>>().join(", ");
+                let values = after.iter().map(|(c, v)| literal(v, field(fields, c).and_then(cast_of))).collect::<Vec<_>>().join(", ");
+                let probe = format!("SELECT ({check}) IS TRUE FROM (VALUES ({values})) AS {quoted}({columns})");
+                let passed = match query(database, state, &probe).await? {
+                    Ok(rows) => rows.rows.first().and_then(|r| r.first()).cloned().flatten().is_some_and(|v| matches!(v.as_str(), "t" | "true" | "TRUE")),
+                    Err(e) => return Ok(Err(failure(e))),
+                };
+                if !passed {
+                    return Ok(Err(("42501".into(), format!("new row violates row-level security policy for table \"{table}\""))));
+                }
+            }
             let (after_new, after_old) = match event {
                 Event::Delete => (None, Some(after.clone())),
                 _ => (Some(after.clone()), old.clone()),
@@ -1780,6 +1821,13 @@ pub(super) async fn after_table_ddl(database: &Arc<Database>, tx: Option<TxId>, 
         && !database.has_table(name)
     {
         let _ = crate::core::rql::privileges::rename(database, name, to, tx).await;
+        // Its policies follow it: left behind, RLS stayed on (the marker
+        // moved with the grants) with no policy, and every row was hidden.
+        for mut policy in crate::core::rql::policies::load(database, Some(name), tx).await.unwrap_or_default() {
+            let _ = crate::core::rql::policies::remove(database, name, Some(&policy.name), tx).await;
+            policy.table = to.clone();
+            let _ = crate::core::rql::policies::store(database, &policy, tx).await;
+        }
     }
     if !database.has_table(triggers::TRIGGER_TABLE) {
         return;

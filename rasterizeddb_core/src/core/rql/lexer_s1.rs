@@ -42,9 +42,16 @@ pub enum QueryPurpose {
     /// store. Parsed and executed by [`crate::core::kv_cache::sql`].
     #[cfg(feature = "kv_cache")]
     KvCache(String),
+    /// `BROKER <statement> …`: the message broker's topics, queues and
+    /// exchanges. Parsed and executed by [`crate::core::broker::sql`].
+    #[cfg(feature = "broker")]
+    Broker(String),
     /// `REPLICATION ...` / `SHOW REPLICATION ...` — running the cluster from
     /// SQL. Parsed and executed by [`crate::replication::sql`].
     Replication(String),
+    /// `VERIFY LEDGER`, `SHOW LEDGER`, `ALTER LEDGER TABLE`, `ACKNOWLEDGE
+    /// LEDGER ROLLBACK` — ledger tables and vaults (`ledger_hooks`).
+    Ledger(String),
     /// `STORAGE ...` / `SHOW STORAGE ...` — the directories this database may
     /// write into, and where each table's files are. Parsed and executed by
     /// [`crate::core::storage::sql`].
@@ -74,6 +81,9 @@ pub enum QueryPurpose {
 pub struct VacuumRequest {
     pub table_name: Option<String>,
     pub full: bool,
+    /// `VACUUM (FULL, RECOMPRESS)`: the table rewritten under its compression
+    /// as it stands (`ALTER TABLE … RECOMPRESS`, which also compacts it).
+    pub recompress: bool,
 }
 
 #[derive(Debug)]
@@ -367,12 +377,13 @@ fn unqualify_write_target(sql: &str, skip: usize) -> String {
 fn normalize_table_name(raw: &str) -> String {
     let raw = raw.trim().trim_end_matches(|c| c == ',' || c == ';');
     let raw = raw.split('(').next().unwrap_or(raw);
-    raw.split('.')
-        .next_back()
-        .unwrap_or(raw)
-        .trim()
-        .trim_matches('"')
-        .to_string()
+    // The last segment outside double quotes: `"a.b.c"` is one name, its
+    // dots its own (SQL Server's `[DenevCloud.ERP.Colors]` arrives so).
+    let last = crate::core::sql_scan::last_name_segment(raw.trim()).trim();
+    match last.strip_prefix('"').and_then(|l| l.strip_suffix('"')) {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => last.to_string(),
+    }
 }
 
 /// Recognizes common PostgreSQL SQL and returns a QueryPurpose with the query string.
@@ -525,6 +536,11 @@ fn recognize_surface_statement(query_trimmed: &str) -> Option<QueryPurpose> {
         return Some(Replication(query_trimmed.to_string()));
     }
 
+    // `LEDGER` is no statement keyword anywhere else either.
+    if crate::core::ledger_hooks::is_ledger_statement(query_trimmed) {
+        return Some(Ledger(query_trimmed.to_string()));
+    }
+
     // Alongside the two above and for the same reason: `STORAGE` is not a
     // statement keyword anywhere else, and `SHOW STORAGE` must not be read as a
     // `SHOW` of a thing called `STORAGE`.
@@ -538,6 +554,13 @@ fn recognize_surface_statement(query_trimmed: &str) -> Option<QueryPurpose> {
     #[cfg(feature = "kv_cache")]
     if crate::core::kv_cache::sql::is_kv_statement(query_trimmed) {
         return Some(KvCache(query_trimmed.to_string()));
+    }
+
+    // `BROKER` is not a statement keyword anywhere else either, and what
+    // follows it is the broker's own grammar.
+    #[cfg(feature = "broker")]
+    if crate::core::broker::sql::is_broker_statement(query_trimmed) {
+        return Some(Broker(query_trimmed.to_string()));
     }
 
     // After the three surfaces above, each of which owns a longer `SHOW`
@@ -573,17 +596,28 @@ fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<Q
         // vacuumed instead of a syntax error.
         let mut words = query_trimmed.split_whitespace().skip(1).peekable();
         let mut full = false;
+        let mut recompress = false;
         let mut table_name = None;
 
         while let Some(word) = words.next() {
             let upper = word.to_ascii_uppercase();
             if upper.starts_with('(') {
-                // Skip the option list, however it is spaced.
+                // The option list, however it is spaced: `FULL` and
+                // `RECOMPRESS` are acted on, the rest ignored.
+                let mut options = vec![upper.clone()];
                 if !word.ends_with(')') {
                     for rest in words.by_ref() {
+                        options.push(rest.to_ascii_uppercase());
                         if rest.ends_with(')') {
                             break;
                         }
+                    }
+                }
+                for option in options.iter().flat_map(|o| o.split(|c: char| c == '(' || c == ')' || c == ',')) {
+                    match option.trim() {
+                        "FULL" => full = true,
+                        "RECOMPRESS" => recompress = true,
+                        _ => {}
                     }
                 }
                 continue;
@@ -598,7 +632,7 @@ fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<Q
             }
         }
 
-        Some(Vacuum(VacuumRequest { table_name, full }))
+        Some(Vacuum(VacuumRequest { table_name, full, recompress }))
     } else if simd_compare_strings(query_bytes, b"CREATE INDEX", &StartsWith)
         && (crate::core::rql::path_index::parse_create(query_trimmed).is_some()
             || crate::core::index::ddl::parse_create(query_trimmed).is_some())
@@ -606,7 +640,11 @@ fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<Q
         Some(CreateIndex(query_trimmed.to_string()))
     } else if simd_compare_strings(query_bytes, b"DROP INDEX", &StartsWith) {
         Some(DropIndex(query_trimmed.to_string()))
-    } else if simd_compare_strings(query_bytes, b"CREATE TABLE", &StartsWith) {
+    } else if simd_compare_strings(query_bytes, b"CREATE TABLE", &StartsWith)
+        || crate::core::rql::ledger_ddl::split(query_trimmed).is_some()
+    {
+        // `CREATE LEDGER TABLE` and `CREATE VAULT` too: the executor turns
+        // them into the plain create they stand for (`ledger_ddl`).
         Some(CreateTable(query_trimmed.to_string()))
     } else if simd_compare_strings(query_bytes, b"DROP TABLE", &StartsWith) {
         Some(DropTable(query_trimmed.to_string()))

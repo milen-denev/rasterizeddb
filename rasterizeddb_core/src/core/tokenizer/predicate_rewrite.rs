@@ -3654,8 +3654,10 @@ fn needs_evaluator(text: &str) -> bool {
             // (`expr::parse_subscript`). Not `ARRAY[…]`, whose `= ANY` form
             // the rewrite above reads itself.
             // `[]` is a type's array suffix (`::text[]`), never a subscript.
+            // After a quoted name too, `b."Tags"[1]`, as EF Core writes every
+            // PascalCase column: it read as "unexpected character '['".
             b'[' if i > 0
-                && (is_word(bytes[i - 1]) || bytes[i - 1] == b')')
+                && (is_word(bytes[i - 1]) || bytes[i - 1] == b')' || bytes[i - 1] == b'"')
                 && bytes.get(i + 1) != Some(&b']')
                 && {
                     let word_start = text[..i]
@@ -3938,6 +3940,7 @@ pub fn lift_evaluated_operands(
         && !mentions_range(clause)
         && !in_after_non_column(clause)
         && !may_compare_an_array(clause, schema)
+        && !mentions_containment(clause)
     {
         return Ok(clause.to_string());
     }
@@ -4371,7 +4374,7 @@ fn lift_term(
         }
         (inner.starts_with('(') && matching_paren_at(inner, 0) == Some(inner.len() - 1)) || compares_an_array(inner, schema)
     };
-    if plain && !array && !mentions_distinct_from(term) && !mentions_range(term) && !in_after_non_column(term) {
+    if plain && !array && !mentions_distinct_from(term) && !mentions_range(term) && !in_after_non_column(term) && !mentions_containment(term) {
         return Ok(term.to_string());
     }
     let lead = &term[..term.len() - term.trim_start().len()];
@@ -4393,6 +4396,8 @@ fn lift_term(
         || compares_an_interval(body, schema)
         || (array && compares_an_array(body, schema))
         || compares_a_computed_range(body, schema)
+        || compares_a_computed_jsonb(body, schema)
+        || contains_over_a_computed_side(body, schema)
         || (plain && in_over_non_column(body, schema))
         || mixed_numeric_columns(body, schema)
         || constant_mixed_comparison(body)
@@ -4545,6 +4550,79 @@ fn compares_a_computed_range(body: &str, schema: &SmallVec<[SchemaField; 20]>) -
         _ => false,
     };
     (is_range(&l) || is_range(&r)) && !(matches!(l, Expr::Column(_)) && literal(&r))
+}
+
+/// Whether `body` compares a document the row computes — `'[1]'::jsonb ||
+/// (doc -> 'a') = '[1, 2]'`, `jsonb_build_array(doc) <> other` — which only
+/// the evaluator reads: the scan's operand was refused ("yields a JSONB
+/// value, which a WHERE clause cannot compare yet"). A column, or a path
+/// into one, stays the scan's own comparison.
+fn compares_a_computed_jsonb(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    use crate::core::rql::expr::{parse, static_type, Expr};
+    if !(body.contains("||") || crate::core::sql_scan::contains_ignore_ascii_case(body, b"json")) {
+        return false;
+    }
+    let Some((at, end, false)) = comparison_operator(body) else {
+        return false;
+    };
+    let computed = |side: &str| {
+        let side = side.trim();
+        !side.is_empty()
+            && parse(side, schema).is_ok_and(|e| {
+                let plain = match &e {
+                    Expr::Column(_) | Expr::JsonPath { .. } | Expr::Literal { .. } | Expr::Null => true,
+                    Expr::Cast(inner, _) => matches!(**inner, Expr::Literal { .. } | Expr::Null),
+                    _ => false,
+                };
+                !plain && static_type(&e) == crate::core::db_type::DbType::JSONB
+            })
+    };
+    computed(&body[..at]) || computed(&body[end..])
+}
+
+/// Whether `text` holds a containment operator: only the gate;
+/// [`contains_over_a_computed_side`] decides each term.
+fn mentions_containment(text: &str) -> bool {
+    text.contains("@>") || text.contains("<@")
+}
+
+/// Whether `body` is a containment (`@>`, `<@`) with a document on the left
+/// that is no column or path of one, or a group on the right: `'[20]'::jsonb
+/// <@ (doc -> 'b')`, `(doc -> 'a') || '[1]'::jsonb @> '[1]'`. The scan reads
+/// a column or its path on the left and a constant on the right; anything
+/// else it refused ("expected closing parenthesis after grouped expression",
+/// "operator <@ does not apply to a STRING value"). The evaluator answers
+/// both operators over any two documents.
+fn contains_over_a_computed_side(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    use crate::core::rql::expr::{parse, static_type, yields_json_text, Expr, Nesting};
+    if !(body.contains("@>") || body.contains("<@")) {
+        return false;
+    }
+    let nesting = Nesting::of(body);
+    let bytes = body.as_bytes();
+    let Some(at) = (0..bytes.len().saturating_sub(1)).find(|&i| {
+        nesting.top_level(i)
+            && (&bytes[i..i + 2] == b"@>" || &bytes[i..i + 2] == b"<@")
+            // Not `#>` or `->` before an `@`, and not `<@>`.
+            && bytes.get(i + 2) != Some(&b'>')
+    }) else {
+        return false;
+    };
+    let (left, right) = (body[..at].trim(), body[at + 2..].trim());
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    let (Ok(l), Ok(r)) = (parse(left, schema), parse(right, schema)) else {
+        return false;
+    };
+    let document = |e: &Expr| static_type(e) == crate::core::db_type::DbType::JSONB || yields_json_text(e);
+    let stored = |e: &Expr| matches!(e, Expr::Column(_) | Expr::JsonPath { .. });
+    let constant = |e: &Expr| match e {
+        Expr::Literal { .. } | Expr::Null => true,
+        Expr::Cast(inner, _) => matches!(**inner, Expr::Literal { .. } | Expr::Null),
+        _ => false,
+    };
+    (document(&l) || document(&r)) && !(stored(&l) && constant(&r))
 }
 
 /// Whether `body` is a symbol comparison with a side the evaluator types
@@ -4880,9 +4958,24 @@ fn lift_comparison(
     // Its `ESCAPE`, which nothing after a lifted operand reads, is folded
     // into the pattern here, in the backslash form the matcher reads: left
     // as written, `a LIKE 'a!%b%' ESCAPE '!'` was refused (42601).
-    let escaped = match &padded {
-        Some(_) => like_without_escape(rest)?,
-        None => None,
+    // An operand lifted as an expression (`CAST(c AS text) LIKE p ESCAPE
+    // '\\'`, which EF Core writes for a string Contains over a cast) needs
+    // the fold as much: the scan after it reads no ESCAPE (42601).
+    // Only for a pattern operator, which is all it reads: its lexer refuses
+    // what a pattern never holds (`||`), and called for every lifted
+    // comparison it failed `a IN ('ab' || '  ')` with "unexpected character
+    // '|'" (42601).
+    // A pattern it cannot read (`LIKE 'a' || '%'`) is left as written, as
+    // it was before the fold covered expressions, except under a
+    // `character(n)` operand, which always needed it.
+    let escaped = if !is_pattern_operator(rest) {
+        None
+    } else {
+        match like_without_escape(rest) {
+            Ok(folded) => folded,
+            Err(e) if padded.is_some() => return Err(e),
+            Err(_) => None,
+        }
     };
     let rest: &str = escaped.as_deref().unwrap_or(rest);
     let left_text: &str = padded.as_deref().unwrap_or(&body[..at]);
@@ -6428,7 +6521,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
 /// the ones it does. First, so every later step sees only those:
 ///
 /// - a lone name in parentheses, `(n) > 5`, `(t) = 'a'`, `(n) IS NULL`, is
-///   the name: read as an expression it was an operand with nothing after
+///   the name (and a lone column's path, `(doc -> 'a') @> '…'`, the path): read as an expression it was an operand with nothing after
 ///   it ("unexpected Op(">")"), a syntax error at `IS`, or an integer;
 /// - `x [NOT] IN (n / 10, 2)`, a list holding an expression, is the
 ///   comparisons it means ([`expand_expression_in_lists`]).
@@ -6497,7 +6590,29 @@ fn unwrap_lone_names(clause: &str) -> String {
                 .iter()
                 .any(|k| word.eq_ignore_ascii_case(k));
                 let attached = before.ends_with(')') || (!word.is_empty() && !keyword_before);
-                if is_lone_name(inner) && !syntax && !attached {
+                // A lone column's path, `(doc -> 'a') @> '…'`, `(doc #>> '{}')
+                // = 'x'`: the path. As a group it was read as a condition,
+                // its NULL guard put inside it ("expected comparison operator,
+                // got RPar"). Only where nothing binds to its left as tightly
+                // as the path does: `'x' || (doc ->> 'a')` without its
+                // parentheses is `('x' || doc) ->> 'a'`.
+                let lone_path = || {
+                    let loose_before = match before.as_bytes() {
+                        [] | [.., b'(' | b',' | b'='] => true,
+                        [.., p, b'>'] => !matches!(p, b'-' | b'#' | b'@' | b'>'),
+                        [b'>'] => true,
+                        [.., p, b'<'] => *p != b'<',
+                        [b'<'] => true,
+                        _ => keyword_before,
+                    };
+                    // A cast after it is the group's: `(doc ->> 'n')::int`
+                    // unwrapped would cast the key.
+                    loose_before
+                        && !clause[close + 1..].trim_start().starts_with("::")
+                        && (crate::core::jsonb::parse_path_expression_any(inner).is_some()
+                            || crate::core::jsonb::parse_qualified_path_expression(inner).is_some())
+                };
+                if (is_lone_name(inner) || lone_path()) && !syntax && !attached {
                     out.push_str(&clause[copied..i]);
                     out.push(' ');
                     out.push_str(inner.trim());
@@ -7282,8 +7397,10 @@ fn rewrite_where_in(clause: &str, schema: &SmallVec<[SchemaField; 20]>, scan: bo
                     // The guard goes in front of the term instead, which reads
                     // the same — `AND` binds tighter than `OR` — and leaves the
                     // parentheses holding what they held.
+                    // A path's arrow is no comparison either: `x <@ (doc ->
+                    // 'b')` wrapped as `x <@ ( … AND doc -> 'b' )`.
                     let holds_comparison = toks[i + 1..end].iter().any(|t| {
-                        matches!(t, Tok::Sym(sym) if !is_arithmetic(sym))
+                        matches!(t, Tok::Sym(sym) if !is_arithmetic(sym) && !matches!(sym.as_str(), "->" | "->>" | "#>" | "#>>"))
                             || t.is_keyword("contains")
                             || t.is_keyword("startswith")
                             || t.is_keyword("endswith")
@@ -8972,6 +9089,21 @@ mod lifted_operand_tests {
         assert!(lift_evaluated_operands(&deep(10), &schema()).is_ok());
         let e = lift_evaluated_operands(&deep(100_000), &schema()).unwrap_err();
         assert!(e.contains("nested more than"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod quoted_subscript_tests {
+    use super::needs_evaluator;
+
+    /// A subscript after a quoted column needs the evaluator, as one after a
+    /// bare column or a group does; a quoted column with no subscript does not.
+    #[test]
+    fn a_subscript_after_a_quoted_column_is_lifted() {
+        for text in [r#"b."Tags"[1] = 'even'"#, r#""Scores"[$1 + 1] > 3"#, "b.tags[1] = 'even'", "(a)[2] = 1"] {
+            assert!(needs_evaluator(text), "{text}");
+        }
+        assert!(!needs_evaluator(r#"b."Tags" = c"#));
     }
 }
 

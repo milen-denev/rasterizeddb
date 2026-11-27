@@ -53,7 +53,18 @@ pub fn flag_column_name(column: &str) -> String {
 /// anything else the client can see: a NULL flag ([`is_flag`]) or a
 /// collation key (`collation::is_companion`).
 pub fn is_hidden(name: &str) -> bool {
-    is_flag(name) || crate::core::rql::collation::is_companion(name)
+    is_flag(name) || crate::core::rql::collation::is_companion(name) || is_tick_digit(name)
+}
+
+/// The prefix of a time column's 100 ns digit (`__t7_<column>`): the
+/// seventh fractional digit SQL Server's `datetime2(7)` keeps, which the
+/// engine's microseconds do not. The SQL Server front end writes and reads
+/// it beside the column (`mssql::translate`).
+pub const TICK_DIGIT_PREFIX: &str = "__t7_";
+
+/// True for a time column's 100 ns digit companion.
+pub fn is_tick_digit(name: &str) -> bool {
+    name.len() >= TICK_DIGIT_PREFIX.len() && name.as_bytes()[..TICK_DIGIT_PREFIX.len()].eq_ignore_ascii_case(TICK_DIGIT_PREFIX.as_bytes())
 }
 
 /// True for a NULL flag, `__null_<column>`, the companion whose name ends

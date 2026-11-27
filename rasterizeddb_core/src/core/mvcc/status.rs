@@ -31,6 +31,23 @@ use crate::core::wal::Wal;
 const BITS_IN_PROGRESS: u8 = 0b00;
 const BITS_COMMITTED: u8 = 0b01;
 const BITS_ABORTED: u8 = 0b10;
+/// Reserved: no build writes it yet. Sharding's two-phase commit will record
+/// "prepared" with it (sharding-plan.md B0.1, phase 5). A build that does not
+/// know what it means refuses the file at open rather than reading a
+/// prepared transaction as in progress, which is an abort to every reader.
+const BITS_RESERVED: u8 = 0b11;
+
+/// The open error for a reserved code at transaction `tx`.
+#[cfg(not(feature = "sharding_2pc"))]
+fn reserved_code(path: &Path, tx: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{}: transaction {tx} has status code 0b11, which this build does not know (a newer build's prepared state?); refusing to open",
+            path.display()
+        ),
+    )
+}
 
 const ENTRIES_PER_BYTE: u64 = 4;
 
@@ -224,6 +241,11 @@ impl Drop for Bitmap {
 
 pub struct StatusLog {
     inner: Mutex<Inner>,
+    /// Transactions found prepared (code `0b11`) at open: a two-phase
+    /// commit's first phase, decided by its coordinator later
+    /// (sharding-plan.md B5). The manager keeps them running.
+    #[cfg(feature = "sharding_2pc")]
+    prepared_at_open: Vec<TxId>,
     /// What every lookup reads: the settled prefix and the bitmap above it,
     /// outside the `Mutex` so a scan can read them without it.
     ///
@@ -428,10 +450,21 @@ impl StatusLog {
         // once at open; a transaction still marked in-progress from a previous
         // run ended by crashing, which is an abort.
         let mut highest = 0u64;
+        #[cfg(feature = "sharding_2pc")]
+        let mut prepared: Vec<TxId> = Vec::new();
         for (index, byte) in bits.iter().enumerate() {
             if *byte != 0 {
                 for slot in 0..ENTRIES_PER_BYTE {
-                    if (byte >> (slot * 2)) & 0b11 != BITS_IN_PROGRESS {
+                    let code = (byte >> (slot * 2)) & 0b11;
+                    #[cfg(feature = "sharding_2pc")]
+                    if code == BITS_RESERVED {
+                        prepared.push(index as u64 * ENTRIES_PER_BYTE + slot);
+                    }
+                    #[cfg(not(feature = "sharding_2pc"))]
+                    if code == BITS_RESERVED {
+                        return Err(reserved_code(&path, index as u64 * ENTRIES_PER_BYTE + slot));
+                    }
+                    if code != BITS_IN_PROGRESS {
                         highest = index as u64 * ENTRIES_PER_BYTE + slot;
                     }
                 }
@@ -442,6 +475,8 @@ impl StatusLog {
         map.fill_from(&bits);
 
         Ok(StatusLog {
+            #[cfg(feature = "sharding_2pc")]
+            prepared_at_open: prepared,
             view: ArcSwap::from_pointee(Generation::plain(map)),
             settle: false,
             version: std::sync::atomic::AtomicU64::new(0),
@@ -480,6 +515,8 @@ impl StatusLog {
     /// [`StatusLog::in_memory`] with settling chosen explicitly.
     pub fn in_memory_with(settle: bool) -> Self {
         StatusLog {
+            #[cfg(feature = "sharding_2pc")]
+            prepared_at_open: Vec::new(),
             view: ArcSwap::from_pointee(Generation::plain(Bitmap::new())),
             settle,
             version: std::sync::atomic::AtomicU64::new(0),
@@ -511,6 +548,24 @@ impl StatusLog {
             TxOutcome::Committed => BITS_COMMITTED,
             TxOutcome::Aborted => BITS_ABORTED,
         };
+        self.record_bits(tx, bits);
+    }
+
+    /// Records `tx` prepared (`0b11`): read as in progress by everyone, and
+    /// kept running across a restart until its coordinator decides it
+    /// (sharding-plan.md B5). The caller flushes.
+    #[cfg(feature = "sharding_2pc")]
+    pub fn record_prepared(&self, tx: TxId) {
+        self.record_bits(tx, BITS_RESERVED);
+    }
+
+    /// The transactions found prepared at open.
+    #[cfg(feature = "sharding_2pc")]
+    pub fn prepared_at_open(&self) -> &[TxId] {
+        &self.prepared_at_open
+    }
+
+    fn record_bits(&self, tx: TxId, bits: u8) {
 
         // The lock still serializes writers: four transactions share a byte, so
         // the read-modify-write below is only atomic because nobody else is in
@@ -1022,6 +1077,7 @@ pub fn read_reservation(status_path: &Path) -> Option<TxId> {
 /// Monotonic in every path: each write carries a larger value than the last,
 /// replay applies records in order, and a log is replayed and emptied at open
 /// before the mark is read.
+#[derive(Clone)]
 pub struct IdReservation {
     /// `None` for an in-memory log: nothing outlives the process.
     path: Option<PathBuf>,
@@ -1098,6 +1154,24 @@ impl IdReservation {
         self.path.as_deref()
     }
 
+    /// Ids per raise.
+    pub fn block(&self) -> u64 {
+        self.block
+    }
+
+    /// Persists `mark` (see [`Self::cover`]); the in-memory mark is not
+    /// changed: [`Self::raised_to`] does that once the write is durable.
+    pub fn write_mark(&self, mark: TxId, log: Option<&std::sync::Arc<Wal>>) -> io::Result<()> {
+        self.write(mark, log)
+    }
+
+    /// Records that `mark` is durable: ids below it may be handed out.
+    pub fn raised_to(&mut self, mark: TxId) {
+        if mark > self.reserved {
+            self.reserved = mark;
+        }
+    }
+
     #[cfg(test)]
     pub fn set_block(&mut self, ids: u64) {
         self.block = ids.max(1);
@@ -1113,13 +1187,20 @@ impl IdReservation {
     /// mark, hands the id out again, and its new owner would adopt the rows.
     /// The next `begin` past the mark tries again.
     pub fn cover(&mut self, id: TxId, log: Option<&std::sync::Arc<Wal>>) -> io::Result<()> {
+        self.cover_via(id, |r, mark| r.write(mark, log).map(|()| mark))
+    }
+
+    /// [`Self::cover`] with the write made by `write`, which persists at
+    /// least the mark it is given and returns the mark now on disk (higher
+    /// when an earlier raise already wrote past it).
+    pub fn cover_via(&mut self, id: TxId, write: impl FnOnce(&IdReservation, TxId) -> io::Result<TxId>) -> io::Result<()> {
         if id < self.reserved {
             return Ok(());
         }
         let mark = id.saturating_add(self.block);
-        match self.write(mark, log) {
-            Ok(()) => {
-                self.reserved = mark;
+        match write(self, mark) {
+            Ok(durable) => {
+                self.reserved = durable.max(mark);
                 if self.failing {
                     log::info!("transaction id reservation is being written again");
                     self.failing = false;
@@ -1145,6 +1226,8 @@ impl IdReservation {
         let Some(path) = self.path.as_deref() else {
             return Ok(());
         };
+        #[cfg(test)]
+        reservation_test_hooks::wait_if_parked(path);
         #[cfg(test)]
         if reservation_test_hooks::fails(path) {
             // What a full disk answers: ENOSPC on Unix. Built from the kind on
@@ -1217,6 +1300,47 @@ pub(crate) mod reservation_test_hooks {
             return false;
         };
         FAILING.lock().iter().any(|d| d == dir)
+    }
+
+    /// Directories whose reservation writes wait, as a sync on a busy disk
+    /// does, until [`unpark`]; and how many writes are waiting.
+    static PARKED: parking_lot::Mutex<(Vec<PathBuf>, usize)> = parking_lot::Mutex::new((Vec::new(), 0));
+    static PARKED_CHANGED: parking_lot::Condvar = parking_lot::Condvar::new();
+
+    /// Every reservation write in `dir` waits from now until [`unpark`].
+    pub(crate) fn park_in(dir: &Path) {
+        PARKED.lock().0.push(dir.to_path_buf());
+    }
+
+    pub(crate) fn unpark(dir: &Path) {
+        PARKED.lock().0.retain(|d| d != dir);
+        PARKED_CHANGED.notify_all();
+    }
+
+    /// Waits until a write is parked, up to `limit`; whether one is.
+    pub(crate) fn wait_for_parked(limit: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        let mut g = PARKED.lock();
+        while g.1 == 0 {
+            if PARKED_CHANGED.wait_until(&mut g, deadline).timed_out() {
+                return g.1 > 0;
+            }
+        }
+        true
+    }
+
+    pub(super) fn wait_if_parked(path: &Path) {
+        let Some(dir) = path.parent() else { return };
+        let mut g = PARKED.lock();
+        if !g.0.iter().any(|d| d == dir) {
+            return;
+        }
+        g.1 += 1;
+        PARKED_CHANGED.notify_all();
+        while g.0.iter().any(|d| d == dir) {
+            PARKED_CHANGED.wait(&mut g);
+        }
+        g.1 -= 1;
     }
 }
 
@@ -1772,6 +1896,8 @@ impl StatusLog {
         let mut highest = settled.highest;
 
         // Pass 1: the highest recorded id.
+        #[cfg(feature = "sharding_2pc")]
+        let mut prepared: Vec<TxId> = Vec::new();
         file.seek(SeekFrom::Start(start_byte))?;
         let mut chunk = vec![0u8; 1 << 20];
         let mut at = start_byte;
@@ -1783,7 +1909,16 @@ impl StatusLog {
             for (i, byte) in chunk[..n].iter().enumerate() {
                 if *byte != 0 {
                     for slot in 0..ENTRIES_PER_BYTE {
-                        if (byte >> (slot * 2)) & 0b11 != BITS_IN_PROGRESS {
+                        let code = (byte >> (slot * 2)) & 0b11;
+                        #[cfg(feature = "sharding_2pc")]
+                        if code == BITS_RESERVED {
+                            prepared.push((at + i as u64) * ENTRIES_PER_BYTE + slot);
+                        }
+                        #[cfg(not(feature = "sharding_2pc"))]
+                        if code == BITS_RESERVED {
+                            return Err(reserved_code(&path, (at + i as u64) * ENTRIES_PER_BYTE + slot));
+                        }
+                        if code != BITS_IN_PROGRESS {
                             highest = highest.max((at + i as u64) * ENTRIES_PER_BYTE + slot);
                         }
                     }
@@ -1796,6 +1931,12 @@ impl StatusLog {
         // highest recorded are this run's to assign, and the block holding it
         // may hold some.
         let below = ((highest + 1) / BLOCK_IDS * BLOCK_IDS).max(settled.below);
+        // Never past a prepared transaction: its outcome is not final.
+        #[cfg(feature = "sharding_2pc")]
+        let below = match prepared.iter().min() {
+            Some(&p) => below.min((p / BLOCK_IDS * BLOCK_IDS).max(settled.below)),
+            None => below,
+        };
         let end_byte = below / ENTRIES_PER_BYTE;
         file.seek(SeekFrom::Start(start_byte))?;
         let mut block = vec![0u8; BLOCK_BYTES];
@@ -1827,6 +1968,8 @@ impl StatusLog {
         map.fill_from_at(base, &tail);
 
         Ok(StatusLog {
+            #[cfg(feature = "sharding_2pc")]
+            prepared_at_open: prepared,
             view: ArcSwap::from_pointee(Generation {
                 settled: (below > 0).then_some(settled),
                 bits: Arc::new(map),

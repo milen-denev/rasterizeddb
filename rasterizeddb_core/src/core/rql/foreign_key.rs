@@ -912,7 +912,11 @@ impl<'a> ReferencedSide<'a> {
             fields: schema
                 .fields
                 .iter()
-                .filter(|f| !crate::core::rql::nullable::is_hidden(&f.name))
+                // A case-insensitive column's companion is referenced in its
+                // place (`collation::apply_to_create`).
+                .filter(|f| {
+                    !crate::core::rql::nullable::is_hidden(&f.name) || crate::core::rql::collation::is_companion(&f.name)
+                })
                 .map(|f| (f.name.as_str(), f.is_deleted, f.is_unique))
                 .collect(),
             primary_key: schema.primary_key.as_deref(),

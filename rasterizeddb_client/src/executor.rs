@@ -27,6 +27,14 @@ pub trait Executor: Sync {
     #[doc(hidden)]
     fn send_checked(&self, sql: &str) -> impl Future<Output = Result<Rows>> + Send;
 
+    /// The shard a router's transaction is pinned to, which the ORM checks
+    /// each row's key against. `None` for everything else.
+    #[cfg(feature = "sharding")]
+    #[doc(hidden)]
+    fn __shard_scope(&self) -> Option<&crate::shard::ShardScope> {
+        None
+    }
+
     /// Runs `sql` exactly as given, with no placeholder rendering. Text
     /// holding a second statement is refused with [`Error::Unsupported`]
     /// before anything is sent.
@@ -147,6 +155,11 @@ impl Executor for crate::client::Client {
 impl<E: Executor> Executor for &E {
     fn send_checked(&self, sql: &str) -> impl Future<Output = Result<Rows>> + Send {
         (**self).send_checked(sql)
+    }
+
+    #[cfg(feature = "sharding")]
+    fn __shard_scope(&self) -> Option<&crate::shard::ShardScope> {
+        (**self).__shard_scope()
     }
 }
 

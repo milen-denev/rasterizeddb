@@ -372,12 +372,71 @@ pub fn storage_is_durable(kind: &str) -> bool {
     !matches!(kind, "memory" | "kv-memory" | "temporary" | "file-unlogged")
 }
 
-/// A role the server knows: who can log in, and who can do everything.
+/// A role the server knows: who can log in, who can do everything, what
+/// else it may do, and the roles it is a member of.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoleInfo {
     pub name: String,
     pub can_login: bool,
     pub superuser: bool,
+    pub create_db: bool,
+    pub create_role: bool,
+    pub bypass_rls: bool,
+    /// `-1`: no limit.
+    pub conn_limit: i64,
+    pub valid_until: Option<String>,
+    pub member_of: Vec<String>,
+}
+
+/// What each role may reach beyond its attributes, for the ROLES tab:
+/// table grants, default privileges and row-level security policies.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RoleAccess {
+    /// Grants on tables (vaults and ledger tables among them), one entry per
+    /// (grantee, table). An owner's implicit privileges are in `owned`.
+    pub grants: Vec<TableGrant>,
+    /// `(owner, table)`: the tables each role owns.
+    pub owned: Vec<(String, String)>,
+    pub defaults: Vec<DefaultPrivilege>,
+    pub policies: Vec<PolicyInfo>,
+    /// Tables with row-level security enabled.
+    pub rls_tables: Vec<String>,
+    /// Which parts the server answered: a server without policies still
+    /// shows its grants.
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TableGrant {
+    pub grantee: String,
+    pub table: String,
+    pub privileges: Vec<String>,
+    /// The privileges held WITH GRANT OPTION.
+    pub grantable: Vec<String>,
+}
+
+/// One `ALTER DEFAULT PRIVILEGES` entry: what `grantee` gets on objects of
+/// `kind` that `owner` creates from now on.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DefaultPrivilege {
+    pub owner: String,
+    /// `TABLES`, `SEQUENCES`, `FUNCTIONS`, `TYPES` or `SCHEMAS`.
+    pub kind: String,
+    pub grantee: String,
+    pub privileges: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PolicyInfo {
+    pub name: String,
+    pub table: String,
+    /// `ALL`, `SELECT`, `INSERT`, `UPDATE` or `DELETE`.
+    pub command: String,
+    pub permissive: bool,
+    /// The roles it applies to; `public` for every role.
+    pub roles: Vec<String>,
+    pub using: String,
+    pub check: String,
 }
 
 /// A column of a table.
@@ -897,6 +956,7 @@ mod tests {
             }],
             supported: true,
             locations,
+            stores: Vec::new(),
             placements: Vec::new(),
         }
     }
@@ -1443,6 +1503,99 @@ impl PeerHealth {
     }
 }
 
+/// One shard of the cluster map, as `SHOW SHARDS` answers it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShardInfo {
+    pub id: u64,
+    /// The shard this connection reached.
+    pub this: bool,
+    pub address: String,
+    pub standbys: Vec<String>,
+    /// How many block ranges it owns, and how many blocks in all.
+    pub ranges: u64,
+    pub blocks: u64,
+}
+
+/// One table's rows on the shard the connection reached, summed over its
+/// partitions (`SHOW SHARD LOAD`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableLoad {
+    pub table: String,
+    pub partitions: u64,
+    pub row_slots: u64,
+    pub bytes: u64,
+}
+
+/// Everything the shards page reads.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ShardsSnapshot {
+    /// Whether the server understood `SHOW SHARDS` (an older build answers
+    /// it as a runtime parameter, a PostgreSQL server refuses it).
+    pub supported: bool,
+    pub shards: Vec<ShardInfo>,
+    pub map_epoch: Option<u64>,
+    pub cluster_id: String,
+    pub map_digest: String,
+    /// `SHOW GATEWAY`'s rows when the connection is to a gateway, else
+    /// empty.
+    pub gateway: Vec<(String, String)>,
+    pub load: Vec<TableLoad>,
+    /// Two-phase parts prepared on the shard the connection reached, by
+    /// global id.
+    pub prepared: Vec<String>,
+    /// A gateway's `SHOW REBALANCE STATUS` rows, `(name, value)`, the
+    /// tool's output as `log` rows; empty when not through a gateway.
+    pub rebalance: Vec<(String, String)>,
+    /// Why the rebalance controls are not offered: the gateway refused the
+    /// status (this role is not in its rebalance_roles, an older gateway).
+    pub rebalance_refused: Option<String>,
+}
+
+/// One row of a gateway's `SHOW REBALANCE PLAN`: a `load` row per shard
+/// (its share of the load before and after, in percent), a `move` of blocks
+/// `[lo, hi)` from `shard` to `to_shard`, a `split` to make first, or one
+/// `balanced` row.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RebalanceStep {
+    pub kind: String,
+    pub shard: String,
+    pub to_shard: String,
+    pub lo: String,
+    pub hi: String,
+    pub bytes: String,
+    pub before: String,
+    pub after: String,
+}
+
+impl ShardsSnapshot {
+    /// Every block a map can hand out: the hash space is 2^64 points in
+    /// blocks of 2^16.
+    pub const BLOCKS: u64 = 1 << 48;
+
+    pub fn through_gateway(&self) -> bool {
+        !self.gateway.is_empty()
+    }
+
+    pub fn gateway_value(&self, name: &str) -> Option<&str> {
+        self.gateway.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+
+    /// Whether every block of the hash space has an owner.
+    pub fn covered_blocks(&self) -> u64 {
+        self.shards.iter().map(|s| s.blocks).sum()
+    }
+
+    /// The rebalance's state as the gateway reports it: `idle`, `running`,
+    /// `done` or `failed`; `None` when not reported.
+    pub fn rebalance_state(&self) -> Option<&str> {
+        self.rebalance.iter().find(|(k, _)| k == "state").map(|(_, v)| v.as_str())
+    }
+
+    pub fn rebalance_running(&self) -> bool {
+        self.rebalance_state() == Some("running")
+    }
+}
+
 /// Everything the replication page reads, in one round trip.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplicationSnapshot {
@@ -1572,6 +1725,59 @@ pub struct TablePlacement {
     pub mirrored: bool,
 }
 
+/// One key/value store, as `SHOW STORAGE STORES` reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvStore {
+    pub name: String,
+    /// `s3`, `dir`, or whatever a store this build cannot open calls itself.
+    pub kind: String,
+    /// The endpoint for S3, the directory for a local store.
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub addressing: String,
+    pub settings: String,
+    /// `store` or `environment` — where the credentials come from, never what
+    /// they are.
+    pub credentials: String,
+    pub tables: u64,
+    /// Whether the server has contacted it yet. A store nothing has opened has
+    /// not proved its endpoint or credentials.
+    pub opened: bool,
+    /// Whether this server build can open it at all.
+    pub supported: bool,
+}
+
+impl KvStore {
+    /// Where the bytes are, in one line: `s3://bucket/prefix @ endpoint` or
+    /// the directory.
+    pub fn address(&self) -> String {
+        let prefix = self.prefix.trim_matches('/');
+        match self.kind.as_str() {
+            "s3" => {
+                let mut out = format!("s3://{}", self.bucket);
+                if !prefix.is_empty() {
+                    out.push('/');
+                    out.push_str(prefix);
+                }
+                if !self.endpoint.is_empty() {
+                    out.push_str(" @ ");
+                    out.push_str(&self.endpoint);
+                }
+                out
+            }
+            _ if prefix.is_empty() => self.endpoint.clone(),
+            _ => format!("{} ({})", self.endpoint, prefix),
+        }
+    }
+
+    /// The placement spec a table on this store carries.
+    pub fn spec(&self) -> String {
+        format!("kv:{}", self.name)
+    }
+}
+
 /// Everything the storage page reads, in one round trip.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorageSnapshot {
@@ -1586,6 +1792,10 @@ pub struct StorageSnapshot {
     /// directories, which is a different and much more common thing.
     pub supported: bool,
     pub locations: Vec<StorageLocation>,
+    /// Key/value stores (`SHOW STORAGE STORES`): S3 buckets and local KV
+    /// directories that hold tables outside the pool. Empty against
+    /// PostgreSQL and against a server built without `kv_storage`.
+    pub stores: Vec<KvStore>,
     pub placements: Vec<TablePlacement>,
 }
 
@@ -1639,6 +1849,26 @@ impl StorageSnapshot {
             return Vec::new();
         }
         self.placements.iter().filter(|p| !p.mirrored).collect()
+    }
+
+    /// Tables on key/value stores rather than in a directory.
+    pub fn tables_on_stores(&self) -> u64 {
+        self.stores.iter().map(|store| store.tables).sum()
+    }
+
+    /// How a placement's location reads on the page: a directory as itself,
+    /// `kv:<store>` as the store and where it points, `memory:` in words.
+    pub fn describe_location(&self, location: &str) -> String {
+        if let Some(name) = location.strip_prefix("kv:") {
+            return match self.stores.iter().find(|store| store.name == name) {
+                Some(store) => format!("{} store '{}' · {}", store.kind, name, store.address()),
+                None => format!("key/value store '{name}'"),
+            };
+        }
+        if location.eq_ignore_ascii_case("memory:") || location.eq_ignore_ascii_case("memory") {
+            return "in memory".to_string();
+        }
+        location.to_string()
     }
 
     /// Where a table created now would go, as the server worked it out.
@@ -2316,4 +2546,265 @@ impl Default for BranchForm {
             keep_base: true,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Broker
+// ---------------------------------------------------------------------------
+
+/// One row of `BROKER SHOW TOPICS` (queues are topics too, `queue` set).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerTopic {
+    pub name: String,
+    pub partitions: u64,
+    pub durability: String,
+    pub queue: bool,
+    pub messages: u64,
+    pub bytes: u64,
+    /// 0: kept until a size retention or forever.
+    pub retention_ms: u64,
+}
+
+/// One row of `BROKER SHOW QUEUES`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerQueue {
+    pub name: String,
+    pub messages: u64,
+    pub ready: u64,
+    pub unacked: u64,
+    pub consumers: u64,
+}
+
+/// One row of `BROKER SHOW SUBSCRIPTIONS`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerSubscription {
+    pub topic: String,
+    pub name: String,
+    pub mode: String,
+    pub members: u64,
+    pub backlog: u64,
+    pub inflight: u64,
+    pub delivered: u64,
+    pub acked: u64,
+    pub dead: u64,
+}
+
+/// One row of `BROKER SHOW EXCHANGES`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerExchange {
+    pub name: String,
+    pub kind: String,
+    pub durable: bool,
+    pub bindings: u64,
+}
+
+/// One row of `BROKER SHOW BINDINGS`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerBinding {
+    pub exchange: String,
+    pub topic: String,
+    pub key: String,
+}
+
+/// Everything the broker page reads.
+#[derive(Debug, Clone, Default)]
+pub struct BrokerSnapshot {
+    /// Whether the server answered `BROKER SHOW TOPICS` at all: a server
+    /// without the broker (or a PostgreSQL one) refuses it.
+    pub supported: bool,
+    /// Why it was refused, shown on the page.
+    pub refusal: String,
+    pub topics: Vec<BrokerTopic>,
+    pub queues: Vec<BrokerQueue>,
+    pub subscriptions: Vec<BrokerSubscription>,
+    pub exchanges: Vec<BrokerExchange>,
+    pub bindings: Vec<BrokerBinding>,
+    /// `BROKER SHOW GRANTS`; empty on a server without broker permissions.
+    pub grants: Vec<BrokerGrant>,
+}
+
+/// What the create form makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BrokerCreateKind {
+    #[default]
+    Topic,
+    Queue,
+    Exchange,
+    Subscription,
+    Binding,
+}
+
+impl BrokerCreateKind {
+    pub const ALL: [BrokerCreateKind; 5] = [
+        BrokerCreateKind::Topic,
+        BrokerCreateKind::Queue,
+        BrokerCreateKind::Exchange,
+        BrokerCreateKind::Subscription,
+        BrokerCreateKind::Binding,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BrokerCreateKind::Topic => "TOPIC",
+            BrokerCreateKind::Queue => "QUEUE",
+            BrokerCreateKind::Exchange => "EXCHANGE",
+            BrokerCreateKind::Subscription => "SUBSCRIPTION",
+            BrokerCreateKind::Binding => "BINDING",
+        }
+    }
+}
+
+/// The create form. Empty fields are left out of the statement, so the
+/// server's defaults apply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrokerForm {
+    pub kind: BrokerCreateKind,
+    /// The topic, queue, exchange or subscription name; a binding's exchange.
+    pub name: String,
+    /// A topic's partition count.
+    pub partitions: String,
+    /// `sync`, `async` or `memory` (topic, queue).
+    pub durability: String,
+    /// A topic's retention (`7d`, `12h`) or a queue's message TTL.
+    pub retention: String,
+    /// A topic's retention by size (`10GB`).
+    pub retention_bytes: String,
+    /// Queue, subscription: redeliveries before the dead letter.
+    pub max_deliveries: String,
+    /// Queue, subscription: where a message goes after `max_deliveries`.
+    pub dead_letter: String,
+    /// Queue, subscription: how long a delivery waits for its ack (`30s`).
+    pub ack_timeout: String,
+    /// An exchange's type: direct, fanout, topic or headers.
+    pub exchange_type: String,
+    /// A subscription's topic; a binding's topic or queue.
+    pub target: String,
+    /// A subscription's mode: ordered or shared.
+    pub mode: String,
+    /// A subscription's start: EARLIEST, LATEST or an offset.
+    pub from: String,
+    /// A binding's key.
+    pub key: String,
+}
+
+impl Default for BrokerForm {
+    fn default() -> Self {
+        Self {
+            kind: BrokerCreateKind::Topic,
+            name: String::new(),
+            partitions: String::new(),
+            durability: String::new(),
+            retention: String::new(),
+            retention_bytes: String::new(),
+            max_deliveries: String::new(),
+            dead_letter: String::new(),
+            ack_timeout: String::new(),
+            exchange_type: "direct".to_string(),
+            target: String::new(),
+            mode: "shared".to_string(),
+            from: String::new(),
+            key: String::new(),
+        }
+    }
+}
+
+/// The publish form: to a topic or queue, or through an exchange with a
+/// routing key.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerPublishForm {
+    /// A topic or queue; with `routing_key` set, an exchange.
+    pub target: String,
+    pub via_exchange: bool,
+    pub routing_key: String,
+    pub value: String,
+    /// The record's key (topics: picks the partition).
+    pub key: String,
+    pub header_name: String,
+    pub header_value: String,
+}
+
+/// What the message panel shows: a topic's records, a queue's popped
+/// messages, or a topic's partitions.
+#[derive(Debug, Clone)]
+pub struct BrokerBrowse {
+    pub title: String,
+    pub statement: String,
+    /// `None` while it loads.
+    pub result: Option<Result<Grid, String>>,
+}
+
+/// The read controls of the message panel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrokerReadForm {
+    /// Empty: every partition.
+    pub partition: String,
+    /// EARLIEST, LATEST, or an offset.
+    pub from: String,
+    pub limit: String,
+}
+
+impl Default for BrokerReadForm {
+    fn default() -> Self {
+        Self { partition: String::new(), from: "EARLIEST".to_string(), limit: "100".to_string() }
+    }
+}
+
+/// One row of `BROKER SHOW GRANTS`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerGrant {
+    /// `topic`, `queue` or `exchange`.
+    pub object_type: String,
+    pub object: String,
+    pub owner: String,
+    /// A role, or `PUBLIC`.
+    pub grantee: String,
+    /// `OWNER` for the owner's own row, else PRODUCE, CONSUME, PUBLISH or BIND.
+    pub privilege: String,
+    pub grantor: String,
+    pub grantable: bool,
+}
+
+/// What a grant, a revoke or an owner change is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BrokerObjectKind {
+    #[default]
+    Topic,
+    Queue,
+    Exchange,
+}
+
+impl BrokerObjectKind {
+    pub const ALL: [BrokerObjectKind; 3] = [BrokerObjectKind::Topic, BrokerObjectKind::Queue, BrokerObjectKind::Exchange];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BrokerObjectKind::Topic => "TOPIC",
+            BrokerObjectKind::Queue => "QUEUE",
+            BrokerObjectKind::Exchange => "EXCHANGE",
+        }
+    }
+
+    /// The two privileges it takes: PRODUCE/CONSUME, or PUBLISH/BIND.
+    pub fn privileges(self) -> [&'static str; 2] {
+        match self {
+            BrokerObjectKind::Exchange => ["PUBLISH", "BIND"],
+            _ => ["PRODUCE", "CONSUME"],
+        }
+    }
+}
+
+/// The permissions form: a grant or revoke of up to two privileges to one
+/// role, and an owner change.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BrokerPermForm {
+    pub kind: BrokerObjectKind,
+    /// Empty: every one of the kind (`ON ALL TOPICS`).
+    pub object: String,
+    /// A role, or PUBLIC.
+    pub grantee: String,
+    /// The kind's first and second privilege (`privileges()`).
+    pub first: bool,
+    pub second: bool,
+    /// The new owner for ALTER … OWNER TO.
+    pub owner: String,
 }

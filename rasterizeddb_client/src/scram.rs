@@ -9,9 +9,12 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+#[cfg(not(feature = "fips"))]
 use hmac::{Hmac, KeyInit, Mac};
+#[cfg(not(feature = "fips"))]
 use sha2::{Digest, Sha256};
 
+#[cfg(not(feature = "fips"))]
 type HmacSha256 = Hmac<Sha256>;
 
 /// Iteration counts below this are refused.
@@ -98,9 +101,9 @@ impl ScramClient {
         }
 
         let mut salted = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(self.password.as_bytes(), &salt, iterations, &mut salted);
+        pbkdf2_sha256(self.password.as_bytes(), &salt, iterations, &mut salted);
         let client_key = hmac(&salted, b"Client Key");
-        let stored_key = Sha256::digest(&client_key).to_vec();
+        let stored_key = sha256(&client_key);
         let server_key = hmac(&salted, b"Server Key");
 
         let mut cbind = self.gs2_header.as_bytes().to_vec();
@@ -150,10 +153,40 @@ impl ScramClient {
     }
 }
 
+/// HMAC-SHA-256: the AWS-LC FIPS module with feature `fips`.
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    #[cfg(feature = "fips")]
+    {
+        let k = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, key);
+        aws_lc_rs::hmac::sign(&k, data).as_ref().to_vec()
+    }
+    #[cfg(not(feature = "fips"))]
+    {
+        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+        mac.update(data);
+        mac.finalize().into_bytes().to_vec()
+    }
+}
+
+fn sha256(data: &[u8]) -> Vec<u8> {
+    #[cfg(feature = "fips")]
+    {
+        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data).as_ref().to_vec()
+    }
+    #[cfg(not(feature = "fips"))]
+    {
+        Sha256::digest(data).to_vec()
+    }
+}
+
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
+    #[cfg(feature = "fips")]
+    {
+        let n = std::num::NonZeroU32::new(iterations.max(1)).expect("non-zero");
+        aws_lc_rs::pbkdf2::derive(aws_lc_rs::pbkdf2::PBKDF2_HMAC_SHA256, n, salt, password, out);
+    }
+    #[cfg(not(feature = "fips"))]
+    pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iterations, out);
 }
 
 /// Escapes a user name for the `n=` field, where `,` and `=` are structural.
@@ -192,6 +225,8 @@ fn field(message: &str, key: char) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "fips")]
+    use sha2::{Digest, Sha256};
     use super::*;
 
     #[test]

@@ -37,6 +37,14 @@ pub const INDEX_STORE_V1: &str = "index_store_v1";
 /// bytes padded with a scale of zero — wrong values both ways, never an error.
 pub const NUMERIC_OWN_SCALE_V1: &str = "numeric_own_scale_v1";
 
+/// A table in this directory has a column declared `COMPRESSION`, so its
+/// rows may hold compressed values (`core::compression`): a string header
+/// whose length has bit 31 set and whose bytes are a zstd frame. Set before a
+/// table with such a column is written to. A binary that does not know it
+/// would refuse those values as misread headers, and could not keep the
+/// column's setting across a rewrite.
+pub const COMPRESSED_VALUES_V1: &str = "compressed_values_v1";
+
 /// A foreign key over several columns is stored as one record per column
 /// pair (`foreign_key::ForeignKeyRecord`). Set before the first such record
 /// is written: a binary that predates composite keys reads each pair as a
@@ -44,20 +52,89 @@ pub const NUMERIC_OWN_SCALE_V1: &str = "numeric_own_scale_v1";
 /// something different, without an error.
 pub const COMPOSITE_FOREIGN_KEY_V1: &str = "composite_foreign_key_v1";
 
+/// The directory is a shard's (`--role shard`, sharding-plan.md B1a.3): it
+/// holds only the level-0 ranges the cluster map gives it. A build without
+/// the `sharding` feature would open it as a plain database answering for
+/// every range, so it refuses it.
+pub const SHARD_V1: &str = "shard_v1";
+
+/// A table in the directory is a ledger table (docs/ledger-and-vault-plan.md
+/// §3): append-only under a retention lock, its rows chained by digest. The
+/// guard lives in a licensed crate, so a build that has not installed it
+/// would let `UPDATE` and `DELETE` through. Known only once
+/// [`crate::core::ledger_hooks::install`] has registered it.
+pub const LEDGER_V1: &str = "ledger_v1";
+
+/// A table in the directory has columns encrypted under wrapped keys
+/// (plan §4). Known only once the licensed cipher is installed: a build
+/// without it would read ciphertext as values.
+pub const ENCRYPTED_VALUES_V1: &str = "encrypted_values_v1";
+
+/// The directory holds a secret vault (plan §4). Known only once the licensed
+/// vault is installed.
+pub const VAULT_V1: &str = "vault_v1";
+
+/// The flags a licensed crate may make known at run time, through
+/// [`register_licensed`]. Every other flag is decided by this build's
+/// features alone.
+const LICENSED: &[&str] = &[LEDGER_V1, ENCRYPTED_VALUES_V1, VAULT_V1];
+
+/// The licensed flags installed hooks have registered.
+static REGISTERED: parking_lot::RwLock<Vec<&'static str>> = parking_lot::RwLock::new(Vec::new());
+
+/// Makes `flag`, one of the licensed flags, known to this process. Called by
+/// the licensed crate's installer before any catalogue opens; a directory
+/// opened before is refused, which fails closed.
+pub fn register_licensed(flag: &str) -> Result<(), String> {
+    let Some(&flag) = LICENSED.iter().find(|f| **f == flag) else {
+        return Err(format!("{flag} is not a flag a licensed crate may register"));
+    };
+    let mut set = REGISTERED.write();
+    if !set.contains(&flag) {
+        set.push(flag);
+    }
+    Ok(())
+}
+
 /// Every flag any build has defined, with what it means, for the refusal
-/// message. Not the set this build supports: that is [`KNOWN`].
+/// message. Not the set this build supports: that is [`known`].
 const DESCRIBED: &[(&str, &str)] = &[
     (INDEX_STORE_V1, "persistent index snapshots (Cargo feature `persistent_indexes`)"),
     (NUMERIC_OWN_SCALE_V1, "unconstrained NUMERIC columns that keep each value's own scale"),
+    (COMPRESSED_VALUES_V1, "compressed column values (Cargo feature `storage_compression`)"),
     (COMPOSITE_FOREIGN_KEY_V1, "foreign keys over several columns"),
+    (SHARD_V1, "a shard's data directory (Cargo feature `sharding`)"),
+    (LEDGER_V1, "ledger tables (the enterprise build, feature `ledger`)"),
+    (ENCRYPTED_VALUES_V1, "encrypted columns (the enterprise build, feature `encryption`)"),
+    (VAULT_V1, "secret vaults (the enterprise build, feature `vault`)"),
 ];
 
-/// The flags this build understands.
-#[cfg(feature = "persistent_indexes")]
-const KNOWN: &[&str] = &[INDEX_STORE_V1, NUMERIC_OWN_SCALE_V1, COMPOSITE_FOREIGN_KEY_V1];
-/// The flags this build understands.
-#[cfg(not(feature = "persistent_indexes"))]
-const KNOWN: &[&str] = &[NUMERIC_OWN_SCALE_V1, COMPOSITE_FOREIGN_KEY_V1];
+/// The flags this build understands: those its features decide, and the
+/// licensed ones installed hooks registered.
+fn known() -> Vec<&'static str> {
+    let mut k = built_in().to_vec();
+    k.extend(REGISTERED.read().iter().copied());
+    k
+}
+
+/// The flags this build's features decide.
+fn built_in() -> &'static [&'static str] {
+    static KNOWN: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    KNOWN.get_or_init(|| {
+        let mut k = Vec::with_capacity(5);
+        if cfg!(feature = "persistent_indexes") {
+            k.push(INDEX_STORE_V1);
+        }
+        k.extend([NUMERIC_OWN_SCALE_V1, COMPOSITE_FOREIGN_KEY_V1]);
+        if cfg!(feature = "storage_compression") {
+            k.push(COMPRESSED_VALUES_V1);
+        }
+        if cfg!(feature = "sharding") {
+            k.push(SHARD_V1);
+        }
+        k
+    })
+}
 
 /// Serialises [`require`] within the process: two first writers in one
 /// directory would otherwise race on the temporary file.
@@ -117,7 +194,7 @@ pub fn flags(dir: &Path) -> Result<Vec<String>, String> {
 ///
 /// Called before anything in the directory is opened, replayed or created.
 pub fn check(dir: &Path) -> Result<(), String> {
-    refusal(&flags(dir)?, KNOWN)
+    refusal(&flags(dir)?, &known())
 }
 
 /// Sets `flag` in `dir`, durably, before the caller creates the first file
@@ -127,7 +204,7 @@ pub fn check(dir: &Path) -> Result<(), String> {
 /// directory synced, so a crash leaves the old set or the new, never a torn
 /// one.
 pub fn require(dir: &Path, flag: &str) -> io::Result<()> {
-    if !KNOWN.contains(&flag) {
+    if !known().contains(&flag) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{flag} is not an on-disk feature this build supports"),
@@ -183,6 +260,20 @@ pub fn fence_numeric_own_scale(dir: &Path, fields: &[crate::core::row::schema::S
     require(dir, NUMERIC_OWN_SCALE_V1)
 }
 
+/// Sets [`COMPRESSED_VALUES_V1`] in `dir` when `schema` has a column that
+/// compresses and it is not set yet. Asked where [`fence_numeric_own_scale`]
+/// is, whenever a table's schema is read and before anything writes to it,
+/// and by the DDL that declares the compression before it is recorded.
+pub fn fence_compressed_values(dir: &Path, schema: &crate::core::row::schema::TableSchema) -> io::Result<()> {
+    if schema.compression.is_empty() {
+        return Ok(());
+    }
+    if flags(dir).map_err(io::Error::other)?.iter().any(|f| f == COMPRESSED_VALUES_V1) {
+        return Ok(());
+    }
+    require(dir, COMPRESSED_VALUES_V1)
+}
+
 /// The database directories under `dir` (`dir` itself, and a `CREATE
 /// DATABASE` directory nested in it) whose tables record a seventeen-byte
 /// NUMERIC field, read from every `…_schema_FIELDS.db` in every
@@ -192,6 +283,41 @@ pub fn fence_numeric_own_scale(dir: &Path, fields: &[crate::core::row::schema::S
 /// a database: this is for a restored directory before anything opens it.
 pub fn directories_needing_numeric_own_scale(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
     use crate::core::row::schema::{SCHEMA_FIELD_SIZE, SchemaField};
+    directories_where(dir, "_schema_FIELDS.db", |bytes| {
+        bytes
+            .chunks_exact(SCHEMA_FIELD_SIZE as usize)
+            .filter(|record| !crate::core::torn_tail::is_unwritten(record))
+            .filter_map(|record| SchemaField::from_vec(record).ok())
+            .any(|field| crate::core::value_codec::keeps_own_scale(&field))
+    })
+}
+
+/// The database directories under `dir` whose tables declare compression:
+/// a live compression marker in a `…_schema_TYP.db`
+/// (`type_modifier::declares_compression`), for [`COMPRESSED_VALUES_V1`].
+pub fn directories_needing_compressed_values(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
+    use crate::core::rql::type_modifier::{TYPE_MODIFIER_SIZE, TypeModifier, declares_compression};
+    directories_where(dir, "_schema_TYP.db", |bytes| {
+        let records: Vec<TypeModifier> = bytes
+            .chunks_exact(TYPE_MODIFIER_SIZE as usize)
+            .filter(|record| !crate::core::torn_tail::is_unwritten(record))
+            .filter_map(|record| TypeModifier::from_vec(record).ok())
+            .collect();
+        // The newest record of a key wins, as the sidecar is read.
+        let mut live: Vec<TypeModifier> = Vec::new();
+        for record in records {
+            live.retain(|m| m.column != record.column);
+            live.push(record);
+        }
+        declares_compression(&live)
+    })
+}
+
+/// The database directories under `dir` (`dir` itself, and a nested `CREATE
+/// DATABASE` one) holding a file ending in `suffix` whose bytes `needs` says
+/// need a flag: a file belongs to the nearest directory at or above it with
+/// a catalogue (`db_data_schema.db`), or to `dir` when none has.
+fn directories_where(dir: &Path, suffix: &str, needs: impl Fn(&[u8]) -> bool) -> io::Result<Vec<std::path::PathBuf>> {
     const CATALOGUE: &str = "db_data_schema.db";
     let mut needing: Vec<std::path::PathBuf> = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
@@ -204,16 +330,11 @@ pub fn directories_needing_numeric_own_scale(dir: &Path) -> io::Result<Vec<std::
                 continue;
             }
             let name = entry.file_name();
-            if !kind.is_file() || !name.to_string_lossy().ends_with("_schema_FIELDS.db") {
+            if !kind.is_file() || !name.to_string_lossy().ends_with(suffix) {
                 continue;
             }
             let bytes = std::fs::read(entry.path())?;
-            let found = bytes
-                .chunks_exact(SCHEMA_FIELD_SIZE as usize)
-                .filter(|record| !crate::core::torn_tail::is_unwritten(record))
-                .filter_map(|record| SchemaField::from_vec(record).ok())
-                .any(|field| crate::core::value_codec::keeps_own_scale(&field));
-            if !found {
+            if !needs(&bytes) {
                 continue;
             }
             let mut owner = at.clone();
@@ -244,6 +365,13 @@ pub fn fence_restored_directory(dir: &Path) -> io::Result<()> {
     }
     for database in directories_needing_composite_foreign_keys(dir)? {
         require(&database, COMPOSITE_FOREIGN_KEY_V1)?;
+    }
+    // A build without the feature cannot set this flag, nor open what needs
+    // it; it is set by one that can.
+    if known().contains(&COMPRESSED_VALUES_V1) {
+        for database in directories_needing_compressed_values(dir)? {
+            require(&database, COMPRESSED_VALUES_V1)?;
+        }
     }
     Ok(())
 }

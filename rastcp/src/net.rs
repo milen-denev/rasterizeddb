@@ -221,6 +221,15 @@ pub(crate) enum ServerStream {
 forward_io!(ServerStream { Tls, Unix #[cfg(unix)] });
 
 impl ServerStream {
+    /// The certificate the client presented in the handshake (DER), if any.
+    pub(crate) fn peer_certificate(&self) -> Option<Vec<u8>> {
+        match self {
+            ServerStream::Tls(stream) => stream.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| c.as_ref().to_vec()),
+            #[cfg(unix)]
+            ServerStream::Unix(_) => None,
+        }
+    }
+
     /// The value a credential exchange on this connection binds itself to.
     pub(crate) fn channel_binding(&self) -> Result<ChannelBinding, RastcpError> {
         match self {

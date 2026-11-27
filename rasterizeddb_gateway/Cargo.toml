@@ -1,0 +1,54 @@
+[package]
+name = "rasterizeddb_gateway"
+version = "1.0.0"
+edition = "2024"
+description = "RasterizedDB's sharding gateway: routes each statement to the shard that owns its key and relays the bytes"
+repository = "https://github.com/milen-denev/rasterizeddb"
+license = "GPL-3.0-only"
+authors = ["Milen Denev"]
+keywords = ["rasterizeddb", "sharding", "gateway", "postgresql", "proxy"]
+categories = ["database", "network-programming"]
+
+[[bin]]
+name = "rasterizeddb_gateway"
+path = "src/main.rs"
+
+# Every dependency is already in the tree (through rastcp): the gateway adds
+# no crate to the build. No rasterizeddb_core: no engine, parser or
+# catalogue (sharding-plan.md §4.9 G1).
+[dependencies]
+rastcp = { path = "../rastcp", version = "1.0.2" }
+rasterizeddb_router = { path = "../rasterizeddb_router", version = "1.0.0" }
+tokio = { version = "1.54", features = ["rt", "net", "io-util", "time", "sync", "macros", "signal"] }
+rustls = { version = "0.23" }
+tokio-rustls = { version = "0.26", optional = true }
+# SCRAM-SHA-256 (G9) and the TLS end-point hash: rastcp's own.
+sha2 = "0.11"
+# SO_REUSEPORT listeners, one per core (G2): rastcp's own.
+socket2 = { version = "0.6", features = ["all"] }
+log = "0.4"
+env_logger = "0.11"
+# The links to the shards, compressed when `shard_compression` says so.
+zstd = { version = "0.14", optional = true }
+# The configuration API's local store (an embedded RasterizedDB, low-memory)
+# and its JSON.
+rasterizeddb_embedded = { path = "../rasterizeddb_embedded", optional = true }
+rasterizeddb_client = { path = "../rasterizeddb_client", optional = true, default-features = false }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = ["tls", "native", "fanout", "shard_compression", "config_api"]
+# An HTTP API (bearer token) to read and change the gateway's configuration,
+# kept in a local embedded RasterizedDB in low-memory mode (`api_listen`,
+# `api_token_file`, `config_dir`).
+config_api = ["dep:rasterizeddb_embedded", "dep:rasterizeddb_client", "dep:serde_json"]
+# zstd on the links to the shards, turned on per gateway by the
+# `shard_compression` setting (off unless set).
+shard_compression = ["dep:zstd"]
+# TLS for clients (the gateway terminates it, so SCRAM channel binding works).
+tls = ["dep:tokio-rustls"]
+# The native (rastcp) front end, routed by the request's `route=` option.
+native = []
+# Tier-1 fan-out merges (B1b): concatenation, COUNT sums, top-N by the
+# shards' sort keys. Without it every statement without a key is refused.
+fanout = []

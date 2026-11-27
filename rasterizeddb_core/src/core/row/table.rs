@@ -31,6 +31,13 @@ use crate::core::mvcc::TransactionManager;
 use crate::core::mvcc::Visibility;
 use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX, TxId};
 use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+
+/// [`Table::resident_estimate`]'s fixed part: an open table's providers,
+/// caches and empty structures.
+const RESIDENT_BASE: u64 = 256 << 10;
+/// [`Table::resident_estimate`]'s per-byte part: one byte resident for every
+/// this many stored.
+const RESIDENT_SHARE: u64 = 8;
 use crate::core::row::schema::SchemaCalculator;
 use crate::core::vacuum::{
     CompactReport, FreeSpace, ReadTicket, ReaderRegistry, VacuumConfig, VacuumReport,
@@ -2603,6 +2610,7 @@ impl<S: StorageIO> Table<S> {
     /// with `deferred` set and nothing is published.
     pub async fn vacuum_now(&self) -> Result<VacuumReport> {
         let d = self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::Maintenance)?;
         // Joined by `retire`, like the service's own sweeps.
         let _tick = self.maintenance_tick.lock().await;
         let config = VacuumConfig::default();
@@ -2670,6 +2678,7 @@ impl<S: StorageIO> Table<S> {
     /// tail — the space is reusable either way, just not returned.
     pub async fn compact(&self) -> Result<CompactReport> {
         let d = self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::Maintenance)?;
         // Compaction is the one writer whose effects the log cannot describe:
         // it moves rows and then shortens the file, and a truncation has no
         // redo record. A backup's fuzzy copy is only made consistent by replay,
@@ -3148,6 +3157,19 @@ impl<S: StorageIO> Table<S> {
 
     /// Row versions the write path has stamped dead since the table opened.
     /// See the field for what counts.
+    /// What this table is estimated to hold in memory once open, for the
+    /// partition budget's resident-bytes term (sharding-plan.md B0.5): a
+    /// fixed cost per open table plus a share of its stored row bytes, which
+    /// is what its in-memory indexes and filters grow with. An estimate taken
+    /// at open, not a measurement; 0 for a table that cannot be read.
+    pub(crate) fn resident_estimate(&self) -> u64 {
+        let Ok(d) = self.data() else {
+            return 0;
+        };
+        let stored = d.len.load(AtomicOrdering::Relaxed);
+        RESIDENT_BASE + stored / RESIDENT_SHARE
+    }
+
     pub fn dead_stamps(&self) -> u64 {
         self.dead_stamps.load(AtomicOrdering::Relaxed)
     }
@@ -4999,6 +5021,7 @@ impl<S: StorageIO> Table<S> {
     /// Inserts outside any transaction, visible immediately.
     pub async fn insert_row(&self, row_write: RowWrite) -> Result<()> {
         self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::Insert)?;
         self.insert_row_in_txn(row_write, FROZEN_TX).await
     }
 
@@ -5011,6 +5034,7 @@ impl<S: StorageIO> Table<S> {
     /// key checked.
     pub(crate) async fn insert_conflict_in_txn(&self, mut row_write: RowWrite, written_by: TxId) -> Result<()> {
         self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::InsertOnConflict)?;
         if !self.has_unique {
             return Ok(());
         }
@@ -5026,6 +5050,12 @@ impl<S: StorageIO> Table<S> {
     /// commits.
     pub async fn insert_row_in_txn(&self, mut row_write: RowWrite, written_by: TxId) -> Result<()> {
         let d = self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::Insert)?;
+        let ledger_ts = if self.schema.special.is_special() {
+            Some(self.ledger_stamp(&mut row_write, written_by)?)
+        } else {
+            None
+        };
         // Before a key is taken from the row: every value of a declared text
         // length in its stored form, or the insert refused (22001). The
         // encoders do this already; this is the one place every insert
@@ -5047,6 +5077,10 @@ impl<S: StorageIO> Table<S> {
         if let Some(guard) = d.guard.as_ref() {
             guard.check_insert(&row_write)?;
         }
+        crate::core::shard_hooks::check_stamp(
+            d.guard.as_ref().map(|g| g.range()),
+            crate::core::shard_hooks::StampOp::Insert,
+        )?;
 
         self.note_write(written_by);
 
@@ -5081,7 +5115,7 @@ impl<S: StorageIO> Table<S> {
             row_write.columns_writing_data.len()
         );
 
-        let result = RowPointer::write_row_with_pointer_record_pos(
+        let result = RowPointer::write_row_with_pointer_record_pos_compressed(
             d.io_pointers.clone(),
             d.io_rows.clone(),
             &d.ids.last_row_id,
@@ -5090,6 +5124,8 @@ impl<S: StorageIO> Table<S> {
             #[cfg(feature = "enable_long_row")]
             0u32,
             &row_write,
+            // The columns that store their values compressed (`core::compression`).
+            &self.schema.compression,
             None,
             Some(&d.free_space),
             None,
@@ -5106,6 +5142,30 @@ impl<S: StorageIO> Table<S> {
             std::io::Error::from(e)
         })?;
         d.vacuum_stats.note_inserted(written_by, 1);
+        // A ledger table's row, for its transaction's chain entry
+        // (`ledger_hooks::on_insert`): its cells as written.
+        if let Some(ts) = ledger_ts {
+            let cells: Vec<(u32, &[u8])> = row_write
+                .columns_writing_data
+                .iter()
+                .map(|c| (c.write_order, c.data.into_slice()))
+                .collect();
+            crate::core::ledger_hooks::on_insert(&self.schema, written_by, ts, &cells);
+        }
+        // A shard's Raft group carries the new row (B3).
+        #[cfg(feature = "sharding_raft")]
+        if crate::core::shard::capture::active()
+            && let Some(db) = crate::core::shard::capture::database_of_scope(&self.cache_scope)
+        {
+            crate::core::shard::capture::record(
+                db,
+                written_by,
+                crate::core::shard::capture::Op::Insert {
+                    table: self.schema.name.clone(),
+                    row: crate::core::shard::capture::image_of_write(&row_write),
+                },
+            );
+        }
 
         // Index the new slot. The pointer record position IS the slot address
         // (dense fixed-stride file), so no mapping is needed.
@@ -5131,6 +5191,48 @@ impl<S: StorageIO> Table<S> {
         Ok(())
     }
 
+    /// Waits until this table's indexes are ready to answer exact lookups,
+    /// or `timeout` passes (sharding-plan.md B0.6).
+    ///
+    /// Covers both ways indexes become ready: a snapshot load (the gate's
+    /// load barrier) and a rebuild from the rows, which has no barrier and is
+    /// polled. A shard's apply loop and a move address rows by primary key,
+    /// so they call this first and fail on its `Err` rather than fall back to
+    /// a scan that would silently cost a full read per row. A table with no
+    /// indexes has nothing to wait for.
+    // Its callers (a shard's apply loop, a move) arrive with B1a and B2.
+    #[allow(dead_code)]
+    pub(crate) async fn wait_indexes_ready(&self, timeout: std::time::Duration) -> Result<()> {
+        let d = self.data()?;
+        let Some(indexes) = d.indexes.as_ref() else {
+            return Ok(());
+        };
+        let start = std::time::Instant::now();
+        let mut pause = std::time::Duration::from_millis(1);
+        loop {
+            if indexes.is_ready() {
+                return Ok(());
+            }
+            let left = timeout.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "the indexes of '{}' were not ready within {} ms",
+                        self.schema.name,
+                        timeout.as_millis()
+                    ),
+                ));
+            }
+            if self.gate.loads().loading() {
+                self.gate.loads().settled_within(left.min(pause.max(std::time::Duration::from_millis(50)))).await;
+            } else {
+                tokio::time::sleep(left.min(pause)).await;
+            }
+            pause = (pause * 2).min(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// Writes one row version as another instance of this table's file set
     /// held it: created by `xmin` and, unless `xmax` is `NO_TX`, retired by
     /// `xmax`. For an ALTER rewrite (docs/persistent-indexes.md §7, R5), which
@@ -5146,6 +5248,11 @@ impl<S: StorageIO> Table<S> {
     /// insert.
     pub(crate) async fn insert_version(&self, mut row_write: RowWrite, xmin: TxId, xmax: TxId) -> Result<()> {
         let d = self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::RawVersion)?;
+        crate::core::shard_hooks::check_stamp(
+            d.guard.as_ref().map(|g| g.range()),
+            crate::core::shard_hooks::StampOp::InsertVersion,
+        )?;
         // A rewrite's added column (its DEFAULT) is held to its declared
         // text length as any insert is; the copied columns already hold.
         self.hold_text_lengths(&mut row_write, |_| true, false)
@@ -5163,7 +5270,7 @@ impl<S: StorageIO> Table<S> {
             }
         }
         let _id = d.ids.reserve_insert_id().await;
-        let (record_pos, mut pointer) = RowPointer::write_row_with_pointer_record_pos(
+        let (record_pos, mut pointer) = RowPointer::write_row_with_pointer_record_pos_compressed(
             d.io_pointers.clone(),
             d.io_rows.clone(),
             &d.ids.last_row_id,
@@ -5171,6 +5278,8 @@ impl<S: StorageIO> Table<S> {
             #[cfg(feature = "enable_long_row")]
             0u32,
             &row_write,
+            // The columns that store their values compressed (`core::compression`).
+            &self.schema.compression,
             None,
             // Appended, in the order read: a fresh file set has no free space.
             None,
@@ -5746,6 +5855,163 @@ impl<S: StorageIO> Table<S> {
             .await
     }
 
+    /// The schema field of a ledger table's hidden insert time.
+    fn ledger_ts_field(&self) -> Result<&SchemaField> {
+        self.schema
+            .fields
+            .iter()
+            .find(|f| !f.is_deleted && f.name == crate::core::ledger_hooks::LEDGER_TS)
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "XX001: \"{}\" is a ledger table without its {} column",
+                    self.schema.name,
+                    crate::core::ledger_hooks::LEDGER_TS
+                ))
+            })
+    }
+
+    /// Stamps a new row of a ledger table with trusted time, over whatever
+    /// the statement gave for the hidden column: a client cannot backdate a
+    /// row to delete it early.
+    fn ledger_stamp(&self, row_write: &mut RowWrite, written_by: TxId) -> Result<i64> {
+        Self::ledger_needs_transaction(&self.schema, written_by)?;
+        let order = self.ledger_ts_field()?.write_order as u32;
+        let now = crate::core::ledger_hooks::trusted_now(&self.schema).map_err(std::io::Error::other)?;
+        let Some(cell) = row_write.columns_writing_data.iter_mut().find(|c| c.write_order == order) else {
+            return Err(std::io::Error::other(format!(
+                "XX000: an insert into ledger table \"{}\" carried no {} cell",
+                self.schema.name,
+                crate::core::ledger_hooks::LEDGER_TS
+            )));
+        };
+        let mut block = crate::memory_pool::MEMORY_POOL.acquire(8);
+        block.into_slice_mut().copy_from_slice(&now.to_le_bytes());
+        cell.data = block;
+        cell.size = 8;
+        Ok(now)
+    }
+
+    /// A ledger table is written only inside a transaction: its chain entry
+    /// is written when that commits (`ledger_hooks::prepare_commit`), and a
+    /// write outside one never commits through there.
+    fn ledger_needs_transaction(schema: &TableSchema, tx: TxId) -> Result<()> {
+        if tx == FROZEN_TX {
+            return Err(std::io::Error::other(format!(
+                "0A000: \"{}\" is a ledger table and takes writes only inside a transaction",
+                schema.name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuses deleting the row `pointer` addresses while the ledger policy
+    /// holds it.
+    async fn ledger_check_delete(&self, d: &TableData<S>, pointer: &RowPointer, deleted_by: TxId) -> Result<()> {
+        Self::ledger_needs_transaction(&self.schema, deleted_by)?;
+        let field = self.ledger_ts_field()?;
+        let fetch = Self::build_fetch_for(&self.schema.fields, &[field.write_order as u32]);
+        let mut row = Row::default();
+        pointer.fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row).await?;
+        let inserted_at = row
+            .columns
+            .first()
+            .and_then(|c| <[u8; 8]>::try_from(c.data.into_slice()).ok())
+            .map(i64::from_le_bytes)
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "XX001: a row of ledger table \"{}\" has no readable insert time",
+                    self.schema.name
+                ))
+            })?;
+        crate::core::ledger_hooks::admit_row_delete(&self.schema, inserted_at).map_err(std::io::Error::other)?;
+        crate::core::ledger_hooks::on_delete(&self.schema, deleted_by, inserted_at);
+        Ok(())
+    }
+
+    /// Admits one row's update of a versioned ledger table and notes its new
+    /// version for the chain.
+    fn ledger_note_update(&self, row_write: &RowWrite, updates: &[ColumnWritePayload], written_by: TxId) -> Result<()> {
+        Self::ledger_needs_transaction(&self.schema, written_by)?;
+        let order = self.ledger_ts_field()?.write_order as u32;
+        if updates.iter().any(|u| u.write_order == order) {
+            return Err(std::io::Error::other(format!(
+                "0A000: {} is a ledger row's identity and is never assigned",
+                crate::core::ledger_hooks::LEDGER_TS
+            )));
+        }
+        let ts = row_write
+            .columns_writing_data
+            .iter()
+            .find(|c| c.write_order == order)
+            .and_then(|c| <[u8; 8]>::try_from(c.data.into_slice()).ok())
+            .map(i64::from_le_bytes)
+            .ok_or_else(|| std::io::Error::other("XX001: a ledger row has no readable insert time"))?;
+        crate::core::ledger_hooks::admit_row_update(&self.schema, ts).map_err(std::io::Error::other)?;
+        let cells: Vec<(u32, &[u8])> =
+            row_write.columns_writing_data.iter().map(|c| (c.write_order, c.data.into_slice())).collect();
+        crate::core::ledger_hooks::on_update(&self.schema, written_by, ts, &cells);
+        Ok(())
+    }
+
+    /// Every version of the row stamped `ts` still on disk, oldest first:
+    /// `(xmin, xmax, stored cells by write order)`. For `SHOW LEDGER
+    /// HISTORY` on a versioned ledger table, whose retired versions are never
+    /// reclaimed.
+    pub async fn ledger_versions(&self, ts: i64) -> Result<Vec<(u64, u64, Vec<(u32, Vec<u8>)>)>> {
+        let d = self.data()?;
+        let ts_order = self.ledger_ts_field()?.write_order as u32;
+        let fetch = Self::build_full_row_fetch(&self.schema.fields);
+        let mut iterator = RowPointerIterator::new(d.io_pointers.clone()).await?;
+        let mut out = Vec::new();
+        let mut row = Row::default();
+        while let Some(pointer) = iterator.next_row_pointer().await? {
+            if pointer.deleted {
+                continue;
+            }
+            pointer.fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row).await?;
+            let cells: Vec<(u32, Vec<u8>)> =
+                row.columns.iter().map(|c| (c.schema_id, c.data.into_slice().to_vec())).collect();
+            let stamp = cells
+                .iter()
+                .find(|(o, _)| *o == ts_order)
+                .and_then(|(_, b)| <[u8; 8]>::try_from(b.as_slice()).ok())
+                .map(i64::from_le_bytes);
+            if stamp == Some(ts) {
+                out.push((pointer.xmin, pointer.xmax, cells));
+            }
+        }
+        out.sort_by_key(|(xmin, _, _)| *xmin);
+        Ok(out)
+    }
+
+    /// Every row of this ledger table visible now: its stamp and its stored
+    /// cells by write order, for `VERIFY LEDGER` (`ledger_hooks`).
+    pub async fn ledger_rows(&self) -> Result<Vec<(i64, Vec<(u32, Vec<u8>)>)>> {
+        let d = self.data()?;
+        let ts_order = self.ledger_ts_field()?.write_order as u32;
+        let visibility = self.visibility_now_for(FROZEN_TX);
+        let fetch = Self::build_full_row_fetch(&self.schema.fields);
+        let mut iterator = RowPointerIterator::new(d.io_pointers.clone()).await?;
+        let mut out = Vec::new();
+        let mut row = Row::default();
+        while let Some(pointer) = iterator.next_row_pointer().await? {
+            if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
+                continue;
+            }
+            pointer.fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row).await?;
+            let cells: Vec<(u32, Vec<u8>)> =
+                row.columns.iter().map(|c| (c.schema_id, c.data.into_slice().to_vec())).collect();
+            let ts = cells
+                .iter()
+                .find(|(o, _)| *o == ts_order)
+                .and_then(|(_, b)| <[u8; 8]>::try_from(b.as_slice()).ok())
+                .map(i64::from_le_bytes)
+                .unwrap_or(0);
+            out.push((ts, cells));
+        }
+        Ok(out)
+    }
+
     /// A fetch of just the columns named by write order, for the index build
     /// and for vacuum reading a reclaimed version's keys.
     pub(crate) fn build_fetch_for(schema_fields: &SmallVec<[SchemaField; 20]>, columns: &[u32]) -> RowFetch {
@@ -5802,6 +6068,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
     ) -> Result<u64> {
         self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::Delete)?;
         self.delete_rows_in_txn(where_clause, query_row_fetch, limit, FROZEN_TX)
             .await
     }
@@ -5815,6 +6082,7 @@ impl<S: StorageIO> Table<S> {
         deleted_by: TxId,
     ) -> Result<u64> {
         self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::Delete)?;
         self.delete_rows_as_of(where_clause, query_row_fetch, limit, deleted_by, None, None)
             .await
     }
@@ -5842,7 +6110,12 @@ impl<S: StorageIO> Table<S> {
         mut collect: Option<&mut Vec<Row>>,
     ) -> Result<u64> {
         let d = self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::Delete)?;
         info!("Deleting rows");
+        crate::core::shard_hooks::check_stamp(
+            d.guard.as_ref().map(|g| g.range()),
+            crate::core::shard_hooks::StampOp::Delete,
+        )?;
 
         self.note_write(deleted_by);
 
@@ -5950,6 +6223,16 @@ impl<S: StorageIO> Table<S> {
                 .into());
             }
 
+            // A ledger table's row goes only past its retention and with no
+            // hold standing (`ledger_hooks`); one locked row fails the whole
+            // statement, nothing stamped.
+            if self.schema.special.is_special() {
+                if let Err(e) = self.ledger_check_delete(d, &pointer, deleted_by).await {
+                    d.io_pointers.abort_txn(txn).await;
+                    return Err(e);
+                }
+            }
+
             if let (Some(marker), Some(fetch)) = (marker.as_ref().filter(|m| m.needed()), &marker_fetch) {
                 let marked = match pointer.fetch_row_reuse_async(&*d.io_rows, fetch, &mut key_row).await {
                     Ok(()) => marker.mark(&key_row, deleted_by),
@@ -5961,9 +6244,14 @@ impl<S: StorageIO> Table<S> {
                 }
             }
 
-            // The row as it was, for `RETURNING`, read before the tombstone.
+            // The row as it was, for `RETURNING` (and a shard's Raft group,
+            // which carries the old image), read before the tombstone.
+            #[cfg(feature = "sharding_raft")]
+            let capturing = crate::core::shard::capture::active();
+            #[cfg(not(feature = "sharding_raft"))]
+            let capturing = false;
             let before = match collect.as_ref() {
-                Some(_) => {
+                _ if collect.is_some() || capturing => {
                     let mut row = Row::default();
                     let full_fetch = Self::build_full_row_fetch(&self.schema.fields);
                     if let Err(e) = pointer.fetch_row_reuse_async(&*d.io_rows, &full_fetch, &mut row).await {
@@ -5977,7 +6265,7 @@ impl<S: StorageIO> Table<S> {
                     }
                     Some(row)
                 }
-                None => None,
+                _ => None,
             };
 
             if let Err(e) = pointer
@@ -5986,6 +6274,19 @@ impl<S: StorageIO> Table<S> {
             {
                 error!("Failed to delete row pointer {:?}: {}", pointer, e);
                 continue;
+            }
+            #[cfg(feature = "sharding_raft")]
+            if capturing
+                && let (Some(db), Some(row)) = (crate::core::shard::capture::database_of_scope(&self.cache_scope), before.as_ref())
+            {
+                crate::core::shard::capture::record(
+                    db,
+                    deleted_by,
+                    crate::core::shard::capture::Op::Delete {
+                        table: self.schema.name.clone(),
+                        old: crate::core::shard::capture::image_of_row(row),
+                    },
+                );
             }
             if let (Some(collect), Some(row)) = (collect.as_deref_mut(), before) {
                 collect.push(row);
@@ -6051,6 +6352,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
     ) -> Result<u64> {
         self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::Update)?;
         self.update_rows_in_txn(where_clause, query_row_fetch, updates, limit, FROZEN_TX)
             .await
     }
@@ -6065,6 +6367,7 @@ impl<S: StorageIO> Table<S> {
         written_by: TxId,
     ) -> Result<u64> {
         self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::Update)?;
         self.update_rows_with_expressions(
             where_clause,
             query_row_fetch,
@@ -6093,6 +6396,7 @@ impl<S: StorageIO> Table<S> {
         written_by: TxId,
     ) -> Result<u64> {
         self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::Update)?;
         self.update_rows_as_of(
             where_clause,
             query_row_fetch,
@@ -6124,6 +6428,7 @@ impl<S: StorageIO> Table<S> {
         collect: Option<&mut Vec<Row>>,
     ) -> Result<u64> {
         self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::Update)?;
         self.update_rows_body(where_clause, query_row_fetch, updates, expressions, limit, written_by, visibility, collect, None)
             .await
     }
@@ -6149,6 +6454,7 @@ impl<S: StorageIO> Table<S> {
         moves: &mut Vec<RowWrite>,
     ) -> Result<u64> {
         self.data()?;
+        crate::core::ledger_hooks::admit_io(&self.schema, crate::core::ledger_hooks::WriteKind::Update)?;
         self.update_rows_body(
             where_clause,
             query_row_fetch,
@@ -6217,6 +6523,10 @@ impl<S: StorageIO> Table<S> {
         mut moves: Option<&mut Vec<RowWrite>>,
     ) -> Result<u64> {
         info!("Updating rows");
+        crate::core::shard_hooks::check_stamp(
+            self.data()?.guard.as_ref().map(|g| g.range()),
+            crate::core::shard_hooks::StampOp::Update,
+        )?;
 
         // A statement naming its row by a unique key tries the point path
         // first, which lets updates of different keys run side by side. It
@@ -6735,6 +7045,16 @@ impl<S: StorageIO> Table<S> {
                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into());
                 }
             }
+            // A versioned ledger table's update (`ledger_hooks`): admitted row
+            // by row, never to its hidden insert time (the row's identity),
+            // and the new version's cells joined to the transaction's chain
+            // entry. Aborted with the statement, the pending item goes too.
+            if self.schema.special.is_special() {
+                if let Err(e) = self.ledger_note_update(&row_write, updates, written_by) {
+                    d.io_pointers.abort_txn(txn).await;
+                    return Err(e);
+                }
+            }
 
             // The range guard (§4.5), on the merged row and ahead of every
             // write branch below. Two of them never relocate (the fixed-width
@@ -6763,6 +7083,21 @@ impl<S: StorageIO> Table<S> {
                     updated_count = updated_count.saturating_add(1);
                     if let Some(collect) = collect.as_deref_mut() {
                         collect.push(returned_image.clone().unwrap_or_else(|| row.clone()));
+                    }
+                    // The old version leaves this partition; the caller's
+                    // insert of the merged row is captured where it lands.
+                    #[cfg(feature = "sharding_raft")]
+                    if crate::core::shard::capture::active()
+                        && let Some(db) = crate::core::shard::capture::database_of_scope(&self.cache_scope)
+                    {
+                        crate::core::shard::capture::record(
+                            db,
+                            written_by,
+                            crate::core::shard::capture::Op::Delete {
+                                table: self.schema.name.clone(),
+                                old: crate::core::shard::capture::image_of_row(&row),
+                            },
+                        );
                     }
                     moves.push(row_write);
                     continue;
@@ -6859,6 +7194,23 @@ impl<S: StorageIO> Table<S> {
                 });
             }
 
+            // A shard's Raft group carries the update, the old image and the
+            // merged new one, whichever branch below writes it (B3).
+            #[cfg(feature = "sharding_raft")]
+            if crate::core::shard::capture::active()
+                && let Some(db) = crate::core::shard::capture::database_of_scope(&self.cache_scope)
+            {
+                crate::core::shard::capture::record(
+                    db,
+                    written_by,
+                    crate::core::shard::capture::Op::Update {
+                        table: self.schema.name.clone(),
+                        old: crate::core::shard::capture::image_of_row(&row),
+                        new: crate::core::shard::capture::image_of_write(&row_write),
+                    },
+                );
+            }
+
             // Fast path: when every assigned column is fixed-width, the row's
             // layout and length are unchanged, so only those columns' bytes
             // differ. The general path re-encodes and rewrites the whole row —
@@ -6867,9 +7219,12 @@ impl<S: StorageIO> Table<S> {
             //
             // The filter is fed the same full `row_write` either way, so this
             // needs nothing from it that the general path does not.
+            // Never on a ledger table: an overwrite keeps no prior version,
+            // which a versioned ledger's history is made of.
             if !updates.is_empty()
                 && !may_fail_after_write
                 && !assigns_key
+                && !self.schema.special.is_special()
                 && updates.iter().all(|u| u.column_type != DbType::STRING)
                 && self
                     .write_columns_in_place(d, &pointer, updates, txn, written_by)
@@ -6894,7 +7249,7 @@ impl<S: StorageIO> Table<S> {
             }
 
             let update_result = pointer
-                .update_with_pointer_record_pos(
+                .update_with_pointer_record_pos_compressed(
                     d.io_pointers.clone(),
                     d.io_rows.clone(),
                     record_pos,
@@ -6904,6 +7259,8 @@ impl<S: StorageIO> Table<S> {
                     #[cfg(feature = "enable_long_row")]
                     0u32,
                     &row_write,
+                    // The columns that store their values compressed (`core::compression`).
+                    &self.schema.compression,
                     Some(txn),
                     Some(&d.free_space),
                     written_by,
