@@ -5292,6 +5292,7 @@ dependencies = [
  "base64 0.23.1",
  "cryptoki",
  "fastrand",
+ "getrandom 0.3.4",
  "libc",
  "log",
  "ml-dsa",
@@ -5303,6 +5304,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tss-esapi",
+ "windows-sys 0.61.2",
  "x25519-dalek",
  "zeroize",
 ]

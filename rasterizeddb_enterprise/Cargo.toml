@@ -22,6 +22,8 @@ fastrand = { version = "2.5", optional = true }
 aes-gcm = { version = "0.10", optional = true }
 zeroize = { version = "1", optional = true }
 libc = { version = "0.2", optional = true }
+# Random bytes off Linux (Linux reads getrandom(2) through libc).
+getrandom = { version = "0.3", optional = true }
 base64 = { version = "0.23", optional = true }
 # Hardware key providers through PKCS#11 (HSMs, cloud HSMs, TPM 2.0 via
 # tpm2-pkcs11). The module is loaded at run time: no C library at link time.
@@ -40,6 +42,10 @@ tss-esapi = { version = "7", optional = true }
 # S3 anchors run the core's S3 client on a small runtime of their own.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"], optional = true }
 
+# Locked, unswappable pages for keys on Windows (crypto/secure.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = ["Win32_System_Memory", "Win32_System_SystemInformation"] }
+
 [features]
 default = ["tenant_isolation", "segregation_policies", "ledger", "ledger_s3", "encryption", "pkcs11", "vault", "pqc"]
 # Strict tenant mode, T1-T10 (docs/sharding-plan.md §4.10).
@@ -55,7 +61,7 @@ ledger = ["dep:sha2", "dep:fastrand"]
 ledger_s3 = ["ledger", "rasterizeddb_core/s3_backup", "dep:tokio"]
 # Envelope encryption: AES-256-GCM data keys wrapped by a key-encryption
 # key from a provider (plan §4.4); secure memory for keys and secrets.
-encryption = ["dep:aes-gcm", "dep:zeroize", "dep:libc", "dep:base64"]
+encryption = ["dep:aes-gcm", "dep:zeroize", "dep:libc", "dep:base64", "dep:getrandom", "dep:windows-sys"]
 # The PKCS#11 key provider: HSMs, cloud HSMs, TPM 2.0 (tpm2-pkcs11).
 pkcs11 = ["encryption", "dep:cryptoki"]
 # FIPS 140-3 mode: the ledger's hashes and the vault's AES-256-GCM and

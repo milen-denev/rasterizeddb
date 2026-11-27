@@ -74,13 +74,17 @@ pub fn new_dek() -> Result<Dek, String> {
 }
 
 /// Fills `buf` from the operating system's random source.
+#[allow(unreachable_code)]
 pub fn fill_random(buf: &mut [u8]) -> Result<(), String> {
     // FIPS: the module's DRBG.
     #[cfg(feature = "fips")]
     return aws_lc_rs::rand::fill(buf).map_err(|_| "no random bytes from the FIPS module".to_string());
-    #[cfg(not(feature = "fips"))]
+    // Off Linux: the platform's source (BCryptGenRandom on Windows).
+    #[cfg(all(not(feature = "fips"), not(target_os = "linux")))]
+    return getrandom::fill(buf).map_err(|e| format!("no random bytes: {e}"));
+    #[cfg(all(not(feature = "fips"), target_os = "linux"))]
     let mut done = 0;
-    #[cfg(not(feature = "fips"))]
+    #[cfg(all(not(feature = "fips"), target_os = "linux"))]
     while done < buf.len() {
         // getrandom(2): blocks only before the pool is first seeded.
         let n = unsafe { libc::getrandom(buf[done..].as_mut_ptr().cast(), buf.len() - done, 0) };

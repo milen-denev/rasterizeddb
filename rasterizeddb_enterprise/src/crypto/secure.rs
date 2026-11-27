@@ -30,9 +30,17 @@ pub struct SecretBuf {
 unsafe impl Send for SecretBuf {}
 unsafe impl Sync for SecretBuf {}
 
+#[cfg(unix)]
 fn page() -> usize {
     let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if p > 0 { p as usize } else { 4096 }
+}
+
+#[cfg(windows)]
+fn page() -> usize {
+    let mut info: windows_sys::Win32::System::SystemInformation::SYSTEM_INFO = unsafe { std::mem::zeroed() };
+    unsafe { windows_sys::Win32::System::SystemInformation::GetSystemInfo(&mut info) };
+    if info.dwPageSize > 0 { info.dwPageSize as usize } else { 4096 }
 }
 
 impl SecretBuf {
@@ -107,6 +115,23 @@ fn anonymous(cap: usize) -> Result<(*mut u8, bool), String> {
     }
 }
 
+/// Windows: committed pages locked into the working set (`VirtualLock`),
+/// so not written to the page file. Best effort, as `mlock` is: a refused
+/// lock still leaves the zeroing on drop. Core dumps there are the user's
+/// own setting (Windows Error Reporting), not the process's.
+#[cfg(windows)]
+fn anonymous(cap: usize) -> Result<(*mut u8, bool), String> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualLock};
+    unsafe {
+        let p = VirtualAlloc(std::ptr::null(), cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if p.is_null() {
+            return Err(format!("no memory for a secret: {}", std::io::Error::last_os_error()));
+        }
+        VirtualLock(p, cap);
+        Ok((p.cast(), false))
+    }
+}
+
 impl Drop for SecretBuf {
     fn drop(&mut self) {
         unsafe {
@@ -120,6 +145,12 @@ impl Drop for SecretBuf {
                     libc::munlock(self.ptr.cast(), self.cap);
                 }
                 libc::munmap(self.ptr.cast(), self.cap);
+            }
+            #[cfg(windows)]
+            {
+                use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree, VirtualUnlock};
+                VirtualUnlock(self.ptr.cast(), self.cap);
+                VirtualFree(self.ptr.cast(), 0, MEM_RELEASE);
             }
         }
     }
