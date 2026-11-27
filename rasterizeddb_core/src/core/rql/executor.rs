@@ -10676,6 +10676,7 @@ async fn execute_ledger_statement(sql: &str, database: &Arc<Database>, depth: us
         versions,
         role: &role,
         superuser,
+        tx,
     };
     let reply = crate::core::ledger_hooks::statement(&database.ledger_store(), request)?;
     for insert in &reply.inserts {
@@ -10716,6 +10717,7 @@ async fn execute_ledger_statement(sql: &str, database: &Arc<Database>, depth: us
 /// DELETE and kept them after a failover made it the primary.
 fn special_create(
     query: QueryPurpose,
+    database: &Database,
 ) -> Result<(QueryPurpose, Option<(crate::core::row::schema::SpecialTable, Vec<u8>, String)>), String> {
     let QueryPurpose::CreateTable(sql) = &query else {
         return Ok((query, None));
@@ -10724,6 +10726,14 @@ fn special_create(
         return Ok((query, None));
     };
     let split = split?;
+    // `IF NOT EXISTS` over a table that is there changes nothing, so asks
+    // the hooks for nothing: the policy would open a vault's key provider,
+    // and `mlkem:…;create` made a key file no vault would ever use.
+    if split.create_sql.starts_with("CREATE TABLE IF NOT EXISTS ")
+        && database.relation(&crate::core::sql_scan::bare_name(&split.name)).is_some()
+    {
+        return Ok((QueryPurpose::CreateTable(split.create_sql), None));
+    }
     let policy = crate::core::ledger_hooks::create_policy(split.kind, &split.name, &split.clauses)?;
     let written = sql.clone();
     Ok((QueryPurpose::CreateTable(split.create_sql), Some((split.kind, policy, written))))
@@ -24091,7 +24101,7 @@ async fn execute_with_need_inner(
             }
             // `CREATE LEDGER TABLE` / `CREATE VAULT`: the plain create they
             // stand for, and the kind and policy its header and sidecar get.
-            let (query, special) = match special_create(query) {
+            let (query, special) = match special_create(query, &database) {
                 Ok(split) => split,
                 Err(e) => return ddl_error(&e),
             };

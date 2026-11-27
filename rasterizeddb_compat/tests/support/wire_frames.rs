@@ -180,6 +180,7 @@ pub enum Reply {
     DataRow(Vec<Option<Vec<u8>>>),
     Complete(String),
     Error { code: String, message: String, routine: Option<String> },
+    /// `code: message`.
     Notice(String),
     Ready(u8),
     /// ParameterStatus, BackendKeyData and anything else: kept for a test
@@ -303,7 +304,7 @@ fn decode(tag: u8, body: &[u8]) -> Reply {
             if tag == b'E' {
                 Reply::Error { code, message, routine }
             } else {
-                Reply::Notice(code)
+                Reply::Notice(format!("{code}: {message}"))
             }
         }
         b'Z' => Reply::Ready(body[0]),

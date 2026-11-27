@@ -391,7 +391,25 @@ fn audit_path(store_key: &str) -> Option<std::path::PathBuf> {
 
 /// Writes one audit line and chains it. An error means it was not recorded,
 /// and the caller returns nothing.
+/// Audits `line` now: written and chained at once. For what is done the
+/// moment it runs (a read, a key used, a purge), whatever the transaction's
+/// outcome; a change to the vault is audited at its commit instead
+/// (`LedgerGuard::audit_at_commit`).
+pub(crate) fn audit_now(store_key: &str, vault: u128, line: &str) -> Result<(), String> {
+    let item = audit_line(store_key, vault, line)?;
+    let chain = store::chain(store_key)?;
+    let hash = chain.lock().append(0, &[item]).map_err(|e| format!("55000: the vault audit could not be chained ({e})"))?;
+    crate::ledger::anchor::note_append(store_key, &chain, hash);
+    Ok(())
+}
+
 fn audit(store_key: &str, vault: u128, line: &str) -> Result<(), String> {
+    audit_now(store_key, vault, line)
+}
+
+/// Writes `line`, stamped, to the audit and returns the chain item that
+/// covers it, for the caller to chain.
+pub(crate) fn audit_line(store_key: &str, vault: u128, line: &str) -> Result<Item, String> {
     let stamped = format!("{} {line}", clock::now_micros());
     match audit_path(store_key) {
         Some(p) => {
@@ -411,11 +429,7 @@ fn audit(store_key: &str, vault: u128, line: &str) -> Result<(), String> {
         }
         None => AUDIT_MEMORY.get_or_init(Default::default).lock().entry(store_key.to_string()).or_default().push(stamped.clone()),
     }
-    let item = Item { op: OP_EVENT, ledger: vault, row_ts: clock::now_micros(), width: 0, leaf: store::event_leaf(&stamped) };
-    let chain = store::chain(store_key)?;
-    let hash = chain.lock().append(0, &[item]).map_err(|e| format!("55000: the vault audit could not be chained ({e})"))?;
-    crate::ledger::anchor::note_append(store_key, &chain, hash);
-    Ok(())
+    Ok(Item { op: OP_EVENT, ledger: vault, row_ts: clock::now_micros(), width: 0, leaf: store::event_leaf(&stamped) })
 }
 
 fn audit_lines(store_key: &str) -> Result<Vec<String>, String> {
@@ -442,6 +456,21 @@ fn current(rows: &[VRow]) -> BTreeMap<String, (Option<VRow>, String)> {
         e.1 = r.state.clone();
     }
     out
+}
+
+/// PURGE destroys keys and ROTATE KEY rewraps them, at once: a ROLLBACK
+/// could not bring either back, so neither runs inside a transaction block
+/// (25001, as PostgreSQL refuses VACUUM there). A batch holding one runs
+/// statement by statement (`pgwire::opens_an_implicit_block`).
+fn refuse_in_block(what: &str) -> Result<(), String> {
+    use rasterizeddb_core::core::mvcc::owner::{OwnerKind, current};
+    if current().is_some_and(|o| o.kind == OwnerKind::Block) {
+        return Err(format!(
+            "25001: VAULT … {what} cannot run inside a transaction block: it changes the vault's keys at once, \
+             which a ROLLBACK could not undo; run it on its own"
+        ));
+    }
+    Ok(())
 }
 
 pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<LedgerReply, String> {
@@ -517,7 +546,7 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
             let sealed = crypto::seal(&dek, value.as_slice(), &aad(vault, &name, version))?;
             drop(dek);
             keyring(store_key, vault)?.lock().add(&name, version, wrapped)?;
-            audit(store_key, vault, &format!("SET {} '{name}' v{version} by {role}", table.name))?;
+            g.audit_at_commit(store_key, vault, req.tx, format!("SET {} '{name}' v{version} by {role}", table.name))?;
             let b64 = base64::engine::general_purpose::STANDARD.encode(sealed);
             Ok(reply(vec![format!("{name} version {version}")], vec![insert(&name, version, &b64, "active", &ct, nb, exp, &tags)]))
         }
@@ -654,10 +683,11 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
             if !from_ok {
                 return Err(format!("55000: secret '{name}' is {state}; {verb} does not apply"));
             }
-            audit(store_key, vault, &format!("{verb} {} '{name}' by {role}", table.name))?;
+            g.audit_at_commit(store_key, vault, req.tx, format!("{verb} {} '{name}' by {role}", table.name))?;
             Ok(reply(vec![format!("{name} {to}")], vec![insert(&name, 0, "", to, "", 0, 0, "")]))
         }
         "PURGE" => {
+            refuse_in_block("PURGE")?;
             let name = quoted(w.get(4), "the secret's name")?;
             let Some((_, state)) = secrets.get(&name) else {
                 return Err(format!("42704: no secret '{name}'"));
@@ -685,6 +715,7 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
             if at(3) != "KEY" {
                 return Err("42601: VAULT v ROTATE KEY [TO '<provider>']".to_string());
             }
+            refuse_in_block("ROTATE KEY")?;
             let old_uri = policy.key_provider.clone().ok_or("XX001: the vault has no key provider")?;
             let new_uri = match at(4) {
                 "TO" => quoted(w.get(5), "a key provider")?,
@@ -787,7 +818,7 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
                         if in_hsm { "hsm-…" } else { "aes256-gcm or mldsa65" }
                     ));
                 }
-                audit(store_key, vault, &format!("CREATE KEY {} '{name}' {kind} (kept) by {role}", table.name))?;
+                g.audit_at_commit(store_key, vault, req.tx, format!("CREATE KEY {} '{name}' {kind} (kept) by {role}", table.name))?;
                 return Ok(reply(
                     vec![format!("key {name} ({kind}, kept: the keyring held it from a statement that rolled back)")],
                     vec![insert(&full, 1, "", "active", &kind, 0, 0, "")],
@@ -801,12 +832,12 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
                 let label = hsm_label(vault, &name);
                 if kind == "hsm-aes256-gcm" { hsm.generate_aes(&label)? } else { hsm.generate_ec(&label)? }
                 keyring(store_key, vault)?.lock().add(&full, 1, HSM_MARKER.to_vec())?;
-                audit(store_key, vault, &format!("CREATE KEY {} '{name}' {kind} by {role}", table.name))?;
+                g.audit_at_commit(store_key, vault, req.tx, format!("CREATE KEY {} '{name}' {kind} by {role}", table.name))?;
                 return Ok(reply(vec![format!("key {name} ({kind}, inside the HSM)")], vec![insert(&full, 1, "", "active", &kind, 0, 0, "")]));
             }
             let material = crypto::new_dek()?;
             keyring(store_key, vault)?.lock().add(&full, 1, provider.wrap(&material)?)?;
-            audit(store_key, vault, &format!("CREATE KEY {} '{name}' {kind} by {role}", table.name))?;
+            g.audit_at_commit(store_key, vault, req.tx, format!("CREATE KEY {} '{name}' {kind} by {role}", table.name))?;
             Ok(reply(vec![format!("key {name} ({kind})")], vec![insert(&full, 1, "", "active", &kind, 0, 0, "")]))
         }
         op @ ("ENCRYPT" | "DECRYPT" | "SIGN" | "VERIFY" | "PUBLIC") if at(3) == "KEY" => {

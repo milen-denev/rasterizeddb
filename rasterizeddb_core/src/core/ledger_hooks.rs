@@ -218,6 +218,10 @@ pub struct LedgerRequest<'a> {
     /// The role running it, and whether it is a superuser.
     pub role: &'a str,
     pub superuser: bool,
+    /// The transaction it runs in (0 outside one, e.g. the offline
+    /// verifier): what a vault's change is audited at the commit of, and
+    /// forgotten at the abort of (`LedgerHooks::prepare_commit`, `discard`).
+    pub tx: TxId,
 }
 
 /// What a ledger statement returns.

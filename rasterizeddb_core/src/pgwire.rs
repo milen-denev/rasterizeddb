@@ -3019,6 +3019,7 @@ where
                     open_implicit_block(database, state);
                 }
                 handle_execute(database, state, stream, &payload).await?;
+                note_ran_in_implicit_block(state);
                 if std::mem::take(&mut state.copy_in_ran)
                     && let Some(at) = pending.iter().position(|(tag, _)| *tag == b'S')
                 {
@@ -3617,6 +3618,10 @@ struct SessionTransaction {
     /// first two, where PostgreSQL keeps neither. A `BEGIN` inside one makes
     /// it explicit (`implicit` false), as PostgreSQL does.
     implicit: bool,
+    /// Statements of an implicit block that completed: rolled back with the
+    /// one that failed, which the client is told (a NOTICE at the block's
+    /// end, `close_implicit_block`), since each was answered as a success.
+    ran: usize,
     /// When the block began, microseconds since the Unix epoch: what `now()`
     /// reads in every statement of it (`statement_clock`).
     started_us: i64,
@@ -11445,7 +11450,7 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // existing one 42710, a bad argument 22023, …), which matched no phrase.
     for code in [
         "RDB02", "RDB03", "57P03", "0A000", "22003", "42501", "XX000", "55000", "XX001", "42601", "42704", "42P01",
-        "42710", "22023", "22021", "42809", "42602", "58030", "22007", "22001",
+        "42710", "22023", "22021", "42809", "42602", "58030", "22007", "22001", "25001",
     ] {
         if message.get(..code.len()).is_some_and(|head| head.eq_ignore_ascii_case(code))
             && message[code.len()..].starts_with(':')
@@ -12146,16 +12151,12 @@ where
     // statement failed kept its first two. A string holding transaction
     // control, or a statement that refuses a block, runs statement by
     // statement as before (`opens_an_implicit_block`).
-    let implicit = statements.len() > 1
+    if statements.len() > 1
         && state.transaction.is_none()
-        && statements.iter().all(|stmt| opens_an_implicit_block(stmt));
-    if implicit {
+        && statements.iter().all(|stmt| opens_an_implicit_block(stmt))
+    {
         open_implicit_block(database, state);
     }
-    // How many ran before one failed: rolled back with it, which a client
-    // shown only the failure's error took to have stayed (a role a script
-    // created, then found missing).
-    let mut completed = 0usize;
 
     // Where each statement starts in the client's text, for an error's
     // position: only where the text was not rewritten before the split.
@@ -12185,23 +12186,9 @@ where
         if state.statement_failed {
             break;
         }
-        completed += 1;
+        note_ran_in_implicit_block(state);
     }
-    let rolled_back = implicit && state.statement_failed && completed > 0;
     close_implicit_block(database, state, stream).await?;
-    if rolled_back {
-        send_notice(
-            stream,
-            "00000",
-            &format!(
-                "{} before the one that failed {} rolled back with it: several statements sent as one \
-                 request run as one transaction",
-                if completed == 1 { "the statement".to_string() } else { format!("the {completed} statements") },
-                if completed == 1 { "was" } else { "were" }
-            ),
-        )
-        .await?;
-    }
 
     let status = state.ready_status();
     send_ready_for_query(stream, status).await?;
@@ -12345,6 +12332,7 @@ fn open_block(
         ddl_mark: None,
         failed: false,
         implicit: false,
+        ran: 0,
         // The message that opened the block, as PostgreSQL stamps it.
         started_us: state.message_us,
         aborted: false,
@@ -12384,6 +12372,9 @@ fn opens_an_implicit_block(sql: &str) -> bool {
         &["BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE", "PREPARE"],
     );
     let outside = is(first, &["IMPORT", "VACUUM", "CHECKPOINT", "COPY"])
+        // A vault's PURGE or ROTATE KEY, which a block refuses (25001): they
+        // change keys at once, past any rollback.
+        || (is(first, &["VAULT"]) && words.clone().any(|w| is(w, &["PURGE", "ROTATE"])))
         || (is(first, &["CREATE", "DROP", "ALTER"]) && words.next().is_some_and(|w| w.eq_ignore_ascii_case("DATABASE")))
         // A partition restructure, which a block refuses (25001): only
         // parsed when a word could make it one.
@@ -12676,6 +12667,41 @@ fn created_over_pending_drop(database: &Database, root: crate::core::mvcc::TxId,
     pending.into_iter().find(|p| p.eq_ignore_ascii_case(&created))
 }
 
+/// A statement of the open implicit block completed (see
+/// `SessionTransaction::ran`); nothing outside one or after its failure.
+fn note_ran_in_implicit_block(state: &mut SessionState) {
+    if let Some(t) = state.transaction.as_mut().filter(|t| t.implicit && !t.failed) {
+        if !state.statement_failed {
+            t.ran += 1;
+        }
+    }
+}
+
+/// Tells the client that the `ran` statements an implicit block completed
+/// were rolled back with the one that failed: each was answered as a
+/// success, and a script's earlier statements looked to have stayed (a
+/// role it created, then found missing). Not PostgreSQL's: it says
+/// nothing, and a client reading only the error cannot tell.
+async fn send_rolled_back_notice<S>(stream: &mut S, ran: usize) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    if ran == 0 {
+        return Ok(());
+    }
+    send_notice(
+        stream,
+        "00000",
+        &format!(
+            "{} before the one that failed {} rolled back with it: several statements sent as one \
+             request (or one batch) run as one transaction",
+            if ran == 1 { "the statement".to_string() } else { format!("the {ran} statements") },
+            if ran == 1 { "was" } else { "were" }
+        ),
+    )
+    .await
+}
+
 /// Ends the implicit block open at a batch's end, if one is: committed, or,
 /// when a statement in it failed, rolled back (its error has already
 /// aborted it, R3). A failed commit is reported here, before the batch's
@@ -12695,7 +12721,7 @@ where
         database.block_ddl_abort(t.id).await;
         t.abort_unless_aborted(database);
         t.owner.release();
-        return Ok(());
+        return send_rolled_back_notice(stream, t.ran).await;
     }
     if let Err((code, message)) = commit_block(database, state, t).await {
         state.statement_failed = false;

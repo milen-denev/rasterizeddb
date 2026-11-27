@@ -40,6 +40,10 @@ pub struct LedgerGuard {
     /// The anchors each ledger id's policy names, learned as its rows are
     /// written: a commit adds them to its store's sinks.
     anchors_of: RwLock<HashMap<u128, Vec<String>>>,
+    /// A vault's changes by running transactions, to be audited at their
+    /// commit (`(store, vault id, line)`): audited as they ran, a SET or
+    /// DELETE a ROLLBACK undid stayed in the audit as done.
+    audits: Mutex<HashMap<TxId, Vec<(String, u128, String)>>>,
 }
 
 fn what(table: &TableSchema) -> &'static str {
@@ -56,7 +60,19 @@ impl LedgerGuard {
             policies: RwLock::new(HashMap::new()),
             overlay: RwLock::new(HashMap::new()),
             anchors_of: RwLock::new(HashMap::new()),
+            audits: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Audits `line` (a change to vault `vault`) when `tx` commits, and
+    /// never if it aborts. Outside a transaction (`tx` 0) at once.
+    #[cfg(feature = "vault")]
+    pub(crate) fn audit_at_commit(&self, store_key: &str, vault: u128, tx: TxId, line: String) -> Result<(), String> {
+        if tx == 0 {
+            return crate::vault::audit_now(store_key, vault, &line);
+        }
+        self.audits.lock().entry(tx).or_default().push((store_key.to_string(), vault, line));
+        Ok(())
     }
 
     /// The policy in force for `table`: its sidecar's records, then any this
@@ -239,11 +255,13 @@ impl LedgerHooks for LedgerGuard {
 
     fn has_pending(&self, ids: &[TxId]) -> bool {
         let pending = self.pending.lock();
-        ids.iter().any(|id| pending.contains_key(id))
+        let audits = self.audits.lock();
+        ids.iter().any(|id| pending.contains_key(id) || audits.contains_key(id))
     }
 
     fn discard(&self, tx: TxId) {
         self.pending.lock().remove(&tx);
+        self.audits.lock().remove(&tx);
     }
 
     fn prepare_commit(&self, store_key: &str, members: &[(TxId, bool)]) -> Result<(), String> {
@@ -258,7 +276,21 @@ impl LedgerHooks for LedgerGuard {
                 }
             }
         }
-        if items.is_empty() {
+        // The vault changes of the members that survive: audited now, in
+        // the same chain entry as their rows. A rolled-back savepoint's are
+        // dropped with it.
+        let mut audits = Vec::new();
+        {
+            let mut staged = self.audits.lock();
+            for (id, survives) in members {
+                if let Some(mine) = staged.remove(id) {
+                    if *survives {
+                        audits.extend(mine.into_iter().filter(|(s, _, _)| s == store_key));
+                    }
+                }
+            }
+        }
+        if items.is_empty() && audits.is_empty() {
             return Ok(());
         }
         // Refused before anything is appended when the unanchored window is
@@ -275,6 +307,12 @@ impl LedgerHooks for LedgerGuard {
             }
         }
         anchor::admit_writes(store_key)?;
+        // Written before the chain entry that covers them, as `audit` does:
+        // a line that cannot be written fails the commit.
+        #[cfg(feature = "vault")]
+        for (_, vault, line) in &audits {
+            items.push(crate::vault::audit_line(store_key, *vault, line)?);
+        }
         let top = members.iter().map(|(id, _)| *id).min().unwrap_or(0);
         let chain = store::chain(store_key)?;
         let hash = chain.lock().append(top, &items)?;

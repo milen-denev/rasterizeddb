@@ -108,6 +108,46 @@ async fn a_failed_batch_takes_its_vault_and_ledger_ddl_with_it() {
     let e = refused(&admin, "VAULT bv CREATE KEY 'k2'").await;
     assert!(e.contains("exists"), "{e}");
 
+    // --- a vault's changes are audited at their commit -------------------------
+    // A SET a ROLLBACK undid is not in the audit; a committed one is, chained.
+    session.query("BEGIN; VAULT bv SET SECRET 'undone' = 'x'; ROLLBACK").await.unwrap();
+    session.query("BEGIN; VAULT bv SET SECRET 'kept' = 'y'; COMMIT").await.unwrap();
+    let audit = col(&admin, "VAULT bv AUDIT").await;
+    let audit: Vec<String> = audit.into_iter().flatten().collect();
+    assert!(!audit.iter().any(|l| l.contains("'undone'")), "a rolled-back SET was audited: {audit:?}");
+    assert!(audit.iter().any(|l| l.starts_with("chained") && l.contains("SET bv 'kept' v1")), "{audit:?}");
+    // A read is audited whatever becomes of its transaction: it disclosed.
+    session.query("BEGIN; VAULT bv GET SECRET 'kept'; ROLLBACK").await.unwrap();
+    let audit: Vec<String> = col(&admin, "VAULT bv AUDIT").await.into_iter().flatten().collect();
+    assert!(audit.iter().any(|l| l.starts_with("chained") && l.contains("GET bv 'kept' v1")), "{audit:?}");
+    // Nothing is left unchained.
+    assert!(!audit.iter().any(|l| l.starts_with("UNCHAINED")), "{audit:?}");
+
+    // PURGE and ROTATE KEY change keys at once, past any ROLLBACK: refused in
+    // a block, and a batch holding one runs statement by statement.
+    run(&admin, "VAULT bv DELETE SECRET 'kept'").await;
+    for sql in ["VAULT bv PURGE SECRET 'kept'", "VAULT bv ROTATE KEY"] {
+        let e = session.query(&format!("BEGIN; {sql}")).await.expect_err(sql).to_string();
+        assert!(e.ends_with("(SQLSTATE 25001)"), "{sql}: {e}");
+        session.query("ROLLBACK").await.unwrap();
+    }
+    // Statement by statement: the RECOVER commits on its own, and the PURGE
+    // then finds the secret active (55000), not a block (25001).
+    let e = session.query("VAULT bv RECOVER SECRET 'kept'; VAULT bv PURGE SECRET 'kept'").await.expect_err("not deleted");
+    assert!(e.to_string().ends_with("(SQLSTATE 55000)"), "{e}");
+    assert_eq!(col(&admin, "VAULT bv GET SECRET 'kept'").await, vec![Some("y".into())], "the RECOVER did not stay");
+
+    // --- CREATE VAULT IF NOT EXISTS over one that is there ------------------
+    // Changes nothing and opens no provider: no key file is made.
+    let unused = root.path().join("unused.key");
+    run(&admin, &format!("CREATE VAULT IF NOT EXISTS bv KEY PROVIDER 'mlkem:{};create'", unused.display())).await;
+    assert!(!unused.exists(), "IF NOT EXISTS over an existing vault made a key file");
+
+    // --- a vault with no NO DROP clause drops ---------------------------------
+    run(&admin, &format!("CREATE VAULT dv KEY PROVIDER 'file:{}'", key.display())).await;
+    run(&admin, "DROP TABLE dv").await;
+    assert!(!table_exists(&admin, "dv").await);
+
     // --- a table dropped and made again in a block that rolls back ------------
     // The dropped one is set aside under a hidden name and comes back with
     // its rows; its encrypted columns' keys must come back with it, whether

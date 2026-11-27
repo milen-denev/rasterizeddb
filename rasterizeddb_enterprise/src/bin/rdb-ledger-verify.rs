@@ -156,6 +156,7 @@ fn rows(store_key: &str, data: &str, default_db: &str) -> bool {
                 versions: Vec::new(),
                 role: "rdb-ledger-verify",
                 superuser: true,
+                tx: 0,
             };
             match rasterizeddb_core::core::ledger_hooks::statement(&served, request) {
                 Ok(reply) => {
