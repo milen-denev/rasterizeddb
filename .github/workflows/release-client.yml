@@ -147,12 +147,12 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "packing $v"
 
-      # The published packages by name, not the solution: RasterizedDb.Messaging
-      # is in it and is not published until the user says so.
+      # The published packages by name, not the solution (its test projects
+      # are in it too).
       - name: Pack
         shell: bash
         run: |
-          for p in RasterizedDb.Data RasterizedDb.EntityFrameworkCore; do
+          for p in RasterizedDb.Data RasterizedDb.EntityFrameworkCore RasterizedDb.Messaging; do
             dotnet pack "dotnet/src/$p/$p.csproj" -c Release \
               -p:Version=${{ steps.version.outputs.version }} \
               -p:ContinuousIntegrationBuild=true \
