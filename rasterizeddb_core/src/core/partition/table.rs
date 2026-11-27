@@ -1107,7 +1107,15 @@ fn fan_out_part() -> bool {
 fn unowned_by_the_map(part: bool) -> impl Fn(PointRange) -> bool {
     #[cfg(feature = "sharding")]
     {
-        let own = if part { crate::core::shard::ownership::current() } else { None };
+        // The ownership the part was accepted under, when a shard request
+        // carried it; the live one for `SET rdb.shard_part`.
+        let own = if part {
+            crate::pgwire::current_session_cancel()
+                .and_then(|c| c.part_owned.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .or_else(crate::core::shard::ownership::current)
+        } else {
+            None
+        };
         move |range: PointRange| own.as_ref().is_some_and(|o| o.owns_none_of(range))
     }
     #[cfg(not(feature = "sharding"))]

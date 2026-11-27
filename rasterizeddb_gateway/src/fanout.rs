@@ -138,9 +138,14 @@ impl Session {
         }
         let mut parts: Vec<(u32, PartReply)> = Vec::with_capacity(handles.len());
         let mut failure: Option<(String, String)> = None;
+        // Parts refused before they ran because the map moved under them
+        // (a shard one epoch apart): the shard, and whether it is behind.
+        let mut moving: Vec<(u32, bool)> = Vec::new();
         for (s, h) in handles {
             match h.await {
                 Ok(Ok(p)) => parts.push((s, p)),
+                Ok(Err((code, _))) if code.as_bytes() == rasterizeddb_router::rshard::MOVED => moving.push((s, false)),
+                Ok(Err((code, _))) if code.as_bytes() == rasterizeddb_router::rshard::FENCED => moving.push((s, true)),
                 Ok(Err(e)) => {
                     failure.get_or_insert(e);
                 }
@@ -148,6 +153,25 @@ impl Session {
                     failure.get_or_insert(("XX000".into(), format!("the part on shard {s} panicked")));
                 }
             }
+        }
+        if failure.is_none() && !moving.is_empty() {
+            // Nothing ran on the refusing shards and the others only read:
+            // the statement goes again once the map settles, so every part
+            // answers at one epoch. A map one epoch ahead is fetched; a
+            // shard behind is waited for.
+            if consistent {
+                for &s in &shards {
+                    let _ = self.quiet_query(s, "ROLLBACK").await;
+                }
+            }
+            for &(s, behind) in &moving {
+                if behind {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                } else {
+                    let _ = self.core.fetch_map(s).await;
+                }
+            }
+            return Ok(Outcome::Retry);
         }
         if let Some((code, m)) = failure {
             self.error_ready(&code, &m);

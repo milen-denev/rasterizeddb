@@ -436,14 +436,14 @@ async fn plan_partitions(database: &Arc<Database>, pool: &StorageManager) -> Res
 /// itself keeps it, and keeps any other mode it held: the manager holds a
 /// mode set per owner). Taken before the request, so a failed or cancelled
 /// wait gives back nothing it did not get.
-struct MoveRelease<'a> {
+pub(crate) struct MoveRelease<'a> {
     database: &'a Database,
     owner: Option<crate::core::mvcc::table_locks::LockOwner>,
     table: String,
 }
 
 impl<'a> MoveRelease<'a> {
-    fn before(database: &'a Database, table: &str) -> Self {
+    pub(crate) fn before(database: &'a Database, table: &str) -> Self {
         use crate::core::mvcc::table_locks::TableMode;
         let key = database.lock_key(table).into_owned();
         let owner = crate::core::mvcc::owner::ensure()
