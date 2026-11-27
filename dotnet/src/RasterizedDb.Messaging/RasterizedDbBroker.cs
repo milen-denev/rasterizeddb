@@ -37,6 +37,10 @@ public sealed class RasterizedDbBroker : IAsyncDisposable
     private const byte FlagReply = 1;
     private const byte FlagError = 2;
     private const byte FlagPush = 4;
+    /// <summary>On a delivery: a list of delivery counts follows the ranges.</summary>
+    private const byte FlagCounts = 8;
+    /// <summary>Subscribe option, bit 0: put delivery counts on this subscription's deliveries.</summary>
+    private const uint SubscribeDeliveryCounts = 1;
 
     internal static class Op
     {
@@ -413,7 +417,7 @@ public sealed class RasterizedDbBroker : IAsyncDisposable
             switch (op)
             {
                 case Op.Deliver:
-                    subscription.Deliver(body);
+                    subscription.Deliver(body, (flags & FlagCounts) != 0);
                     break;
                 case Op.Assign:
                     subscription.Assign(body);
@@ -749,6 +753,9 @@ public sealed class RasterizedDbBroker : IAsyncDisposable
                 w.UInt32(config.MaxDeliveries);
                 w.String(config.DeadLetter);
                 w.UInt32((uint)credits);
+                // Options, after the credits: delivery counts are always asked for. A broker that
+                // predates them ignores the field, and its deliveries read as before.
+                w.UInt32(SubscribeDeliveryCounts);
             },
             cancellationToken,
             reply =>
@@ -876,7 +883,7 @@ public sealed class RasterizedDbBroker : IAsyncDisposable
 public sealed class BrokerSubscription : IAsyncEnumerable<BrokerMessage>, IAsyncDisposable
 {
     private readonly RasterizedDbBroker _broker;
-    private readonly Channel<byte[]> _deliveries = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleWriter = true });
+    private readonly Channel<(byte[] Body, bool Counts)> _deliveries = Channel.CreateUnbounded<(byte[] Body, bool Counts)>(new UnboundedChannelOptions { SingleWriter = true });
     private readonly uint _window;
     private uint _consumed;
     private volatile uint[] _assigned;
@@ -899,7 +906,7 @@ public sealed class BrokerSubscription : IAsyncEnumerable<BrokerMessage>, IAsync
     /// <summary>Raised when the subscription ends other than by <see cref="CloseAsync"/>.</summary>
     public event Action<BrokerException>? Closed;
 
-    internal void Deliver(byte[] body) => _deliveries.Writer.TryWrite(body);
+    internal void Deliver(byte[] body, bool counts) => _deliveries.Writer.TryWrite((body, counts));
 
     internal void Assign(byte[] body)
     {
@@ -929,44 +936,9 @@ public sealed class BrokerSubscription : IAsyncEnumerable<BrokerMessage>, IAsync
     public async IAsyncEnumerator<BrokerMessage> GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
         var messages = new List<BrokerMessage>();
-        await foreach (var body in _deliveries.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+        await foreach (var (body, counts) in _deliveries.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
         {
-            // partition u32 | range count u32 | (partition u32, offset u64, count u32)… | stored batches
-            if (body.Length < 8 || BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(4)) > (uint)(body.Length - 8) / 16)
-            {
-                throw new BrokerException("malformed delivery: body too short");
-            }
-
-            var partition = BinaryPrimitives.ReadUInt32LittleEndian(body);
-            var rangeCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(4));
-            var ranges = new (ulong Offset, uint Count)[rangeCount];
-            uint delivered = 0;
-            for (var i = 0; i < rangeCount; i++)
-            {
-                var at = 8 + i * 16;
-                ranges[i] = (BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(at + 4)), BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(at + 12)));
-                delivered += ranges[i].Count;
-            }
-
-            messages.Clear();
-            // Records outside the ranges are another member's, or before this one's position.
-            BrokerBatch.Read(
-                body.AsMemory(8 + rangeCount * 16),
-                partition,
-                offset =>
-                {
-                    foreach (var (start, count) in ranges)
-                    {
-                        if (offset >= start && offset < start + count)
-                        {
-                            return true;
-                        }
-                    }
-
-                    return false;
-                },
-                messages);
-
+            var delivered = ReadDelivery(body, counts, messages);
             _consumed += delivered;
             if (_consumed >= Math.Max(1, _window / 2))
             {
@@ -991,6 +963,90 @@ public sealed class BrokerSubscription : IAsyncEnumerable<BrokerMessage>, IAsync
                 yield return message;
             }
         }
+    }
+
+    /// <summary>
+    /// Reads a delivery's body into <paramref name="messages"/> and returns how many records the
+    /// broker counted against the credits.
+    /// </summary>
+    internal static uint ReadDelivery(byte[] body, bool counts, List<BrokerMessage> messages)
+    {
+        // partition u32 | range count u32 | (partition u32, offset u64, count u32)…
+        //   | with the counts flag: count u32 | (partition u32, offset u64, deliveries u32)…
+        //   | stored batches
+        if (body.Length < 8 || BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(4)) > (uint)(body.Length - 8) / 16)
+        {
+            throw new BrokerException("malformed delivery: body too short");
+        }
+
+        var partition = BinaryPrimitives.ReadUInt32LittleEndian(body);
+        var rangeCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(4));
+        var ranges = new (ulong Offset, uint Count)[rangeCount];
+        uint delivered = 0;
+        for (var i = 0; i < rangeCount; i++)
+        {
+            var at = 8 + i * 16;
+            ranges[i] = (BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(at + 4)), BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(at + 12)));
+            delivered += ranges[i].Count;
+        }
+
+        var batches = 8 + rangeCount * 16;
+        var countsAt = 0;
+        var countEntries = 0;
+        if (counts)
+        {
+            if (body.Length - batches < 4 || BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(batches)) > (uint)(body.Length - batches - 4) / 16)
+            {
+                throw new BrokerException("malformed delivery: delivery counts too short");
+            }
+
+            countEntries = (int)BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(batches));
+            countsAt = batches + 4;
+            batches = countsAt + countEntries * 16;
+        }
+
+        messages.Clear();
+        // Records outside the ranges are another member's, or before this one's position.
+        BrokerBatch.Read(
+            body.AsMemory(batches),
+            partition,
+            offset =>
+            {
+                foreach (var (start, count) in ranges)
+                {
+                    if (offset >= start && offset < start + count)
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            },
+            messages);
+
+        if (countEntries != 0)
+        {
+            // Only records on their second or later delivery are listed, so the list is short
+            // beside the messages; both are in offset order within a partition, but nothing here
+            // leans on that.
+            var listed = new Dictionary<(uint Partition, ulong Offset), uint>(countEntries);
+            for (var i = 0; i < countEntries; i++)
+            {
+                var at = countsAt + i * 16;
+                listed[(BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(at)), BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(at + 4)))] =
+                    BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(at + 12));
+            }
+
+            foreach (var message in messages)
+            {
+                if (listed.TryGetValue((message.Partition, message.Offset), out var deliveries) && deliveries > 1)
+                {
+                    message.DeliveryCount = deliveries;
+                }
+            }
+        }
+
+        return delivered;
     }
 
     private void Settle(byte op, uint delayMs, IReadOnlyList<(uint Partition, ulong Offset, uint Count)> ranges) =>

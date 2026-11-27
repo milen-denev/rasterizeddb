@@ -206,7 +206,8 @@ options.UseRasterizedDb(connectionString, o => o.EnableRetryOnFailure());
 
 `RasterizedDb.Messaging` is a client for the server's message broker. **Pre-production**: it is written
 against a broker whose protocol (`rdbmq/1`) is not frozen, and has been tested against a stand-in that
-speaks the frames, not against the broker.
+speaks the frames; of the broker itself, only queue delivery, nack, redelivery and dead-lettering are
+tested (with `RDB_SERVER_BIN` set).
 
 ```csharp
 await using var broker = await RasterizedDbBroker.ConnectAsync("Host=mq.example.com;Port=7171;Username=app;Password=secret");
@@ -236,8 +237,16 @@ unacknowledged messages again). Topics with partitions and ordered or broadcast 
 (`CreateTopicAsync`, `SubscribeAsync`), batches (`BrokerBatchBuilder`), `FetchAsync` and exchanges
 (`DeclareExchangeAsync`, `BindAsync`, `PublishAsync`) are there too. `ProduceAsync(…, deliverAt: time)`
 holds a message back from a queue's consumers until then, and `jobs.RenewAsync(message, extend)` keeps
-a delivered message yours for longer when the work outlasts the acknowledgement timeout. Not yet:
-compressed batches.
+a delivered message yours for longer when the work outlasts the acknowledgement timeout.
+
+`message.DeliveryCount` says which delivery of a queue's message this is: 1 the first time, one more
+after each nack or lapsed acknowledgement timeout. When it equals the queue's `MaxDeliveries` this is
+the last attempt, and a handler that cannot finish should say so (log, alert) before the broker
+dead-letters the message. The broker keeps the counts in memory: they start again from 1 after it
+restarts, so a count is a lower bound across a restart. A broker older than delivery counts reports 1
+for every message.
+
+Not yet: compressed batches.
 
 ## Tests
 

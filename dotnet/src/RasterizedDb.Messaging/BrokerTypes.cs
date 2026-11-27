@@ -195,6 +195,17 @@ public sealed class BrokerMessage
 
     public ulong Offset { get; }
 
+    /// <summary>
+    /// Which delivery of this message this is, on a shared subscription (a queue): 1 for the first,
+    /// 2 after one nack or one lapsed acknowledgement timeout, and so on. When it equals the maximum
+    /// deliveries of the queue (<see cref="BrokerQueueConfig.MaxDeliveries"/>) or of the subscription
+    /// (<see cref="BrokerSubscriptionConfig.MaxDeliveries"/>), this is the last attempt:
+    /// the broker dead-letters the message instead of delivering it again. The broker keeps the
+    /// counts in memory, so they start again from 1 after it restarts. Always 1 from a broker that
+    /// predates delivery counts, and for messages read with <c>FetchAsync</c>.
+    /// </summary>
+    public uint DeliveryCount { get; internal set; } = 1;
+
     /// <summary>When the broker stored it (or the producer's own time, if it set one), in UTC.</summary>
     public DateTime Time { get; }
 

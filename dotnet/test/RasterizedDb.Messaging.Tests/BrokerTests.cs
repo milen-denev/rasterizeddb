@@ -449,13 +449,17 @@ public class BrokerClientTests
         at = 4;
         Assert.Equal("jobs", FakeBroker.Str(subscribe, ref at));
         Assert.Equal((byte)BrokerSubscriptionMode.Shared, subscribe[at]);
-        Assert.Equal(2u, BinaryPrimitives.ReadUInt32LittleEndian(subscribe.AsSpan(subscribe.Length - 4)));
+        // The credits, then the options: bit 0 asks for delivery counts.
+        Assert.Equal(2u, BinaryPrimitives.ReadUInt32LittleEndian(subscribe.AsSpan(subscribe.Length - 8)));
+        Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(subscribe.AsSpan(subscribe.Length - 4)));
 
         var messages = await Take(subscription, 2);
         Assert.Equal(["one", "two"], messages.Select(m => Encoding.UTF8.GetString(m.Value.Span)));
         Assert.Equal([10ul, 11ul], messages.Select(m => m.Offset));
         Assert.Equal("email", messages[0].Header("kind"));
         Assert.True(messages[1].HasKey);
+        // This broker sends no counts, as one that predates them: every message is on its first delivery.
+        Assert.All(messages, m => Assert.Equal(1u, m.DeliveryCount));
 
         // Half the window taken: that many credits go back, with the handle as the frame's corr.
         var credit = fake.Next(31);
@@ -619,5 +623,245 @@ public class BrokerClientTests
         var unacknowledged = await broker.ProduceAsync("jobs", "x"u8.ToArray(), ack: BrokerAck.None);
         Assert.Equal(ulong.MaxValue, unacknowledged.BaseOffset);
         await broker.PingAsync();
+    }
+}
+
+public class DeliveryCountTests
+{
+    /// <summary>A delivery body: one range over the whole batch, then the counts when there are any to send.</summary>
+    private static byte[] Delivery(byte[] batch, ulong offset, uint count, (uint Partition, ulong Offset, uint Deliveries)[]? counts) => FakeBroker.Body(w =>
+    {
+        w.Write(0u);
+        w.Write(1u);
+        w.Write(0u);
+        w.Write(offset);
+        w.Write(count);
+        if (counts is not null)
+        {
+            w.Write((uint)counts.Length);
+            foreach (var (partition, at, deliveries) in counts)
+            {
+                w.Write(partition);
+                w.Write(at);
+                w.Write(deliveries);
+            }
+        }
+
+        w.Write(batch);
+    });
+
+    private static byte[] Three()
+    {
+        using var builder = new BrokerBatchBuilder();
+        builder.Add("a").Add("b").Add("c");
+        return BatchTests.Stamp(builder.Seal().ToArray(), 100, 1_000_000);
+    }
+
+    [Fact]
+    public void A_delivery_without_counts_reads_every_message_as_its_first()
+    {
+        var messages = new List<BrokerMessage>();
+        Assert.Equal(3u, BrokerSubscription.ReadDelivery(Delivery(Three(), 100, 3, null), counts: false, messages));
+        Assert.Equal([100ul, 101ul, 102ul], messages.Select(m => m.Offset));
+        Assert.All(messages, m => Assert.Equal(1u, m.DeliveryCount));
+    }
+
+    [Fact]
+    public void A_delivery_with_counts_gives_the_listed_records_theirs()
+    {
+        var messages = new List<BrokerMessage>();
+        // Out of order, with an entry for another partition and one for a record that is not there.
+        var body = Delivery(Three(), 100, 3, [(0, 102, 5), (7, 101, 9), (0, 100, 2), (0, 400, 3)]);
+        Assert.Equal(3u, BrokerSubscription.ReadDelivery(body, counts: true, messages));
+        Assert.Equal(["a", "b", "c"], messages.Select(m => Encoding.UTF8.GetString(m.Value.Span)));
+        Assert.Equal([2u, 1u, 5u], messages.Select(m => m.DeliveryCount));
+
+        // The flag with an empty list is still a list.
+        Assert.Equal(3u, BrokerSubscription.ReadDelivery(Delivery(Three(), 100, 3, []), counts: true, messages));
+        Assert.Equal([1u, 1u, 1u], messages.Select(m => m.DeliveryCount));
+    }
+
+    [Fact]
+    public void A_counts_list_that_runs_past_the_body_is_refused()
+    {
+        var messages = new List<BrokerMessage>();
+        var cut = FakeBroker.Body(w =>
+        {
+            w.Write(0u);
+            w.Write(0u);
+            w.Write(3u);
+            w.Write(new byte[40]);
+        });
+        Assert.Throws<BrokerException>(() => BrokerSubscription.ReadDelivery(cut, counts: true, messages));
+        Assert.Throws<BrokerException>(() => BrokerSubscription.ReadDelivery(cut[..10], counts: true, messages));
+    }
+
+    [Fact]
+    public async Task A_redelivery_arrives_flagged_and_counted()
+    {
+        await using var fake = new FakeBroker();
+        await using var broker = await RasterizedDbBroker.ConnectAsync(fake.ConnectionString);
+        await broker.DeclareQueueAsync("jobs");
+        await using var subscription = await broker.ConsumeAsync("jobs");
+        fake.Next(30);
+
+        var batch = Three();
+        await fake.Send(0x80, 4, 9, Delivery(batch, 100, 3, null));
+        await fake.Send(0x80, 4 | 8, 9, Delivery(batch, 100, 3, [(0, 101, 2)]));
+        // The flag is the frame's, not the subscription's: the next one has no list.
+        await fake.Send(0x80, 4, 9, Delivery(batch, 100, 3, null));
+
+        using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var counts = new List<uint>();
+        await foreach (var message in subscription.WithCancellation(limit.Token))
+        {
+            counts.Add(message.DeliveryCount);
+            if (counts.Count == 9)
+            {
+                break;
+            }
+        }
+
+        Assert.Equal([1u, 1u, 1u, 1u, 2u, 1u, 1u, 1u, 1u], counts);
+    }
+}
+
+/// <summary>
+/// Against the broker itself, started from the binary <c>RDB_SERVER_BIN</c> names. Without it the tests
+/// say so and pass.
+/// </summary>
+public sealed class LiveBrokerTests : IDisposable
+{
+    private System.Diagnostics.Process? _server;
+    private string? _directory;
+
+    private string? Start()
+    {
+        if (Environment.GetEnvironmentVariable("RDB_SERVER_BIN") is not { Length: > 0 } binary)
+        {
+            Console.WriteLine("RDB_SERVER_BIN is not set: the live broker test did not run");
+            return null;
+        }
+
+        int port;
+        using (var listener = new TcpListener(IPAddress.Loopback, 0))
+        {
+            listener.Start();
+            port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        }
+
+        _directory = Path.Combine("/tmp", $"rdbmq_live_{Environment.ProcessId}");
+        if (Directory.Exists(_directory))
+        {
+            Directory.Delete(_directory, recursive: true);
+        }
+
+        Directory.CreateDirectory(Path.Combine(_directory, "db"));
+        // Through a shell that watches this process, so a killed test host leaves no server behind.
+        var start = new System.Diagnostics.ProcessStartInfo("/bin/bash") { RedirectStandardOutput = true, UseShellExecute = false };
+        const string Watch =
+            "\"$@\" & server=$!; " +
+            "while kill -0 $PPID 2>/dev/null && kill -0 $server 2>/dev/null; do sleep 1; done; " +
+            "if kill -0 $server 2>/dev/null; then kill $server; wait $server; rm -rf \"$RDB_TEST_DIRECTORY\"; exit 0; fi; wait $server";
+        start.Environment["RDB_TEST_DIRECTORY"] = _directory;
+        foreach (var argument in (string[])
+            [
+                "-c", Watch, "server", binary, "--location", Path.Combine(_directory, "db"),
+                "--rdb-tcp", "off", "--rdb-socket", Path.Combine(_directory, "s.sock"), "--rdb-socket-auth", "trust", "--socket-mode", "600",
+                "--log-level", "warn", "--broker-port", port.ToString(), "--broker-auth", "trust",
+            ])
+        {
+            start.ArgumentList.Add(argument);
+        }
+
+        _server = System.Diagnostics.Process.Start(start) ?? throw new InvalidOperationException("the server did not start");
+        _server.OutputDataReceived += static (_, _) => { };
+        _server.BeginOutputReadLine();
+        for (var i = 0; i < 600; i++)
+        {
+            if (_server.HasExited)
+            {
+                throw new InvalidOperationException($"the server exited with code {_server.ExitCode} before opening its broker port");
+            }
+
+            try
+            {
+                using var probe = new TcpClient();
+                probe.Connect(IPAddress.Loopback, port);
+                return $"Host=127.0.0.1;Port={port};Timeout=10";
+            }
+            catch (SocketException)
+            {
+                Thread.Sleep(100);
+            }
+        }
+
+        throw new TimeoutException("the server did not open its broker port within 60 s");
+    }
+
+    public void Dispose()
+    {
+        if (_server is { HasExited: false })
+        {
+            _server.Kill(entireProcessTree: true);
+            _server.WaitForExit(10_000);
+        }
+
+        _server?.Dispose();
+        if (_directory is not null && Directory.Exists(_directory))
+        {
+            Directory.Delete(_directory, recursive: true);
+        }
+    }
+
+    private static async Task<BrokerMessage> One(BrokerSubscription subscription)
+    {
+        using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        await foreach (var message in subscription.WithCancellation(limit.Token))
+        {
+            return message;
+        }
+
+        throw new InvalidOperationException("the subscription ended");
+    }
+
+    [Fact]
+    public async Task Delivery_counts_go_up_with_a_nack_and_with_a_lapsed_timeout()
+    {
+        if (Start() is not { } connection)
+        {
+            return;
+        }
+
+        await using var broker = await RasterizedDbBroker.ConnectAsync(connection);
+        await broker.DeclareQueueAsync("counted", new BrokerQueueConfig { AckTimeout = TimeSpan.FromSeconds(1), MaxDeliveries = 3, DeadLetter = "counted.dead" });
+        await broker.DeclareQueueAsync("counted.dead");
+        await broker.ProduceAsync("counted", "job"u8.ToArray());
+
+        await using var subscription = await broker.ConsumeAsync("counted");
+        var first = await One(subscription);
+        Assert.Equal("job", Encoding.UTF8.GetString(first.Value.Span));
+        Assert.Equal(1u, first.DeliveryCount);
+
+        // Given back: the second delivery.
+        subscription.Nack(first);
+        var second = await One(subscription);
+        Assert.Equal(first.Offset, second.Offset);
+        Assert.Equal(2u, second.DeliveryCount);
+
+        // Left unacknowledged past the queue's timeout: the third, and with MaxDeliveries = 3 the last.
+        var third = await One(subscription);
+        Assert.Equal(first.Offset, third.Offset);
+        Assert.Equal(3u, third.DeliveryCount);
+
+        // Given back once more, it is dead-lettered and not delivered a fourth time. There it is a
+        // new message of another queue, on its first delivery.
+        subscription.Nack(third);
+        await using var dead = await broker.ConsumeAsync("counted.dead");
+        var buried = await One(dead);
+        Assert.Equal("job", Encoding.UTF8.GetString(buried.Value.Span));
+        Assert.Equal(1u, buried.DeliveryCount);
+        Assert.NotNull(buried.Header("x-death-reason"));
+        dead.Ack(buried);
     }
 }
