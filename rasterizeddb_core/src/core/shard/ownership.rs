@@ -36,6 +36,21 @@ impl Ownership {
         let hi = ((range.hi - 1) >> 16) as u64 + 1;
         covers(&self.owned, &self.incoming, lo, hi)
     }
+
+    /// True when no level-0 block `range` reaches is one the map gives this
+    /// shard (`owned`): a partition a fan-out's part must not read. That is
+    /// a move's copy still coming in (incoming: a move in flight, one that
+    /// failed, or one whose tool died), and a source's span after the map
+    /// moved it away but before `SHARD GIVE` made it FOREIGN. Either way
+    /// another shard answers for those rows.
+    pub fn owns_none_of(&self, range: PointRange) -> bool {
+        if range.is_empty() {
+            return false;
+        }
+        let lo = range.lo >> 16;
+        let hi = ((range.hi - 1) >> 16) as u64 + 1;
+        !self.owned.iter().any(|&(a, b)| a < hi && lo < b)
+    }
 }
 
 /// True when `[lo, hi)` lies within the union of `a` and `b`.
@@ -242,4 +257,35 @@ pub fn adopt_map(owned: Vec<(u64, u64)>, map_epoch: u64) -> Result<Ownership, St
         o.owned = owned;
         o.map_epoch = map_epoch;
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn points(lo_block: u64, hi_block: u64) -> PointRange {
+        PointRange { lo: lo_block << 16, hi: (hi_block as u128) << 16 }
+    }
+
+    /// What a fan-out's part skips: a partition with no block the map gives
+    /// this shard, such as a move's copy still incoming. A partition with any
+    /// owned block is read.
+    #[test]
+    fn a_partition_outside_the_owned_ranges_is_another_shards() {
+        let o = Ownership { owned: vec![(0, 100), (200, 300)], incoming: vec![(100, 150)], ..Default::default() };
+        assert!(o.owns_none_of(points(100, 150)), "an incoming copy");
+        assert!(o.owns_none_of(points(150, 200)), "between owned ranges");
+        assert!(o.owns_none_of(points(300, 400)), "past the last");
+        assert!(!o.owns_none_of(points(0, 100)));
+        assert!(!o.owns_none_of(points(250, 260)));
+        // Straddling an edge: some of its rows are this shard's.
+        assert!(!o.owns_none_of(points(90, 120)));
+        assert!(!o.owns_none_of(points(199, 201)));
+        // The top block's range ends at 2^64.
+        let top = PointRange { lo: 300 << 16, hi: 1u128 << 64 };
+        assert!(o.owns_none_of(top));
+        let all = Ownership { owned: vec![(0, 1 << 48)], ..Default::default() };
+        assert!(!all.owns_none_of(top));
+        assert!(!o.owns_none_of(PointRange { lo: 5, hi: 5 }), "an empty range is no partition");
+    }
 }
