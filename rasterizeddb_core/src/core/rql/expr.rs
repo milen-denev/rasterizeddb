@@ -597,8 +597,12 @@ pub fn needs_evaluation(text: &str) -> bool {
     // A path into a document is an expression, not a column name. Asked
     // structurally rather than by looking for `->`, so `#>` and `#>>` are
     // covered too and a column whose *name* contains an arrow is not.
-    if crate::core::jsonb::parse_path_expression(trimmed).is_some()
+    if crate::core::jsonb::parse_path_expression_any(trimmed).is_some()
         || crate::core::jsonb::parse_qualified_path_expression(trimmed).is_some()
+        // `(doc) #> '{a}'`, `(doc -> 'a') #>> '{}'`: a path over a group. It
+        // reached the select list's call branch, the leading `(` a call
+        // named nothing ("function '' is not supported yet").
+        || path_over_expression(trimmed).is_some()
     {
         return true;
     }
@@ -1080,7 +1084,13 @@ pub(crate) fn path_operator_refusal(column: &SchemaField, text: &str) -> Option<
     let at = after_column.find(['-', '#'])?;
     let rest = &after_column[at..];
     let operator = ["#>>", "#>", "->>", "->"].into_iter().find(|op| rest.starts_with(op))?;
-    Some(format!("operator does not exist: {name} {operator} unknown"))
+    // The right side as PostgreSQL types it: a number is an integer, a
+    // quoted constant not yet anything.
+    let operand = match rest[operator.len()..].trim_start().bytes().next() {
+        Some(b) if b.is_ascii_digit() || b == b'-' => "integer",
+        _ => "unknown",
+    };
+    Some(format!("operator does not exist: {name} {operator} {operand}"))
 }
 
 /// `text` as an operand and the path steps after it, when it is a path over
@@ -1111,7 +1121,7 @@ fn path_over_expression(text: &str) -> Option<(&str, (crate::core::jsonb::PathEx
     }
     let operator = ["#>>", "#>", "->>", "->"].into_iter().find(|op| text[at..].starts_with(op))?;
     // The steps read by the one path parser, over a stand-in column.
-    let path = crate::core::jsonb::parse_path_expression(&format!("x{}", &text[at..]))?;
+    let path = crate::core::jsonb::parse_path_expression_any(&format!("x{}", &text[at..]))?;
     Some((base, (path, operator)))
 }
 
@@ -1534,7 +1544,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         match path_at {
             Some(at) => {
                 if let (Some(path), Some(operator)) = (
-                    crate::core::jsonb::parse_path_expression(&format!("x{}", &text[at..])),
+                    crate::core::jsonb::parse_path_expression_any(&format!("x{}", &text[at..])),
                     ["#>>", "#>", "->>", "->"].into_iter().find(|op| text[at..].starts_with(op)),
                 ) {
                     let base = parse(text[..at].trim_end(), schema)?;
@@ -1570,7 +1580,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     // relations' `doc` never meet here under one name. Unread, the whole
     // `t.doc->>'k'` was looked up as a column ("not found in schema"), which
     // failed every ORM query reading a document field.
-    let path = crate::core::jsonb::parse_path_expression(text)
+    let path = crate::core::jsonb::parse_path_expression_any(text)
         .or_else(|| crate::core::jsonb::parse_qualified_path_expression(text).map(|(_, path)| path));
     if let Some(path) = path {
         if let Some(column) = schema
