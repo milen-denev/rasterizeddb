@@ -47,7 +47,11 @@ jobs:
           - { name: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
           - { name: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
           - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc }
-          - { name: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+          # Every feature but `fips`: aws-lc-fips-sys does not build for
+          # Windows ARM64 (its CMake run asks Ninja for an ARM64 platform,
+          # which Ninja refuses), and AWS-LC's FIPS module has no such target.
+          - { name: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc,
+              features: "--features rastcp/tls-keylog,rasterizeddb_client/derive,rasterizeddb_client/sharding,rasterizeddb_client/broker,rasterizeddb_client/fault_points,rasterizeddb_client/chrono,rasterizeddb_client/uuid,rasterizeddb_client/serde_json" }
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -56,7 +60,7 @@ jobs:
       - name: Test
         run: >
           cargo test --locked --target ${{ matrix.target }}
-          -p rastcp -p rasterizeddb_client_derive -p rasterizeddb_client --all-features
+          -p rastcp -p rasterizeddb_client_derive -p rasterizeddb_client ${{ matrix.features || '--all-features' }}
       - name: Live tests against this tree's server (unix only)
         if: runner.os == 'Linux'
         shell: bash
