@@ -17,7 +17,7 @@ path = "src/main.rs"
 # no crate to the build. No rasterizeddb_core: no engine, parser or
 # catalogue (sharding-plan.md §4.9 G1).
 [dependencies]
-rastcp = { path = "../rastcp", version = "1.0.0" }
+rastcp = { path = "../rastcp", version = "1.0.2" }
 rasterizeddb_router = { path = "../rasterizeddb_router", version = "1.0.0" }
 tokio = { version = "1.54", features = ["rt", "net", "io-util", "time", "sync", "macros", "signal"] }
 rustls = { version = "0.23" }

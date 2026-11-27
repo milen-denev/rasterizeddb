@@ -21,7 +21,7 @@ rasterizeddb_core = { path = "../rasterizeddb_core", version = "1.0.0", default-
 rasterizeddb_enterprise = { path = "../rasterizeddb_enterprise", version = "1.0.0", optional = true }
 # main.rs names it directly when Raft is on.
 rasterizeddb_raft = { path = "../rasterizeddb_raft", version = "1.0.0", optional = true }
-rastcp = { path = "../rastcp", version = "1.0.0" }
+rastcp = { path = "../rastcp", version = "1.0.2" }
 tokio = { version = "1", features = ["full"] }
 # main.rs's broker flags (broker_args.rs) name these directly.
 rasterizeddb_mq = { path = "../rasterizeddb_mq", version = "1.0.1", optional = true }

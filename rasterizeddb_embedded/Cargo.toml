@@ -16,7 +16,7 @@ categories = ["database-implementations", "database"]
 # it does not build with them off (see rasterizeddb_core's Cargo.toml).
 [dependencies]
 rasterizeddb_core = { path = "../rasterizeddb_core", version = "1.0.1" }
-rasterizeddb_client = { path = "../rasterizeddb_client", version = "1.0.1" }
+rasterizeddb_client = { path = "../rasterizeddb_client", version = "1.0.2" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 # The engine's catalogue handle is an rclite::Arc.
 rclite = "0.4.2"
