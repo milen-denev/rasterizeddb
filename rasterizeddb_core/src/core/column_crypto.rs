@@ -58,7 +58,9 @@ pub trait ColumnCrypto: Send + Sync + 'static {
     fn touches(&self, store: &str, sql: &str) -> bool;
     /// The client's text, before any rewrite: `Err` (with its SQLSTATE) when
     /// an encrypted column appears where its ciphertext would be computed on.
-    fn guard(&self, store: &str, sql: &str) -> Result<(), String>;
+    /// The database is there for a table's column order (`INSERT … VALUES`
+    /// without a column list).
+    fn guard(&self, database: &Database, sql: &str) -> Result<(), String>;
     /// The text the executor is about to run: refused, run as it is, or run
     /// as the plan says.
     fn plan(&self, database: &Database, sql: &str) -> Result<Option<Plan>, String>;
@@ -114,7 +116,7 @@ pub fn guard(database: &Database, sql: &str) -> Result<(), String> {
     match hooks() {
         Some(h) => {
             let store = database.ledger_store();
-            if h.active(&store) { h.guard(&store, sql) } else { Ok(()) }
+            if h.active(&store) { h.guard(database, sql) } else { Ok(()) }
         }
         None if declares(sql) && sql.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("CREATE")) => {
             Err("0A000: encrypted columns need the enterprise build (rasterizeddb_core_enterprise)".to_string())

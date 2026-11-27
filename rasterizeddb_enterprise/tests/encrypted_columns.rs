@@ -100,7 +100,6 @@ async fn encrypted_columns() {
         "UPDATE patients SET ssn = upper(ssn)",
         "DELETE FROM patients WHERE ssn = '123-45-6789'",
         "INSERT INTO patients (id, ssn) SELECT id, ssn FROM patients",
-        "INSERT INTO patients VALUES (7, 'x', '000-00-0000')",
         "CREATE TABLE copy AS SELECT * FROM patients",
         "ALTER TABLE patients RENAME COLUMN ssn TO s",
     ] {
@@ -117,8 +116,19 @@ async fn encrypted_columns() {
         .expect("a bound value for an encrypted column");
     assert_eq!(col(&admin, "SELECT ssn FROM patients WHERE id = 4").await, vec![Some("444-44-4444".into())]);
 
+    // Positional VALUES, as PostgreSQL clients and bulk paths write them:
+    // mapped onto the table's columns in order, the encrypted one sealed.
+    run(&admin, "INSERT INTO patients VALUES (10, 'eve', '101-01-0101')").await;
+    run(&admin, "INSERT INTO patients VALUES (11, 'fay', '111-01-0101'), (12, 'gus', NULL), (13, 'hal', DEFAULT)").await;
+    run(&admin, "INSERT INTO patients VALUES (14, 'ivy')").await;
+    assert_eq!(
+        col(&admin, "SELECT ssn FROM patients WHERE id >= 10 ORDER BY id").await,
+        vec![Some("101-01-0101".into()), Some("111-01-0101".into()), None, None, None]
+    );
+    assert!(refused(&admin, "INSERT INTO patients VALUES (15, 'jo', upper('x'))").await.contains("encrypted"));
+
     // --- stored as ciphertext: no plaintext in any file -----------------------
-    for secret in ["123-45-6789", "555-55-5555", "444-44-4444"] {
+    for secret in ["123-45-6789", "555-55-5555", "444-44-4444", "101-01-0101", "111-01-0101"] {
         let found = on_disk(&data, secret.as_bytes());
         assert!(found.is_empty(), "{secret} is stored in the clear in {found:?}");
     }
@@ -145,7 +155,9 @@ async fn encrypted_columns() {
     // --- a ledger table with an encrypted column --------------------------------
     run(&admin, "CREATE LEDGER TABLE cards (id BIGINT, pan TEXT ENCRYPTED WITH VAULT hr KEY 'pii') NO DELETE UNTIL 1 DAY AFTER INSERT").await;
     run(&admin, "INSERT INTO cards (id, pan) VALUES (1, '4111111111111111')").await;
-    assert_eq!(col(&admin, "SELECT pan FROM cards").await, vec![Some("4111111111111111".into())]);
+    run(&admin, "INSERT INTO cards VALUES (2, '5500000000000004')").await;
+    assert_eq!(col(&admin, "SELECT pan FROM cards ORDER BY id").await, vec![Some("4111111111111111".into()), Some("5500000000000004".into())]);
+    assert!(on_disk(&data, b"5500000000000004").is_empty());
     let verify = col(&admin, "VERIFY LEDGER cards").await;
     assert!(verify.iter().flatten().all(|l| !l.starts_with("TAMPERED") && !l.starts_with("UNKNOWN")), "{verify:?}");
     assert!(on_disk(&data, b"4111111111111111").is_empty());

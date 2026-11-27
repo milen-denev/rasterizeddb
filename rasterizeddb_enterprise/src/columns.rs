@@ -554,11 +554,23 @@ fn analyze(all: &[Col], sql: &str, mode: Mode, database: Option<&Database>) -> R
                         .filter_map(|(k, n)| target_enc.iter().find(|c| c.column.eq_ignore_ascii_case(n)).map(|c| (k, *c)))
                         .collect(),
                     None if t.get(p).is_some_and(|x| x.kw("DEFAULT")) => Vec::new(),
+                    // No column list: the table's own columns, in the order
+                    // a positional INSERT fills them.
                     None => {
-                        return Err(format!(
-                            "0A000: name the columns when inserting into \"{}\": it has encrypted columns, whose values are encrypted by position",
-                            target_enc[0].table
-                        ))
+                        let order = column_order(database, &target_enc[0].table)?;
+                        let mut at = Vec::new();
+                        for c in &target_enc {
+                            match order.iter().position(|n| n.eq_ignore_ascii_case(&c.column)) {
+                                Some(k) => at.push((k, *c)),
+                                None => {
+                                    return Err(format!(
+                                        "0A000: name the columns when inserting into \"{}\": its encrypted column \"{}\" is not among its columns as they stand",
+                                        c.table, c.column
+                                    ))
+                                }
+                            }
+                        }
+                        at
                     }
                 };
                 if !positions.is_empty() {
@@ -578,8 +590,11 @@ fn analyze(all: &[Col], sql: &str, mode: Mode, database: Option<&Database>) -> R
                             }
                         }
                         for (k, c) in &positions {
-                            let Some(&(a, b)) = items.get(*k) else { return Err("42601: a VALUES tuple has fewer values than columns".into()) };
-                            value(&t, a, b, c, mode, &mut an)?;
+                            // A shorter tuple leaves the rest to their
+                            // defaults (an encrypted column has none: NULL).
+                            if let Some(&(a, b)) = items.get(*k) {
+                                value(&t, a, b, c, mode, &mut an)?;
+                            }
                         }
                         j = close + 1;
                         if t.get(j).is_some_and(|x| x.is(',') && x.depth == 0) {
@@ -680,10 +695,24 @@ fn value(t: &[Tok], a: usize, b: usize, c: &Col, mode: Mode, an: &mut Analysis) 
             an.encrypt.push((c.clone(), a));
             Ok(())
         }
-        (K::Word, _) if v.kw("NULL") => Ok(()),
+        (K::Word, _) if v.kw("NULL") || v.kw("DEFAULT") => Ok(()),
         (K::Param, Mode::Raw) => Ok(()),
         _ => Err(refuse(&label, "its value must be a literal or NULL")),
     }
+}
+
+/// The columns a positional `INSERT INTO table VALUES (…)` fills, in order:
+/// the visible ones by write order, without a ledger table's hidden stamp.
+/// Without the database to ask, nothing can be placed: refused.
+fn column_order(database: Option<&Database>, table: &str) -> Result<Vec<String>, String> {
+    let refuse = || format!("0A000: name the columns when inserting into \"{table}\": it has encrypted columns, encrypted by position");
+    let db = database.ok_or_else(refuse)?;
+    let relation = db.relation(table).ok_or_else(refuse)?;
+    Ok(rasterizeddb_core::core::rql::nullable::visible_fields(&relation.schema().fields)
+        .into_iter()
+        .map(|f| f.name)
+        .filter(|n| !n.eq_ignore_ascii_case(rasterizeddb_core::core::ledger_hooks::LEDGER_TS))
+        .collect())
 }
 
 /// `CREATE [TEMP…] [LEDGER] TABLE name ( … col TYPE ENCRYPTED WITH VAULT v
@@ -886,8 +915,8 @@ impl ColumnCrypto for Cipher {
         cols(store).map_or(true, |c| c.iter().any(|c| low.contains(&c.table.to_ascii_lowercase())))
     }
 
-    fn guard(&self, store: &str, sql: &str) -> Result<(), String> {
-        analyze(&cols(store)?, sql, Mode::Raw, None).map(drop)
+    fn guard(&self, database: &Database, sql: &str) -> Result<(), String> {
+        analyze(&cols(&database.ledger_store())?, sql, Mode::Raw, Some(database)).map(drop)
     }
 
     fn plan(&self, database: &Database, sql: &str) -> Result<Option<Plan>, String> {
