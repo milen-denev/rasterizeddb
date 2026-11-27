@@ -1853,27 +1853,41 @@ impl Session {
             let (target, needs, tkey) = match self.decide_extended(&map, batch).await {
                 Ok(v) => v,
                 Err((code, msg)) => {
+                    // A fan-out whose parts were refused for a moving map
+                    // goes again, as a routed statement does.
+                    let mut ran = None;
                     // A join with small global tables, copied to the shards.
                     if let Some((small, merge, gather)) = self.pending_broadcast.take()
                         && sync
-                        && let Some(outcome) = self.broadcast_extended(conn, batch, &small, merge, &gather).await?
                     {
-                        return Ok(outcome);
+                        ran = self.broadcast_extended(conn, batch, &small, merge, &gather).await?;
                     }
                     // A join with a table on other shards, gathered.
-                    if let Some(tables) = self.pending_gather.take()
+                    if ran.is_none()
+                        && let Some(tables) = self.pending_gather.take()
                         && sync
-                        && let Some(outcome) = self.gather_extended(conn, batch, &tables).await?
                     {
-                        return Ok(outcome);
+                        ran = self.gather_extended(conn, batch, &tables).await?;
                     }
                     // A statement without a route key, alone in its batch:
                     // fanned out as a simple query would be.
-                    if let Some((merge, writes)) = self.pending_fanout.take()
+                    if ran.is_none()
+                        && let Some((merge, writes)) = self.pending_fanout.take()
                         && sync
-                        && let Some(outcome) = self.fan_out_extended(conn, batch, merge, writes).await?
                     {
-                        return Ok(outcome);
+                        ran = self.fan_out_extended(conn, batch, merge, writes).await?;
+                    }
+                    match ran {
+                        Some(Outcome::Retry) if attempt < retries => {
+                            self.core.counters.borrow_mut().retries += 1;
+                            continue;
+                        }
+                        Some(Outcome::Retry) => {
+                            self.error_ready("57P03", "the statement was refused for a moving range too many times; try again");
+                            return Ok(Outcome::Done { error: true });
+                        }
+                        Some(outcome) => return Ok(outcome),
+                        None => {}
                     }
                     // A prepared multi-row INSERT is split by row.
                     if code == "0A000"

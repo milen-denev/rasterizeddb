@@ -8,6 +8,7 @@
 //!                       --table TABLE:COLUMN [--table …] --fenced|--online
 //! rdb-shard rollback    --map NEW_MAP --out MAP --state STATE
 //! rdb-shard retire      --map NEW_MAP --state STATE [--retention-hours 24] [--force]
+//! rdb-shard resume      --state STATE [--out MAP]   (a hand-off left half done, finished)
 //! rdb-shard rebalance   --map MAP [--tolerance 0.10] [--max-moves 4] [--max-bytes N]
 //!                       [--pin LO:HI …] [--exclude SHARD …]
 //!                       [--apply --fenced|--online --out NEW_MAP --state-dir DIR
@@ -193,6 +194,7 @@ async fn run(args: &Args) -> std::result::Result<(), String> {
         "move-tenant" => move_tenant(args, &options).await,
         "rollback" => rollback(args, &options).await,
         "retire" => retire(args, &options).await,
+        "resume" => resume(args, &options).await,
         "rebalance" if args.opt("every").is_some() => rebalance_forever(args, &options).await,
         "rebalance" => rebalance(args, &options).await,
         // For a test to ask whether this build injects failures.
@@ -665,6 +667,12 @@ async fn move_tenant(args: &Args, options: &Options) -> std::result::Result<(), 
     let out = args.one("out")?;
     let state_path = args.one("state")?;
     if std::path::Path::new(state_path).exists() {
+        if MoveState::read(state_path)?.get("status")? == HANDING_OFF {
+            let next = resume_hand_off(state_path, options).await?;
+            write_map(out, &next)?;
+            println!("finished the hand-off recorded in {state_path}: map epoch {} on every shard, written to {out}", next.epoch());
+            return Ok(());
+        }
         return Err(format!("{state_path} exists: a move is already recorded there"));
     }
     let tenant = Tenant {
@@ -736,7 +744,7 @@ async fn move_tenant(args: &Args, options: &Options) -> std::result::Result<(), 
     };
     // Hand off: the tenant's block on the destination, one epoch up.
     let next = map.reassign(block, block + 1, to)?;
-    let state = MoveState {
+    let mut state = MoveState {
         fields: BTreeMap::from([
             ("key".to_string(), tenant.text.clone()),
             ("key_type".to_string(), format!("{:?}", tenant.family).to_ascii_lowercase()),
@@ -745,18 +753,22 @@ async fn move_tenant(args: &Args, options: &Options) -> std::result::Result<(), 
             ("block".to_string(), format!("{block:#x}")),
             ("epoch".to_string(), next.epoch().to_string()),
             ("moved_at".to_string(), now_secs().to_string()),
-            ("status".to_string(), "moved".to_string()),
+            ("status".to_string(), if engine { HANDING_OFF } else { "moved" }.to_string()),
         ]),
         tables: copied,
     };
+    if engine {
+        write_signed(args, &handoff_map(state_path), &next)?;
+    }
     state.write(state_path)?;
     for (id, c) in [(from, &src), (to, &dst)] {
         Identity::of(&next, id).write(c).await.map_err(|e| format!("shard {id}: {e}"))?;
     }
     let sig = write_signed(args, out, &next)?;
     if engine {
-        finish_move(&src, &dst, &next, sig.as_deref(), block, block + 1).await?;
-        install_on_the_rest(&next, sig.as_deref(), options, &[from, to]).await?;
+        hand_off(&next, sig.as_deref(), options, (from, to), block, block + 1).await.map_err(|e| unfinished(&e, state_path))?;
+        state.fields.insert("status".to_string(), "moved".to_string());
+        state.write(state_path)?;
         println!(
             "moved to shard {to}; map epoch {} installed on both shards and written to {out}. Reload every router \
              and gateway; the source's rows stay unread until it is restarted or retired.",
@@ -978,6 +990,30 @@ async fn apply_moves(
     let out = args.one("out")?;
     let dir = args.one("state-dir")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
+    // An earlier run's hand-off left half done: finished first, and the run
+    // stops there, since the map it was given predates it.
+    let mut unfinished_states: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| format!("{dir}: {e}"))?
+        .filter_map(|e| e.ok().map(|e| e.path().to_string_lossy().into_owned()))
+        .filter(|p| p.ends_with(".state"))
+        .filter(|p| MoveState::read(p).is_ok_and(|s| s.fields.get("status").map(String::as_str) == Some(HANDING_OFF)))
+        .collect();
+    unfinished_states.sort();
+    if !unfinished_states.is_empty() {
+        let mut last = None;
+        for path in &unfinished_states {
+            last = Some(resume_hand_off(path, options).await?);
+        }
+        let map = last.expect("one at least");
+        write_map(out, &map)?;
+        println!(
+            "finished {} hand-off(s) an earlier run left half done; map epoch {} written to {out}. Nothing else \
+             was moved: run again to plan from that map",
+            unfinished_states.len(),
+            map.epoch()
+        );
+        return Ok(());
+    }
     let tables: Vec<(String, String, String)> = match args.flags.get("table") {
         // Without --table, every partitioned table a shard holds.
         None => {
@@ -1058,7 +1094,8 @@ async fn apply_moves(
             Err(e) => return Err(undo_move(engine, &src, &dst, (mv.from, mv.to), mv.lo, mv.hi, &filters, e).await),
         };
         let next = current.reassign(mv.lo, mv.hi, mv.to)?;
-        let state = MoveState {
+        let state_path = format!("{dir}/move-{}-{n}.state", next.epoch());
+        let mut state = MoveState {
             fields: BTreeMap::from([
                 ("kind".to_string(), "range".to_string()),
                 ("lo".to_string(), format!("{:#x}", mv.lo)),
@@ -1067,18 +1104,22 @@ async fn apply_moves(
                 ("to".to_string(), mv.to.to_string()),
                 ("epoch".to_string(), next.epoch().to_string()),
                 ("moved_at".to_string(), now_secs().to_string()),
-                ("status".to_string(), "moved".to_string()),
+                ("status".to_string(), if engine { HANDING_OFF } else { "moved" }.to_string()),
             ]),
             tables: copied,
         };
-        state.write(&format!("{dir}/move-{}-{n}.state", next.epoch()))?;
+        if engine {
+            write_signed(args, &handoff_map(&state_path), &next)?;
+        }
+        state.write(&state_path)?;
         for (id, c) in [(mv.from, &src), (mv.to, &dst)] {
             Identity::of(&next, id).write(c).await.map_err(|e| format!("shard {id}: {e}"))?;
         }
         let sig = write_signed(args, out, &next)?;
         if engine {
-            finish_move(&src, &dst, &next, sig.as_deref(), mv.lo, mv.hi).await?;
-            install_on_the_rest(&next, sig.as_deref(), options, &[mv.from, mv.to]).await?;
+            hand_off(&next, sig.as_deref(), options, (mv.from, mv.to), mv.lo, mv.hi).await.map_err(|e| unfinished(&e, &state_path))?;
+            state.fields.insert("status".to_string(), "moved".to_string());
+            state.write(&state_path)?;
         }
         current = next;
     }
@@ -1452,8 +1493,9 @@ async fn undo_move(
 }
 
 /// A test's failure injected at `point` for `what`
-/// (`RDB_SHARD_FAIL=<point>:<what>[:exit]`): an error, or with `:exit` the
-/// process gone at once, as if killed, with nothing undone. Only with the
+/// (`RDB_SHARD_FAIL=<point>:<what>[:exit|:sleep<ms>]`): an error; with
+/// `:exit` the process gone at once, as if killed, with nothing undone;
+/// with `:sleep<ms>` a pause there and nothing else. Only with the
 /// `fault_points` feature, which no release build has; otherwise nothing.
 #[cfg(not(feature = "fault_points"))]
 fn fail_point(_point: &str, _what: &str) -> std::result::Result<(), String> {
@@ -1469,9 +1511,17 @@ fn fail_point(point: &str, what: &str) -> std::result::Result<(), String> {
     if it.next() != Some(point) || it.next() != Some(what) {
         return Ok(());
     }
-    if it.next() == Some("exit") {
-        eprintln!("rdb-shard: RDB_SHARD_FAIL={spec}: exiting");
-        std::process::exit(9);
+    match it.next() {
+        Some("exit") => {
+            eprintln!("rdb-shard: RDB_SHARD_FAIL={spec}: exiting");
+            std::process::exit(9);
+        }
+        Some(pause) if pause.starts_with("sleep") => {
+            let ms: u64 = pause["sleep".len()..].parse().map_err(|_| format!("RDB_SHARD_FAIL={spec}: sleep<ms>"))?;
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            return Ok(());
+        }
+        _ => {}
     }
     Err(format!("RDB_SHARD_FAIL={spec}: failing on purpose"))
 }
@@ -1495,6 +1545,7 @@ async fn begin_move(args: &Args, src: &Client, dst: &Client, lo: u64, hi: u64) -
     if engine {
         clear_leftovers(dst, lo, hi).await?;
         src.run(&format!("SHARD FENCE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("fencing the source: {e}"))?;
+        drain_writers(src).await?;
         if let Err(e) = dst.run(&format!("SHARD TAKE RANGE {lo:#x} {hi:#x}")).await {
             let _ = src.run(&format!("SHARD UNFENCE RANGE {lo:#x} {hi:#x}")).await;
             return Err(format!("taking the range on the destination: {e}"));
@@ -1505,6 +1556,49 @@ async fn begin_move(args: &Args, src: &Client, dst: &Client, lo: u64, hi: u64) -
             .to_string());
     }
     Ok(engine)
+}
+
+/// How long [`drain_writers`] waits for the source's transactions to end.
+const DRAIN_WRITERS: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// After the source is fenced: every transaction that was running there
+/// waited out. The fence refuses a row's stamp, so a transaction that
+/// stamped one in the blocks before it may still commit after it; one
+/// that commits after the last round's read had its row left on the
+/// source, unread once the span is given up. A transaction begun after
+/// the fence cannot stamp there, so waiting until the oldest running one
+/// is newer than the fence (`SHOW DATABASE STATS`: `next_transaction_id`
+/// read once, `oldest_active_transaction` until it passes it) is enough.
+/// Each read is a statement of its own, younger than that mark, so it
+/// never waits for itself. Asked here rather than inside `SHARD FENCE`,
+/// whose own transaction runs until it answers.
+async fn drain_writers(src: &Client) -> std::result::Result<(), String> {
+    let stat = |name: &'static str| async move {
+        let rows = src.run("SHOW DATABASE STATS").await.map_err(|e| format!("reading the source's transactions: {e}"))?;
+        for r in rows.iter() {
+            if r.get::<String>(0).is_ok_and(|m| m == name) {
+                let v: String = r.get(1).map_err(|e| e.to_string())?;
+                return v.trim().parse::<u64>().map_err(|_| format!("the source's {name} is {v:?}"));
+            }
+        }
+        Err(format!("the source's SHOW DATABASE STATS has no {name}"))
+    };
+    let mark = stat("next_transaction_id").await?;
+    let deadline = std::time::Instant::now() + DRAIN_WRITERS;
+    loop {
+        let oldest = stat("oldest_active_transaction").await?;
+        if oldest >= mark {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "transaction {oldest} on the source was still running {}s after the fence, and may have written to the \
+                 moved blocks: end it and retry",
+                DRAIN_WRITERS.as_secs()
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
 }
 
 /// How many changed rows an unfenced round may still find before the
@@ -1532,6 +1626,7 @@ async fn online_tail(src: &Client, dst: &Client, tables: &[(String, String)], lo
     let started = std::time::Instant::now();
     src.run(&format!("SHARD FENCE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("fencing the source: {e}"))?;
     let finish = async {
+        drain_writers(src).await?;
         let mut changed = 0;
         for (table, filter) in tables {
             changed += sync_table(src, dst, table, filter).await?;
@@ -1618,38 +1713,131 @@ async fn sync_table(src: &Client, dst: &Client, table: &str, filter: &str) -> st
     Ok(changed)
 }
 
-/// After a verified copy, on shards: the new map installed on both, the
-/// source's span given up (its rows kept, unread), its fence lifted.
-async fn finish_move(
-    src: &Client,
-    dst: &Client,
+/// A move state's status between its verified copy and the end of its
+/// hand-off: recorded before the first map install, so a run that stops
+/// anywhere in the hand-off leaves it to be finished
+/// ([`resume_hand_off`]), never a map on some shards and not others for
+/// good.
+const HANDING_OFF: &str = "handing-off";
+
+/// Where a hand-off's new map (and its signature) is kept beside its state.
+fn handoff_map(state_path: &str) -> String {
+    format!("{state_path}.map")
+}
+
+/// A hand-off error, with how to finish it.
+fn unfinished(e: &str, state_path: &str) -> String {
+    format!(
+        "{e}. The copy is verified and the source still fenced, so the hand-off can be finished: run \
+         `rdb-shard resume --state {state_path}` (or the same command again, which finishes it first)"
+    )
+}
+
+/// The map epoch shard `c` has installed (its `SHOW SHARDS` row).
+async fn installed_epoch(c: &Client) -> std::result::Result<u64, String> {
+    let rows = c.run("SHOW SHARDS").await.map_err(|e| e.to_string())?;
+    for r in rows.iter() {
+        if r.get::<bool>(1).unwrap_or(false) {
+            let epoch: i64 = r.get(6).map_err(|e| e.to_string())?;
+            return Ok(epoch as u64);
+        }
+    }
+    Err("SHOW SHARDS has no row for the shard itself".to_string())
+}
+
+/// Installs `next` on `c` unless it already has it. A shard past it means
+/// a later map was made after this hand-off began: finishing it now would
+/// undo that one, so it is refused.
+async fn install_once(c: &Client, who: &str, next: &ShardMap, signed: &str) -> std::result::Result<(), String> {
+    let at = installed_epoch(c).await.map_err(|e| format!("reading the {who}'s map epoch: {e}"))?;
+    if at > next.epoch() {
+        return Err(format!(
+            "the {who} is at map epoch {at}, past this hand-off's {}: a later move overtook it; check the cluster by hand",
+            next.epoch()
+        ));
+    }
+    if at == next.epoch() {
+        return Ok(());
+    }
+    let text = next.to_text().replace('\'', "''");
+    c.run(&format!("SHARD MAP INSTALL '{text}'{signed}")).await.map(drop).map_err(|e| format!("installing the map on the {who}: {e}"))
+}
+
+/// After a verified copy, on shards: the new map installed on the
+/// destination, then the source, then every other shard; then the source's
+/// span given up (its rows kept, unread) and its fence lifted.
+/// Each step is done only if it is not already, so a hand-off that stopped
+/// anywhere is finished by running this again ([`resume_hand_off`]).
+async fn hand_off(
     next: &ShardMap,
     signature: Option<&str>,
+    options: &Options,
+    (from, to): (ShardId, ShardId),
     lo: u64,
     hi: u64,
 ) -> std::result::Result<(), String> {
-    let text = next.to_text().replace('\'', "''");
     let signed = signature.map(|s| format!(" SIGNATURE '{s}'")).unwrap_or_default();
-    for (who, c) in [("destination", dst), ("source", src)] {
-        c.run(&format!("SHARD MAP INSTALL '{text}'{signed}")).await.map_err(|e| format!("installing the map on the {who}: {e}"))?;
-    }
+    let dst = connect(next, to, options).await?;
+    let src = connect(next, from, options).await?;
+    install_once(&dst, "destination", next, &signed).await?;
+    fail_point("after-install", "destination")?;
+    install_once(&src, "source", next, &signed).await?;
+    // Every shard on the new map before the source's span closes: until the
+    // last has it, a gateway that has it is refused there and waits, so
+    // the span's reopen (one per partitioned table) is kept out of that
+    // window. The source no longer owns the blocks by its map, so its
+    // fan-out parts skip them from its install on.
+    install_on_the_rest(next, signature, options, &[from, to]).await?;
     src.run(&format!("SHARD GIVE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("giving up the source's span: {e}"))?;
     src.run(&format!("SHARD UNFENCE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("unfencing the source: {e}"))?;
     Ok(())
 }
 
+/// Finishes the hand-off recorded in `state_path` (status `handing-off`):
+/// its map (kept beside the state) on every shard, the source's span given
+/// up and unfenced. Rolled forward, never back: the copy was verified with
+/// the source fenced, and the fence holds until this lifts it, so the
+/// destination's rows are the source's. Returns the map now in force.
+async fn resume_hand_off(state_path: &str, options: &Options) -> std::result::Result<ShardMap, String> {
+    let mut state = MoveState::read(state_path)?;
+    if state.get("status")? != HANDING_OFF {
+        return Err(format!("{state_path}: the move is {}, not a hand-off to finish", state.get("status")?));
+    }
+    let map_path = handoff_map(state_path);
+    let next = read_map(&map_path)?;
+    let signature = std::fs::read_to_string(format!("{map_path}.sig")).ok().map(|s| s.trim().to_string());
+    let (_, lo, hi) = state.selection()?;
+    let (from, to) = (state.shard("from")?, state.shard("to")?);
+    println!("finishing the hand-off in {state_path}: blocks [{lo:#x}, {hi:#x}) from shard {from} to shard {to}, map epoch {}", next.epoch());
+    hand_off(&next, signature.as_deref(), options, (from, to), lo, hi).await.map_err(|e| unfinished(&e, state_path))?;
+    state.fields.insert("status".to_string(), "moved".to_string());
+    state.write(state_path)?;
+    Ok(next)
+}
+
+/// `resume --state STATE`: finishes a hand-off a move left half done.
+async fn resume(args: &Args, options: &Options) -> std::result::Result<(), String> {
+    let state_path = args.one("state")?;
+    let next = resume_hand_off(state_path, options).await?;
+    if let Some(out) = args.opt("out") {
+        write_map(out, &next)?;
+    }
+    println!("hand-off finished: map epoch {} on every shard", next.epoch());
+    Ok(())
+}
+
 /// After a move, the new map on every shard but the two that took part
-/// (which [`finish_move`] gave it): a shard on the old map routes the moved
+/// (which [`hand_off`] gave it): a shard on the old map routes the moved
 /// range, and coordinates, as if nothing had moved, and a gateway whose home
 /// it is learns nothing from it. One that cannot be reached is named, not
 /// skipped: the move is done, and the map must still reach it.
 async fn install_on_the_rest(next: &ShardMap, signature: Option<&str>, options: &Options, done: &[ShardId]) -> std::result::Result<(), String> {
-    let text = next.to_text().replace('\'', "''");
     let signed = signature.map(|s| format!(" SIGNATURE '{s}'")).unwrap_or_default();
     let mut missed = Vec::new();
     for info in next.shards().iter().filter(|i| !done.contains(&i.id)) {
+        // Once: a hand-off finished again finds most of them at it already.
         let installed = match connect(next, info.id, options).await {
-            Ok(c) => c.run(&format!("SHARD MAP INSTALL '{text}'{signed}")).await.map(drop).map_err(|e| e.to_string()),
+            Ok(c) => install_once(&c, &format!("shard {}", info.id), next, &signed).await,
             Err(e) => Err(e),
         };
         if let Err(e) = installed {
