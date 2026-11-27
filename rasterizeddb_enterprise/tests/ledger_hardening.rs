@@ -163,6 +163,9 @@ async fn the_reviewed_holes_stay_closed() {
     drop(admin);
     db.shutdown().await.unwrap();
     rasterizeddb_enterprise::columns::forget_cached_keys();
+    // A new process knows only what is on disk: the hold must come back
+    // from the sidecar the rewrite wrote, not this process's memory.
+    rasterizeddb_enterprise::ledger::forget_process_state();
 
     let db = Builder::open(&data).worker_threads(2).password("admin", "adminpw").start().await.unwrap();
     let admin = db.connect().await.unwrap();

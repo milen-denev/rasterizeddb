@@ -57,6 +57,16 @@ pub fn statement(sql: &str) -> String {
     if let Some(kept) = kv_command(sql) {
         return kept;
     }
+    // A statement about a table with an encrypted column: its literals are
+    // the plaintext the column encrypts (`INSERT … VALUES (…, '123-45-6789')`),
+    // and every place that keeps the text kept them too.
+    if crate::core::column_crypto::names_any(sql) {
+        let blanked = blank_literals(sql);
+        return match earliest_secret(blanked.as_bytes()) {
+            Some((at, word)) => format!("{}{} <redacted>", &blanked[..at], word),
+            None => blanked,
+        };
+    }
     match earliest_secret(sql.as_bytes()) {
         Some((at, word)) => format!("{}{} <redacted>", &sql[..at], word),
         None => sql.to_string(),
@@ -78,6 +88,9 @@ pub fn statement(sql: &str) -> String {
 pub fn statement_bounded(sql: &str, max_chars: usize) -> String {
     if let Some(kept) = kv_command(sql) {
         return cut_chars(kept, max_chars);
+    }
+    if crate::core::column_crypto::names_any(sql) {
+        return cut_chars(statement(sql), max_chars);
     }
     // The byte where the `max_chars`-th character starts, if there is one.
     let cut = sql.char_indices().nth(max_chars).map(|(i, _)| i);
@@ -103,6 +116,90 @@ pub fn statement_bounded(sql: &str, max_chars: usize) -> String {
             }
         },
     }
+}
+
+/// `sql` with the text of every string literal replaced by `<redacted>`,
+/// its quotes kept: `'…'` (a doubled quote inside), `E'…'` (backslash
+/// escapes too) and `$tag$…$tag$`. A literal never closed is blanked to the
+/// end. Quoted identifiers (`"…"`) are kept.
+pub fn blank_literals(sql: &str) -> String {
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut copied = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                // An identifier: skipped whole, `""` inside it.
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'"' {
+                        if b.get(i + 1) == Some(&b'"') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'\'' => {
+                let escapes = i > 0 && matches!(b[i - 1], b'E' | b'e') && (i < 2 || !is_ident_byte(b[i - 2]));
+                out.push_str(&sql[copied..=i]);
+                let mut j = i + 1;
+                let mut closed = None;
+                while j < b.len() {
+                    match b[j] {
+                        b'\\' if escapes => j += 2,
+                        b'\'' if b.get(j + 1) == Some(&b'\'') => j += 2,
+                        b'\'' => {
+                            closed = Some(j);
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                out.push_str("<redacted>");
+                match closed {
+                    Some(end) => {
+                        out.push('\'');
+                        i = end + 1;
+                    }
+                    None => i = b.len(),
+                }
+                copied = i;
+            }
+            b'$' if i == 0 || !is_ident_byte(b[i - 1]) => {
+                // `$tag$`: a tag of identifier bytes (or none), then the body
+                // to the same tag. `$1` is a parameter, not a quote.
+                let mut t = i + 1;
+                while t < b.len() && is_ident_byte(b[t]) && !b[t].is_ascii_digit() {
+                    t += 1;
+                }
+                if t < b.len() && b[t] == b'$' {
+                    let tag = &sql[i..=t];
+                    out.push_str(&sql[copied..=t]);
+                    out.push_str("<redacted>");
+                    match sql[t + 1..].find(tag) {
+                        Some(at) => {
+                            out.push_str(tag);
+                            i = t + 1 + at + tag.len();
+                        }
+                        None => i = b.len(),
+                    }
+                    copied = i;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    if copied < b.len() {
+        out.push_str(&sql[copied..]);
+    }
+    out
 }
 
 /// A `KV …` statement (the key/value store's commands) reduced to its
@@ -545,6 +642,27 @@ mod tests {
     }
 
     /// A column that merely contains one of the words is not a secret.
+    /// Every kind of string literal is blanked, its quotes kept; identifiers,
+    /// parameters and the rest of the text are left as they are.
+    #[test]
+    fn literals_are_blanked_and_the_rest_kept() {
+        for (sql, want) in [
+            (
+                "INSERT INTO pt (id, ssn) VALUES (1, '123-45-6789'), ($1, $2)",
+                "INSERT INTO pt (id, ssn) VALUES (1, '<redacted>'), ($1, $2)",
+            ),
+            ("UPDATE pt SET ssn = 'o''brien' WHERE id = 1", "UPDATE pt SET ssn = '<redacted>' WHERE id = 1"),
+            (r"SELECT E'a\'b', 'c'", "SELECT E'<redacted>', '<redacted>'"),
+            ("SELECT $$x'y$$, $t$z$t$", "SELECT $$<redacted>$$, $t$<redacted>$t$"),
+            (r#"SELECT "it's" FROM "p""t" WHERE a = 'v'"#, r#"SELECT "it's" FROM "p""t" WHERE a = '<redacted>'"#),
+            ("SELECT 'never closed", "SELECT '<redacted>"),
+            ("SELECT 'ünï', 'çödé'", "SELECT '<redacted>', '<redacted>'"),
+            ("SELECT 1", "SELECT 1"),
+        ] {
+            assert_eq!(blank_literals(sql), want, "{sql}");
+        }
+    }
+
     #[test]
     fn an_ordinary_statement_is_left_alone() {
         for sql in [

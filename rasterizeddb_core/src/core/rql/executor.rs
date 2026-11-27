@@ -10619,6 +10619,17 @@ async fn execute_ledger_statement(sql: &str, database: &Arc<Database>, depth: us
     if verb == "ACKNOWLEDGE" && !superuser {
         return Err("42501: ACKNOWLEDGE LEDGER ROLLBACK needs a superuser".to_string());
     }
+    // A legal hold is set by the table's owner, and released only by a
+    // superuser: the owner is whom a hold may be about, and releasing it
+    // needed no more than owning the table.
+    if verb == "ALTER"
+        && !superuser
+        && words.windows(3).any(|w| {
+            w[0].eq_ignore_ascii_case("RELEASE") && w[1].eq_ignore_ascii_case("LEGAL") && w[2].eq_ignore_ascii_case("HOLD")
+        })
+    {
+        return Err("42501: RELEASE LEGAL HOLD needs a superuser".to_string());
+    }
     let names: Vec<String> = match named {
         Some(n) => vec![database.resolve_key(n).ok_or_else(|| format!("42P01: relation \"{n}\" does not exist"))?],
         None => database
@@ -10701,6 +10712,7 @@ async fn execute_ledger_statement(sql: &str, database: &Arc<Database>, depth: us
         let mut writes = crate::core::torn_tail::SidecarWrites::default();
         crate::core::ledger_hooks::policy_sidecar::stage(&*table.io_schema, &mut writes, record);
         writes.commit(&*table.io_schema).await.map_err(|e| e.to_string())?;
+        crate::core::ledger_hooks::records_written(&database.ledger_store(), std::slice::from_ref(record))?;
     }
     Ok(reply.lines)
 }

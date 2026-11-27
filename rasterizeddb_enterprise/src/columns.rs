@@ -66,6 +66,9 @@ static STORES: OnceLock<Mutex<HashMap<String, Store>>> = OnceLock::new();
 static PENDING: OnceLock<Mutex<HashMap<u64, (String, Pending)>>> = OnceLock::new();
 static DEKS: OnceLock<Mutex<HashMap<u128, crypto::Dek>>> = OnceLock::new();
 static TOKENS: AtomicU64 = AtomicU64::new(1);
+/// Whether any store read in this process has an encrypted column: what
+/// lets `names_any` answer every other statement with one load.
+static ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -151,6 +154,9 @@ fn cols(store: &str) -> Result<Vec<Col>, String> {
     if !s.loaded {
         s.cols = read_sidecar(store)?;
         s.loaded = true;
+        if !s.cols.is_empty() {
+            ANY.store(true, Ordering::Release);
+        }
     }
     Ok(s.cols.clone())
 }
@@ -173,6 +179,9 @@ fn edit_cols(store: &str, f: impl FnOnce(&mut Vec<Col>) -> bool) -> Result<(), S
 
 fn set_cols(store: &str, cols: Vec<Col>) -> Result<(), String> {
     write_sidecar(store, &cols)?;
+    if !cols.is_empty() {
+        ANY.store(true, Ordering::Release);
+    }
     let all = STORES.get_or_init(|| Mutex::new(HashMap::new()));
     all.lock().insert(store.to_string(), Store { loaded: true, cols });
     Ok(())
@@ -1056,6 +1065,17 @@ impl ColumnCrypto for Cipher {
 
     fn show_lines(&self, store: &str) -> Vec<String> {
         show_lines(store)
+    }
+
+    fn names_any(&self, sql: &str) -> bool {
+        if !ANY.load(Ordering::Acquire) {
+            return false;
+        }
+        let low = sql.to_ascii_lowercase();
+        let Some(all) = STORES.get() else { return false };
+        all.lock()
+            .values()
+            .any(|s| s.cols.iter().any(|c| low.contains(&c.table.to_ascii_lowercase())))
     }
 
     fn rename_table(&self, store: &str, from: &str, to: &str) {

@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use rasterizeddb_core::core::ledger_hooks::{LedgerReply, LedgerRequest};
 use rasterizeddb_core::core::row::schema::SpecialTable;
 
-use super::store::{self, Item, OP_DELETE, OP_EVENT, OP_INSERT, OP_UPDATE};
+use super::store::{self, Item, OP_DELETE, OP_EVENT, OP_INSERT, OP_POLICY, OP_UPDATE};
 use super::{LedgerGuard, anchor, clauses, clock, policy};
 
 /// Words, with quoted strings kept whole: `'…'` stays one word starting
@@ -142,6 +142,25 @@ fn verify(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<L
             }
         }
         let mut problems: Vec<String> = Vec::new();
+        // Every policy record the chain holds a hash of is in the table's
+        // policy (as its sidecar was read, and what this process added): a
+        // record cut from the end of the sidecar read as an interrupted
+        // append, and its hold or raised retention was gone unnoticed.
+        {
+            let mut bytes = table.ledger_policy.clone();
+            bytes.extend_from_slice(&g.overlay.read().get(&policy.id).cloned().unwrap_or_default());
+            let held: HashSet<store::Hash> =
+                super::policy::payloads(&bytes).unwrap_or_default().into_iter().map(store::policy_leaf).collect();
+            let cut = read
+                .entries
+                .iter()
+                .flat_map(|e| e.items.iter())
+                .filter(|i| i.op == OP_POLICY && i.ledger == policy.id && !held.contains(&i.leaf))
+                .count();
+            if cut > 0 {
+                problems.push(format!("{cut} policy change(s) in the chain are missing from its policy sidecar: cut from it"));
+            }
+        }
         let mut matched = 0u64;
         let mut seen = HashSet::new();
         for (ts, cells) in rows {
@@ -461,13 +480,16 @@ fn alter(
     all.extend_from_slice(&g.overlay.read().get(&current.id).cloned().unwrap_or_default());
     all.extend_from_slice(&record);
     policy::fold(&all, table.special).map_err(|e| format!("55000: {e}"))?;
-    // The change joins the chain, so it is as tamper-evident as the rows.
+    // The change joins the chain, so it is as tamper-evident as the rows:
+    // its description, and the record's own hash, which VERIFY finds in
+    // the policy sidecar or reports cut from it. Chained, and put in force
+    // here, once core has written the record (`records_written`).
     let text = format!("{}: {event} by {}", table.name, if req.role.is_empty() { "?" } else { req.role });
-    let item = Item { op: OP_EVENT, ledger: current.id, row_ts: now, width: 0, leaf: store::event_leaf(&text) };
-    let chain = store::chain(store_key)?;
-    let hash = chain.lock().append(0, &[item])?;
-    anchor::note_append(store_key, &chain, hash);
-    g.overlay.write().entry(current.id).or_default().extend_from_slice(&record);
+    let items = vec![
+        Item { op: OP_EVENT, ledger: current.id, row_ts: now, width: 0, leaf: store::event_leaf(&text) },
+        Item { op: OP_POLICY, ledger: current.id, row_ts: now, width: 0, leaf: store::policy_leaf(&payload) },
+    ];
+    g.stash_policy_record(store_key, current.id, record.clone(), items);
     Ok(LedgerReply { lines: vec![text], records: vec![(table.name.clone(), record)], inserts: Vec::new() })
 }
 

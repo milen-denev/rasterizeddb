@@ -53,6 +53,10 @@ pub const OP_EVENT: u8 = 3;
 /// A new version of a row of a versioned ledger table: its stamp, and the
 /// new version's width and leaf.
 pub const OP_UPDATE: u8 = 4;
+/// A record added to a table's policy (`ALTER LEDGER TABLE`): its leaf is
+/// the record's payload hash ([`policy_leaf`]), chained once the record is
+/// written, so VERIFY finds a record cut from the policy sidecar.
+pub const OP_POLICY: u8 = 5;
 
 pub type Hash = [u8; 32];
 
@@ -106,6 +110,11 @@ pub fn leaf_upto(ledger: u128, row_ts: i64, width: u32, cells: &[(u32, &[u8])]) 
         buf.extend_from_slice(bytes);
     }
     sha256(&[&buf])
+}
+
+/// A policy record's leaf: a hash of its payload.
+pub fn policy_leaf(payload: &str) -> Hash {
+    sha256(&[b"rdb-policy-v1", payload.as_bytes()])
 }
 
 /// An event's leaf: a hash of its text.

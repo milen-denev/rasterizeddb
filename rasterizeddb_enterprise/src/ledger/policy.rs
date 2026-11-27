@@ -138,7 +138,7 @@ pub fn record(payload: &str) -> Vec<u8> {
 
 /// Splits `bytes` into record payloads. A torn last record (a crash during
 /// an append) is dropped. Anything else that does not frame is damage.
-fn payloads(bytes: &[u8]) -> Result<Vec<&str>, String> {
+pub(crate) fn payloads(bytes: &[u8]) -> Result<Vec<&str>, String> {
     let mut out = Vec::new();
     let mut at = 0;
     while at < bytes.len() {

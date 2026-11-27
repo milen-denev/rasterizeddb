@@ -48,6 +48,10 @@ pub struct LedgerGuard {
     /// commit (`(store, vault id, line)`): audited as they ran, a SET or
     /// DELETE a ROLLBACK undid stayed in the audit as done.
     audits: Mutex<HashMap<TxId, Vec<(String, u128, String)>>>,
+    /// Policy records an `ALTER LEDGER TABLE` returned, by their bytes: the
+    /// chain items for each and its ledger id, chained and put in force
+    /// once core has written the record (`records_written`).
+    policy_pending: Mutex<HashMap<Vec<u8>, (String, u128, Vec<Item>)>>,
 }
 
 fn what(table: &TableSchema) -> &'static str {
@@ -72,7 +76,13 @@ impl LedgerGuard {
             overlay: RwLock::new(HashMap::new()),
             anchors_of: RwLock::new(HashMap::new()),
             audits: Mutex::new(HashMap::new()),
+            policy_pending: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Holds `record`'s chain items until core has written it.
+    pub(crate) fn stash_policy_record(&self, store_key: &str, ledger: u128, record: Vec<u8>, items: Vec<Item>) {
+        self.policy_pending.lock().insert(record, (store_key.to_string(), ledger, items));
     }
 
     /// The anchors `policy` names now, for the commits of its rows: on every
@@ -304,6 +314,22 @@ impl LedgerHooks for LedgerGuard {
         ids.iter().any(|id| pending.contains_key(id) || audits.contains_key(id))
     }
 
+    fn records_written(&self, store_key: &str, records: &[Vec<u8>]) -> Result<(), String> {
+        for record in records {
+            let Some((store, ledger, items)) = self.policy_pending.lock().remove(record) else { continue };
+            if store != store_key {
+                continue;
+            }
+            // In force in this process from now (the open table's schema
+            // holds the bytes it was opened with).
+            self.overlay.write().entry(ledger).or_default().extend_from_slice(record);
+            let chain = store::chain(store_key)?;
+            let hash = chain.lock().append(0, &items).map_err(|e| format!("55000: the policy change is recorded but could not be chained ({e})"))?;
+            anchor::note_append(store_key, &chain, hash);
+        }
+        Ok(())
+    }
+
     fn pending_mark(&self, tx: TxId) -> usize {
         self.pending.lock().get(&tx).map_or(0, Vec::len)
     }
@@ -411,6 +437,19 @@ pub fn install() -> Result<(), String> {
 /// The guard [`install`] put in place: the vault and the column cipher read
 /// policies through it, so they see what an `ALTER` changed in this process.
 static GUARD: std::sync::OnceLock<&'static LedgerGuard> = std::sync::OnceLock::new();
+
+/// Forgets what the guard learned in this process (folded policies, the
+/// records `ALTER LEDGER TABLE` added, statements in flight), as a new
+/// process would not have it: for tests that reopen a database in the same
+/// process, where the overlay otherwise stood in for the sidecar.
+#[doc(hidden)]
+pub fn forget_process_state() {
+    if let Some(g) = GUARD.get() {
+        g.overlay.write().clear();
+        g.policies.write().clear();
+        g.policy_pending.lock().clear();
+    }
+}
 
 pub(crate) fn guard() -> Option<&'static LedgerGuard> {
     GUARD.get().copied()

@@ -141,6 +141,15 @@ pub trait LedgerHooks: Send + Sync + 'static {
     /// Forgets anything `tx` left pending (it aborted).
     fn discard(&self, tx: TxId);
 
+    /// The policy records a ledger statement returned were written to their
+    /// sidecars: what the statement chains for them, and the change it makes
+    /// to the policy in force, happen now, after the record is on disk, not
+    /// before (a crash between left a chained change with no record, which
+    /// VERIFY could not tell from a record cut from the sidecar).
+    fn records_written(&self, _store: &str, _records: &[Vec<u8>]) -> Result<(), String> {
+        Ok(())
+    }
+
     /// How many items `tx` has pending: a mark [`Self::rewind_pending`] goes
     /// back to.
     fn pending_mark(&self, _tx: TxId) -> usize {
@@ -210,6 +219,9 @@ impl<T: LedgerHooks> LedgerHooks for &'static T {
     }
     fn pending_mark(&self, tx: TxId) -> usize {
         (**self).pending_mark(tx)
+    }
+    fn records_written(&self, store: &str, records: &[Vec<u8>]) -> Result<(), String> {
+        (**self).records_written(store, records)
     }
     fn rewind_pending(&self, tx: TxId, mark: usize) {
         (**self).rewind_pending(tx, mark)
@@ -354,6 +366,14 @@ pub fn database_opened(store: &str) {
 
 /// [`LedgerHooks::discard`]; a no-op without installed hooks.
 #[inline]
+/// See [`LedgerHooks::records_written`].
+pub fn records_written(store: &str, records: &[Vec<u8>]) -> Result<(), String> {
+    match HOOKS.get() {
+        Some(h) => h.records_written(store, records),
+        None => Ok(()),
+    }
+}
+
 /// See [`LedgerHooks::pending_mark`]; 0 without installed hooks.
 pub fn pending_mark(tx: TxId) -> usize {
     HOOKS.get().map_or(0, |h| h.pending_mark(tx))

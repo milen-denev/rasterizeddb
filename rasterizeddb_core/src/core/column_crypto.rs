@@ -83,6 +83,14 @@ pub trait ColumnCrypto: Send + Sync + 'static {
     /// rollback (`block_ddl::set_aside`, `rename_back`). Its columns follow
     /// it, so the new table neither inherits nor clobbers them.
     fn rename_table(&self, _store: &str, _from: &str, _to: &str) {}
+    /// Whether `sql` names a table with an encrypted column in any store
+    /// this process has read: its literals are then the plaintext the
+    /// client sent, and are blanked wherever the statement's text is kept
+    /// (`redact::statement`: the log, `SHOW QUERIES`). Cheap when no store
+    /// has one.
+    fn names_any(&self, _sql: &str) -> bool {
+        false
+    }
 }
 
 static HOOKS: OnceLock<Box<dyn ColumnCrypto>> = OnceLock::new();
@@ -149,6 +157,11 @@ pub fn finish(database: &Database, token: u64, ok: bool) {
     if let Some(h) = hooks() {
         h.finish(&database.ledger_store(), token, ok);
     }
+}
+
+/// See [`ColumnCrypto::names_any`]; false without the hooks.
+pub fn names_any(sql: &str) -> bool {
+    hooks().is_some_and(|h| h.names_any(sql))
 }
 
 /// See [`ColumnCrypto::rename_table`].
