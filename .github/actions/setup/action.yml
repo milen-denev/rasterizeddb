@@ -45,6 +45,10 @@ runs:
 
     - name: Windows ARM64 - Dev Drive for the temp directory
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
+      # The action itself sometimes crashes on the runner (2026-11-27:
+      # "Internal CLR error (0x80131506)"); without the drive the job only
+      # runs slower, with TEMP left where it was.
+      continue-on-error: true
       uses: samypr100/setup-dev-drive@v4.1.0
       with:
         drive-size: 40GB
