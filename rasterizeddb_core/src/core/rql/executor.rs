@@ -10635,7 +10635,7 @@ async fn execute_ledger_statement(sql: &str, database: &Arc<Database>, depth: us
         None => database
             .relation_names()
             .into_iter()
-            .filter(|n| database.relation(n).is_some_and(|r| r.schema().special.is_special()))
+            .filter(|n| database.schema_view(n).is_some_and(|r| r.schema().special.is_special()))
             .collect(),
     };
     if let (Some(privilege), false) = (needs, superuser) {
@@ -10654,9 +10654,16 @@ async fn execute_ledger_statement(sql: &str, database: &Arc<Database>, depth: us
             }
         }
     }
+    // Held for the statement: a policy change (holds, retention) is not
+    // raced by a write it would refuse, and the rows read are the table's.
+    let mode = match verb.as_str() {
+        "ALTER" | "ACKNOWLEDGE" => crate::core::mvcc::table_locks::TableMode::Share,
+        "VAULT" => crate::core::mvcc::table_locks::TableMode::RowExclusive,
+        _ => crate::core::mvcc::table_locks::TableMode::AccessShare,
+    };
     let mut held = Vec::new();
     for name in &names {
-        let Some(relation) = database.relation(name) else { continue };
+        let Some(relation) = database.relation_for(name, crate::core::mvcc::owner::ensure(), mode).await? else { continue };
         let kind = relation.schema().special;
         if !kind.is_special() || (verb == "VAULT" && kind != crate::core::row::schema::SpecialTable::Vault) {
             return Err(format!(
@@ -10743,7 +10750,7 @@ fn special_create(
     // the hooks for nothing: the policy would open a vault's key provider,
     // and `mlkem:…;create` made a key file no vault would ever use.
     if split.create_sql.starts_with("CREATE TABLE IF NOT EXISTS ")
-        && database.relation(&crate::core::sql_scan::bare_name(&split.name)).is_some()
+        && database.schema_view(&crate::core::sql_scan::bare_name(&split.name)).is_some()
     {
         return Ok((QueryPurpose::CreateTable(split.create_sql), None));
     }
@@ -10811,8 +10818,8 @@ async fn execute_truncate(database: &Arc<Database>, sql: &str, depth: usize, tx:
     // only if its policy admits it (`ledger_hooks`), before anything is
     // locked or deleted.
     for name in &tables {
-        if let Some(relation) = database.relation(name) {
-            if let Err(e) = crate::core::ledger_hooks::admit(relation.schema(), crate::core::ledger_hooks::WriteKind::Truncate) {
+        if let Some(view) = database.schema_view(name) {
+            if let Err(e) = crate::core::ledger_hooks::admit(view.schema(), crate::core::ledger_hooks::WriteKind::Truncate) {
                 return ddl_error(&e);
             }
         }

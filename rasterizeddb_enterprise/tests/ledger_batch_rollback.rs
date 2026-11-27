@@ -38,8 +38,8 @@ async fn a_failed_batch_takes_its_vault_and_ledger_ddl_with_it() {
     let key = root.path().join("kek");
     std::fs::write(&key, "33".repeat(32)).unwrap();
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&key, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
     }
     rasterizeddb_enterprise::install_always().unwrap();
     let db = Builder::open(&data).worker_threads(2).password("admin", "adminpw").start().await.unwrap();

@@ -42,8 +42,8 @@ async fn the_reviewed_holes_stay_closed() {
     let key_b = root.path().join("kek-b");
     for (k, byte) in [(&key_a, "66"), (&key_b, "77")] {
         std::fs::write(k, byte.repeat(32)).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(k, std::fs::Permissions::from_mode(0o600)).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(k, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
     }
     rasterizeddb_enterprise::install_always().unwrap();
     let db = Builder::open(&data).worker_threads(2).password("admin", "adminpw").start().await.unwrap();

@@ -41,8 +41,8 @@ async fn ledger_tables_and_vaults() {
     let key = root.path().join("kek");
     std::fs::write(&key, "11".repeat(32)).unwrap();
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&key, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
     }
 
     // As an application does: the licensed hooks before the engine opens.

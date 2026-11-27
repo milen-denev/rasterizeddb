@@ -21,8 +21,8 @@ fn key_file(root: &std::path::Path) -> std::path::PathBuf {
     let key = root.join("kek");
     if !key.exists() {
         std::fs::write(&key, "44".repeat(32)).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&key, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
     }
     key
 }
