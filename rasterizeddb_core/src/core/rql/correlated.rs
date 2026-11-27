@@ -703,7 +703,7 @@ fn rewrite_write_where_inner(
             let calls = (0..bytes.len()).any(|i| {
                 bytes[i] == b'(' && {
                     let before = term[..i].trim_end();
-                    let word_at = before.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |p| p + 1);
+                    let word_at = before.char_indices().rev().find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |(p, c)| p + c.len_utf8());
                     let word = &before[word_at..];
                     !word.is_empty()
                         && !["IN", "AND", "OR", "NOT", "CAST"].iter().any(|k| word.eq_ignore_ascii_case(k))

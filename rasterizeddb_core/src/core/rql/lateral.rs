@@ -1903,7 +1903,7 @@ fn names_bare(text: &str, name: &str) -> bool {
             let lead = text[..at - usize::from(quoted)].trim_end();
             let tail = text[end + usize::from(quoted)..].trim_start();
             let given = {
-                let start = lead.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |p| p + 1);
+                let start = lead.char_indices().rev().find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |(p, c)| p + c.len_utf8());
                 lead[start..].eq_ignore_ascii_case("AS")
             };
             let qualified = text[..at - usize::from(quoted)].ends_with('.');
@@ -2233,7 +2233,7 @@ fn star_reads(text: &str, alias: &str) -> bool {
                         }
                     }
                     Some(b) if is_word(b) => {
-                        let start = before.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |p| p + 1);
+                        let start = before.char_indices().rev().find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |(p, c)| p + c.len_utf8());
                         if ["SELECT", "DISTINCT", "ALL"].iter().any(|w| before[start..].eq_ignore_ascii_case(w)) {
                             return true;
                         }
