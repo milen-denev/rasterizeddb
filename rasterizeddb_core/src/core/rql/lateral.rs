@@ -2526,7 +2526,8 @@ fn qualify_bare(term: &str, alias: &str, columns: &[String]) -> String {
                 out.push('.');
             }
             out.push_str(word);
-            after_cast = false;
+            // `CAST(x AS type)`: what follows `AS` names a type.
+            after_cast = word.eq_ignore_ascii_case("AS");
             continue;
         }
         if b == b':' && bytes.get(i + 1) == Some(&b':') {
@@ -2736,6 +2737,22 @@ fn exists_reads_only(term: &str, alias: &str) -> bool {
     true
 }
 
+/// Whether `name` is a function that gives the same answer for the same
+/// arguments whenever it is asked, and has no effect: one a condition may be
+/// evaluated with an extra time, or for fewer rows. The list is what is
+/// allowed, so a function it does not name (`random`, `now`, `nextval`,
+/// `clock_timestamp`, a user's own) is never one.
+pub(crate) fn is_immutable_function(name: &str) -> bool {
+    const IMMUTABLE: &[&str] = &[
+        "abs", "ascii", "bit_length", "btrim", "ceil", "ceiling", "char_length", "character_length", "chr", "coalesce",
+        "concat", "concat_ws", "floor", "greatest", "initcap", "json_array_length", "json_typeof", "jsonb_array_length",
+        "jsonb_typeof", "least", "left", "length", "lower", "lpad", "ltrim", "md5", "mod", "nullif", "octet_length",
+        "position", "repeat", "replace", "reverse", "right", "round", "rpad", "rtrim", "sign", "split_part",
+        "starts_with", "strpos", "substr", "substring", "translate", "trim", "trunc", "upper",
+    ];
+    IMMUTABLE.iter().any(|f| f.eq_ignore_ascii_case(name))
+}
+
 fn reads_only(term: &str, alias: &str) -> bool {
     const WORDS: &[&str] =
         &["AND", "OR", "NOT", "IS", "NULL", "IN", "BETWEEN", "LIKE", "ILIKE", "TRUE", "FALSE", "DISTINCT", "FROM"];
@@ -2749,7 +2766,19 @@ fn reads_only(term: &str, alias: &str) -> bool {
                 i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
                 continue;
             }
-            b'"' | b'$' | b';' => return false,
+            b'"' | b';' => return false,
+            // `$n`: a parameter, one value for the whole statement.
+            b'$' => {
+                i += 1;
+                let digits = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == digits {
+                    return false;
+                }
+                continue;
+            }
             b':' if bytes.get(i + 1) == Some(&b':') => {
                 // `::type`: the type's one-word name is not a column. A
                 // two-word type's second word is refused below, as any
@@ -2791,6 +2820,30 @@ fn reads_only(term: &str, alias: &str) -> bool {
                     continue;
                 }
                 let called = term[i..].trim_start().starts_with('(');
+                // A call of a function that answers the same every time
+                // (`lower(t.k) = 'x'`, `coalesce(t.n, 0) > 1`); its
+                // arguments are read as the rest of the term is.
+                if called && is_immutable_function(word) {
+                    continue;
+                }
+                // `CAST(x AS type)`: the type's one-word name is not a
+                // column, as after `::`.
+                if called && word.eq_ignore_ascii_case("CAST") {
+                    continue;
+                }
+                if word.eq_ignore_ascii_case("AS") {
+                    while i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    let type_at = i;
+                    while i < bytes.len() && is_word(bytes[i]) {
+                        i += 1;
+                    }
+                    if i == type_at {
+                        return false;
+                    }
+                    continue;
+                }
                 if !WORDS.iter().any(|w| w.eq_ignore_ascii_case(word)) || (called && !word.eq_ignore_ascii_case("IN")) {
                     return false;
                 }
@@ -2895,6 +2948,15 @@ mod tests {
         assert_eq!(q("k(1) = id::text"), "k(1) = t.id::text");
         assert_eq!(q("id = 1e5 AND k = 'é' AND «k» = 2"), "t.id = 1e5 AND t.k = 'é' AND «t.k» = 2");
         assert_eq!(qualify_bare("id = 1", "t", &[]), "id = 1");
+        assert_eq!(q("lower(k) = 'x' AND CAST(id AS text) = $1"), "lower(t.k) = 'x' AND CAST(t.id AS text) = $1");
+        // What may be pushed: columns of the item, constants, parameters,
+        // casts and functions that answer the same every time.
+        for term in ["lower(t.k) = 'x'", "coalesce(t.id, 0) + 1 > $1", "CAST(t.id AS text) = '1'", "t.id::text LIKE '1%'", "length(btrim(t.k)) BETWEEN 1 AND 3"] {
+            assert!(reads_only(term, "t"), "{term}");
+        }
+        for term in ["random() < t.id", "t.id = nextval('s')", "now() > t.k", "my_function(t.id) = 1", "lower(u.k) = 'x'", "t.id = $", "lower('x') = 'x'"] {
+            assert!(!reads_only(term, "t"), "{term}");
+        }
     }
 
     #[test]
