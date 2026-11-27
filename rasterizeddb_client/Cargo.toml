@@ -70,6 +70,12 @@ sharding = ["dep:rasterizeddb_router", "dep:aws-lc-rs"]
 # The message broker's native client (`broker::Broker`, docs/broker.md):
 # topics, queues, exchanges, a batching producer and push subscriptions.
 broker = ["dep:rasterizeddb_mq", "dep:tokio-rustls", "tokio/io-util"]
+# Test-only failure injection in `rdb-shard` (`RDB_SHARD_FAIL`, read from the
+# environment): a move made to fail, or the process to exit, at a named point.
+# Off by default and never in a release build: a stray variable on a
+# production box would break a move on purpose. tests/cluster/cluster_e2e.py
+# needs it for its failed_moves phase.
+fault_points = ["sharding"]
 # ToSql/FromSql for chrono's DateTime<Utc>, NaiveDateTime, NaiveDate, NaiveTime.
 chrono = ["dep:chrono"]
 # ToSql/FromSql for uuid::Uuid.
