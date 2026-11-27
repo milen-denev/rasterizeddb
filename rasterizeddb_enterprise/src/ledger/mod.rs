@@ -180,8 +180,14 @@ impl LedgerHooks for LedgerGuard {
         // missing PIN, key file directory or token otherwise surfaced only
         // at its first use, past a CREATE VAULT that had succeeded and
         // left a vault no key could ever be made in.
+        // Not on a replica applying the origin's CREATE VAULT: it stores the
+        // vault's ciphertext and needs no key to, and a key it lacks would
+        // halt its whole stream.
         #[cfg(feature = "vault")]
-        if let Some(uri) = policy.key_provider.as_deref() {
+        if let Some(uri) = policy.key_provider.as_deref()
+            && !rasterizeddb_core::core::mvcc::owner::current()
+                .is_some_and(|o| o.kind == rasterizeddb_core::core::mvcc::owner::OwnerKind::Replication)
+        {
             crate::vault::check_provider(uri)?;
         }
         Ok(policy::record(&policy.creation_payload()))

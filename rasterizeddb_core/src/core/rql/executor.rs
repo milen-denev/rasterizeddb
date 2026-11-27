@@ -10709,9 +10709,14 @@ async fn execute_ledger_statement(sql: &str, database: &Arc<Database>, depth: us
 /// ledger hooks, so a build without them refuses here, before anything is
 /// locked or written.
 #[inline(never)]
+///
+/// The statement as written comes back too: it is what replicates. The
+/// plain `CREATE TABLE` used to, and a replica (or a shard's Raft follower)
+/// made an ordinary table of a ledger table or vault, which took UPDATE and
+/// DELETE and kept them after a failover made it the primary.
 fn special_create(
     query: QueryPurpose,
-) -> Result<(QueryPurpose, Option<(crate::core::row::schema::SpecialTable, Vec<u8>)>), String> {
+) -> Result<(QueryPurpose, Option<(crate::core::row::schema::SpecialTable, Vec<u8>, String)>), String> {
     let QueryPurpose::CreateTable(sql) = &query else {
         return Ok((query, None));
     };
@@ -10720,7 +10725,8 @@ fn special_create(
     };
     let split = split?;
     let policy = crate::core::ledger_hooks::create_policy(split.kind, &split.name, &split.clauses)?;
-    Ok((QueryPurpose::CreateTable(split.create_sql), Some((split.kind, policy))))
+    let written = sql.clone();
+    Ok((QueryPurpose::CreateTable(split.create_sql), Some((split.kind, policy, written))))
 }
 
 /// `TRUNCATE` (`rql::truncate`): every named table's rows deleted, as one
@@ -24092,9 +24098,11 @@ async fn execute_with_need_inner(
             // Handle create table
             let (mut parsed, partition, rejection) =
                 crate::core::rql::lexer_ct::create_table_with_partition(&query);
-            if let (Some(ct), Some((kind, policy))) = (parsed.as_mut(), special) {
+            let mut replicated: Option<String> = None;
+            if let (Some(ct), Some((kind, policy, written))) = (parsed.as_mut(), special) {
                 ct.special = kind;
                 ct.ledger_policy = policy;
+                replicated = Some(written);
             }
             if let Some(reason) = rejection {
                 error!("Cannot create table: {}", reason);
@@ -24174,7 +24182,7 @@ async fn execute_with_need_inner(
                     !matches!(e.kind(), std::io::ErrorKind::InvalidInput | std::io::ErrorKind::AlreadyExists)
                 }) && database.has_table(&created_name)
                 {
-                    note_write(&database, tx, depth, &query_sql(&query), None);
+                    note_write(&database, tx, depth, &replicated.take().unwrap_or_else(|| query_sql(&query)), None);
                 }
                 if let Err(e) = &added {
                     // The guards in `add_table` say why a name is refused; a
@@ -24193,7 +24201,7 @@ async fn execute_with_need_inner(
                     // last-writer-wins comparison is about row data, and a
                     // `CREATE TABLE` dropped as "superseded" would leave every
                     // statement after it with nowhere to go.
-                    note_write(&database, tx, depth, &query_sql(&query), None);
+                    note_write(&database, tx, depth, &replicated.take().unwrap_or_else(|| query_sql(&query)), None);
                     let mut result: [u8; 1] = [0u8; 1];
                     result[0] = 0;
                     return result.to_vec();
