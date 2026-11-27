@@ -11437,8 +11437,19 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // Ledger tables and vaults (`ledger_hooks`) lead with theirs too: a
     // retention lock or hold (55000), a policy that does not verify (XX001),
     // a clause that does not parse (42601).
-    for code in ["RDB02", "RDB03", "57P03", "0A000", "22003", "42501", "XX000", "55000", "XX001", "42601"] {
-        if message.starts_with(code) && message[code.len()..].starts_with(':') {
+    // Without regard to case: `sqlstate_in` hands this its message
+    // lowercased (`blank_client_texts`), and a code with a letter in it
+    // (`0A000`, `XX001`, `RDB02`) matched nothing then, so every encrypted
+    // column refusal, tampered chain and stale shard map reached the client
+    // as XX000. The vaults' own codes are here too (an unknown key 42704, an
+    // existing one 42710, a bad argument 22023, …), which matched no phrase.
+    for code in [
+        "RDB02", "RDB03", "57P03", "0A000", "22003", "42501", "XX000", "55000", "XX001", "42601", "42704", "42P01",
+        "42710", "22023", "22021", "42809", "42602", "58030", "22007", "22001",
+    ] {
+        if message.get(..code.len()).is_some_and(|head| head.eq_ignore_ascii_case(code))
+            && message[code.len()..].starts_with(':')
+        {
             return code;
         }
     }
@@ -17682,6 +17693,24 @@ mod time_setting_tests {
 #[cfg(test)]
 mod sqlstate_tests {
     use super::{sqlstate_for, sqlstate_in};
+
+    /// A code leading the message is the code, letters and all, also
+    /// through `sqlstate_in`, which lowercases the message first: a code
+    /// with a letter used to reach the client as XX000.
+    #[test]
+    fn a_leading_code_with_letters_survives_the_statement_path() {
+        for (message, code) in [
+            ("0A000: column \"patients.ssn\" is encrypted", "0A000"),
+            ("XX001: the chain does not verify", "XX001"),
+            ("RDB02: this shard does not own the key", "RDB02"),
+            ("42P01: relation \"t\" does not exist", "42P01"),
+            ("42710: key 'k' exists", "42710"),
+            ("42704: no key 'k'", "42704"),
+        ] {
+            assert_eq!(sqlstate_for(message), code, "{message:?}");
+            assert_eq!(sqlstate_in(message, "VAULT v CREATE KEY 'k'"), code, "{message:?}");
+        }
+    }
 
     /// A double quote inside a value, escaped by doubling as the value
     /// messages now write it: the whole value stays one quoted span.

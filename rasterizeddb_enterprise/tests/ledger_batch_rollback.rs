@@ -97,7 +97,10 @@ async fn a_failed_batch_takes_its_vault_and_ledger_ddl_with_it() {
     run(&admin, "INSERT INTO kc (id, s) VALUES (1, 'kept')").await;
     // Of another kind than the keyring holds: refused, not replaced.
     let e = refused(&admin, "VAULT bv CREATE KEY 'k2' TYPE 'hsm-aes256-gcm'").await;
-    assert!(e.contains("42710") || e.contains("keyring"), "{e}");
+    assert!(e.ends_with("(SQLSTATE 42710)"), "{e}");
+    // A code with a letter in it reaches the client as itself, not XX000.
+    let e = refused(&admin, "SELECT id FROM kc WHERE s = 'kept'").await;
+    assert!(e.ends_with("(SQLSTATE 0A000)"), "{e}");
     let made = col(&admin, "VAULT bv CREATE KEY 'k2'").await;
     assert!(made.iter().flatten().any(|l| l.contains("kept")), "{made:?}");
     assert_eq!(col(&admin, "SELECT s FROM kc").await, vec![Some("kept".into())], "the column's key was replaced");
