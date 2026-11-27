@@ -1101,6 +1101,30 @@ fn fan_out_part() -> bool {
     }
 }
 
+/// For a fan-out's part (`part`) on a shard: whether a partition over
+/// `range` holds none of the blocks the map gives this shard
+/// (`Ownership::owns_none_of`). Always false elsewhere.
+fn unowned_by_the_map(part: bool) -> impl Fn(PointRange) -> bool {
+    #[cfg(feature = "sharding")]
+    {
+        // The ownership the part was accepted under, when a shard request
+        // carried it; the live one for `SET rdb.shard_part`.
+        let own = if part {
+            crate::pgwire::current_session_cancel()
+                .and_then(|c| c.part_owned.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .or_else(crate::core::shard::ownership::current)
+        } else {
+            None
+        };
+        move |range: PointRange| own.as_ref().is_some_and(|o| o.owns_none_of(range))
+    }
+    #[cfg(not(feature = "sharding"))]
+    {
+        let _ = part;
+        |_: PointRange| false
+    }
+}
+
 impl PartitionedTable {
     /// Writes a new table's map log (`HEADER`, `LOCATIONS` with the root,
     /// `PLACE` of [`initial_layout`], and on a shard a `RELEASE_SPAN` per
@@ -1904,6 +1928,8 @@ impl PartitionedTable {
     pub fn planned(&self, epoch: &MapEpoch, route: &Route) -> io::Result<Planned> {
         let live = self.live()?;
         let mut out = Planned::new();
+        let part = fan_out_part();
+        let unowned = unowned_by_the_map(part);
         for pid in route.pids(&epoch.map) {
             let slot = Self::slot(live, pid)?;
             // On a shard, a fan-out's part reads the rows this shard owns
@@ -1911,8 +1937,11 @@ impl PartitionedTable {
             // combines the answers), keyed or not: an `IN` list's keys on
             // other shards are answered there. Any other statement whose
             // key reaches another shard's range is refused before anything
-            // is read (B1a.4).
-            if slot.foreign && fan_out_part() {
+            // is read (B1a.4). A live partition the map does not give this
+            // shard (a move's copy coming in, or left by a move that
+            // failed) is another shard's to answer too: read here, its rows
+            // would be counted twice.
+            if part && (slot.foreign || unowned(slot.range)) {
                 continue;
             }
             slot.refuse_foreign(&self.name)?;

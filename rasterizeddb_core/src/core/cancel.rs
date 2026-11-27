@@ -345,6 +345,12 @@ pub struct SessionCancel {
     /// other shard's rows (sharding-plan.md B1a.4).
     #[cfg(feature = "sharding")]
     pub fan_out_part: std::sync::atomic::AtomicBool,
+    /// The shard's ownership a fan-out part is answered under: the one in
+    /// force when the request carrying the part was accepted at its map
+    /// epoch. A map installed while the part runs changes nothing it reads,
+    /// so every shard's part of one fan-out answers for one epoch's ranges.
+    #[cfg(feature = "sharding")]
+    pub part_owned: std::sync::Mutex<Option<std::sync::Arc<crate::core::shard::ownership::Ownership>>>,
 }
 
 /// See [`SessionCancel::fold`].
@@ -449,6 +455,8 @@ pub fn register_session(key: [u8; 4]) -> CancelRegistration {
         fold: std::sync::Mutex::new(Fold::Normal),
         #[cfg(feature = "sharding")]
         fan_out_part: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "sharding")]
+        part_owned: std::sync::Mutex::new(None),
     });
     let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
     let pid = loop {
@@ -567,6 +575,8 @@ pub fn register_token(user: &str, token: &str) -> Option<TokenRegistration> {
         fold: std::sync::Mutex::new(Fold::Normal),
         #[cfg(feature = "sharding")]
         fan_out_part: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "sharding")]
+        part_owned: std::sync::Mutex::new(None),
     });
     map.insert(key.clone(), session.clone());
     Some(TokenRegistration { key, session })

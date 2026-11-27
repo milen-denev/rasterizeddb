@@ -233,6 +233,10 @@ pub struct Session {
     pub(crate) pending_gather: Option<Vec<String>>,
     /// A broadcast the extended batch being decided asks for.
     pub(crate) pending_broadcast: Option<(Vec<String>, Merge, Vec<String>)>,
+    /// Whether the statement being run was already sent again once because
+    /// a shard refuted its template (`refuted_before_effect`): a second
+    /// refusal is the client's to see, never another round.
+    pub(crate) stale_retried: bool,
     /// Who this session is, for an observer (`hooks::Observer`).
     pub client: crate::hooks::ClientInfo,
     /// Bytes written to the client so far, and the first error's SQLSTATE
@@ -395,6 +399,7 @@ impl Session {
             pending_fanout: None,
             pending_gather: None,
             pending_broadcast: None,
+            stale_retried: false,
             client: crate::hooks::ClientInfo {
                 session: 0,
                 database: String::new(),
@@ -1015,6 +1020,7 @@ impl Session {
         {
             return Ok(outcome);
         }
+        self.stale_retried = false;
         for attempt in 0..=retries {
             self.core.refresh_if_stale().await;
             let map = self.core.map();
@@ -1467,6 +1473,36 @@ impl Session {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             return Ok(Outcome::Retry);
         }
+        // A cached template that sent the statement to a shard that does
+        // not hold its rows: the shard refused it with RDB02 before it
+        // changed anything (it ran alone, outside a block, and completed
+        // nothing). The template is dropped and the statement sent once
+        // more, to wherever a fresh Classify puts it. A template learned
+        // while the table did not exist yet (Home) is what this heals: a
+        // table created on the shards directly moves no schema epoch, so
+        // nothing else ever drops it, and every statement shape the client
+        // sent before the CREATE failed afterwards, once on each gateway
+        // core that held it (each core drops only its own copy).
+        if let Response::PgReply { more: false, status: b'I', bytes, .. } = &resp
+            && let Some((src, text)) = tkey
+            && !self.stale_retried
+            && self.txn.status == b'I'
+            && self.txn.shard.is_none()
+            && self.login.pinned.is_none()
+            && refuted_before_effect(bytes)
+        {
+            self.stale_retried = true;
+            // What this shard's virtual session now holds: the lazy
+            // re-Parses and the client's own Parses ran before the refusal.
+            if let Some(vs) = self.vs.get_mut(&shard) {
+                for (n, g) in parsed_now {
+                    vs.parsed.insert(n, g);
+                }
+            }
+            self.after_extended(msgs, shard);
+            route::refute(&self.core, &self.login.database, src, text);
+            return Ok(Outcome::Retry);
+        }
         let mut error = false;
         let mut last_type = 0u8;
         let mut refuted = false;
@@ -1807,6 +1843,7 @@ impl Session {
     /// One extended-protocol batch, ending in Sync (or Flush).
     async fn extended<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, batch: &[u8], sync: bool) -> io::Result<Outcome> {
         let retries = self.core.shared.cfg.retries;
+        self.stale_retried = false;
         for attempt in 0..=retries {
             self.core.refresh_if_stale().await;
             let map = self.core.map();
@@ -1816,27 +1853,41 @@ impl Session {
             let (target, needs, tkey) = match self.decide_extended(&map, batch).await {
                 Ok(v) => v,
                 Err((code, msg)) => {
+                    // A fan-out whose parts were refused for a moving map
+                    // goes again, as a routed statement does.
+                    let mut ran = None;
                     // A join with small global tables, copied to the shards.
                     if let Some((small, merge, gather)) = self.pending_broadcast.take()
                         && sync
-                        && let Some(outcome) = self.broadcast_extended(conn, batch, &small, merge, &gather).await?
                     {
-                        return Ok(outcome);
+                        ran = self.broadcast_extended(conn, batch, &small, merge, &gather).await?;
                     }
                     // A join with a table on other shards, gathered.
-                    if let Some(tables) = self.pending_gather.take()
+                    if ran.is_none()
+                        && let Some(tables) = self.pending_gather.take()
                         && sync
-                        && let Some(outcome) = self.gather_extended(conn, batch, &tables).await?
                     {
-                        return Ok(outcome);
+                        ran = self.gather_extended(conn, batch, &tables).await?;
                     }
                     // A statement without a route key, alone in its batch:
                     // fanned out as a simple query would be.
-                    if let Some((merge, writes)) = self.pending_fanout.take()
+                    if ran.is_none()
+                        && let Some((merge, writes)) = self.pending_fanout.take()
                         && sync
-                        && let Some(outcome) = self.fan_out_extended(conn, batch, merge, writes).await?
                     {
-                        return Ok(outcome);
+                        ran = self.fan_out_extended(conn, batch, merge, writes).await?;
+                    }
+                    match ran {
+                        Some(Outcome::Retry) if attempt < retries => {
+                            self.core.counters.borrow_mut().retries += 1;
+                            continue;
+                        }
+                        Some(Outcome::Retry) => {
+                            self.error_ready("57P03", "the statement was refused for a moving range too many times; try again");
+                            return Ok(Outcome::Done { error: true });
+                        }
+                        Some(outcome) => return Ok(outcome),
+                        None => {}
                     }
                     // A prepared multi-row INSERT is split by row.
                     if code == "0A000"
@@ -2116,6 +2167,34 @@ fn fenced_for_a_move(reply: &[u8]) -> bool {
     error
 }
 
+/// Whether a shard's whole reply is one RDB02 refusal and nothing that took
+/// effect or reached the client as data: no CommandComplete, no row, no
+/// COPY, no suspended portal. What a statement routed by a stale template
+/// gets (`run_on`); safe to send again elsewhere.
+fn refuted_before_effect(reply: &[u8]) -> bool {
+    let mut refusals = 0;
+    for (t, m) in pg::messages(reply) {
+        match t {
+            b'E' => {
+                let coded = pg::error_sqlstate(m).is_some_and(|c| c.as_bytes() == rshard::NOT_OWNED);
+                // The code field may carry the code or not, depending on
+                // the path the error took; the message leads with it.
+                let led = pg::error_message(m).is_some_and(|e| e.starts_with("RDB02:"));
+                if !(coded || led) {
+                    return false;
+                }
+                refusals += 1;
+            }
+            // ReadyForQuery, notices, parameter status; and the extended
+            // protocol's ParseComplete, BindComplete, CloseComplete,
+            // ParameterDescription, RowDescription and NoData.
+            b'Z' | b'N' | b'S' | b'1' | b'2' | b'3' | b't' | b'T' | b'n' => {}
+            _ => return false,
+        }
+    }
+    refusals == 1
+}
+
 /// Whether `text` names a table (reads or writes one): a word FROM, INTO,
 /// UPDATE, JOIN or TABLE outside quotes. `SAVEPOINT a`, `SELECT 1` and
 /// `SELECT now()` do not.
@@ -2178,6 +2257,32 @@ mod tests {
         }
         assert!(names_a_table("SELECT * FROM t") && names_a_table("INSERT INTO t VALUES (1)") && names_a_table("update t set a = 1"));
         assert!(!names_a_table("SAVEPOINT a") && !names_a_table("SELECT 1") && !names_a_table("SELECT now()"));
+    }
+
+    #[test]
+    fn only_a_lone_rdb02_refusal_is_sent_again() {
+        let foreign = "RDB02: statement reaches ranges not on this shard: partition 65 of \"orders\" covers [0x5555555555550000, 0x10000000000000000), which this shard does not own (FOREIGN): the statement reached another shard's rows";
+        let reply = |build: &dyn Fn(&mut Vec<u8>)| {
+            let mut b = Vec::new();
+            build(&mut b);
+            pg::ready(&mut b, b'I');
+            b
+        };
+        // The refusal alone, by its code field or by its message.
+        assert!(refuted_before_effect(&reply(&|b| pg::error(b, "ERROR", "RDB02", foreign))));
+        assert!(refuted_before_effect(&reply(&|b| pg::error(b, "ERROR", "XX000", foreign))));
+        // An extended batch's Parse and Bind ran before it: still nothing done.
+        assert!(refuted_before_effect(&reply(&|b| {
+            b.extend_from_slice(&[b'1', 0, 0, 0, 4, b'2', 0, 0, 0, 4]);
+            pg::error(b, "ERROR", "RDB02", foreign);
+        })));
+        // Another error, or something that completed first, is the client's.
+        assert!(!refuted_before_effect(&reply(&|b| pg::error(b, "ERROR", "23505", "duplicate key"))));
+        assert!(!refuted_before_effect(&reply(&|b| {
+            pg::command_complete(b, "INSERT 0 1");
+            pg::error(b, "ERROR", "RDB02", foreign);
+        })));
+        assert!(!refuted_before_effect(&reply(&|_| {})));
     }
 
     #[test]

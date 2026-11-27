@@ -1611,7 +1611,7 @@ pub(crate) fn subquery_select_list_functions(sql: &str) -> Option<String> {
                         // After IN, EXISTS, ANY, ALL or SOME the subquery is
                         // read by its value, not by its column's name.
                         let before = sql[..i].trim_end();
-                        let word_at = before.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |p| p + 1);
+                        let word_at = before.char_indices().rev().find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |(p, c)| p + c.len_utf8());
                         let by_value = ["IN", "EXISTS", "ANY", "ALL", "SOME"].iter().any(|k| before[word_at..].eq_ignore_ascii_case(k));
                         if let Some(form) = crate::core::rql::table_functions::select_list_form_as(&sql[inner_at..close], !by_value) {
                             out.push_str(&sql[copied..inner_at]);

@@ -1949,7 +1949,19 @@ async fn shard_admin(database: &Arc<Database>, admin: &ShardAdmin) -> Result<Str
             if !matches!(database.relation(&name), Some(Relation::Partitioned(_))) {
                 continue;
             }
-            database.shard_span(&name, lo, hi, take).await.map_err(|e| format!("{name}: {e}"))?;
+            // Under ACCESS EXCLUSIVE, as a reshape is: the span change
+            // reopens the whole table, and a write to any other span of it
+            // made through the old instance meanwhile was acknowledged and
+            // then lost to the new one. Writers wait for the lock, then run
+            // on the reopened table; given back once the span is changed.
+            let release = crate::core::mvcc::table_locks::MoveRelease::before(database, &name);
+            database
+                .lock_table(&name, crate::core::mvcc::owner::ensure(), crate::core::mvcc::table_locks::TableMode::AccessExclusive)
+                .await
+                .map_err(|e| format!("{name}: {e}"))?;
+            let changed = database.shard_span(&name, lo, hi, take).await.map_err(|e| format!("{name}: {e}"));
+            drop(release);
+            changed?;
             tables += 1;
         }
         Ok::<usize, String>(tables)

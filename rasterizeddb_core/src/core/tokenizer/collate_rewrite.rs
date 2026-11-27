@@ -153,7 +153,7 @@ fn mask_operators(clause: &str) -> Option<String> {
             None => true,
             Some(b')' | b'\'' | b'"' | b'!') => false,
             Some(b) if b.is_ascii_alphanumeric() || *b == b'_' || *b >= 0x80 => {
-                let start = before.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |p| p + 1);
+                let start = before.char_indices().rev().find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |(p, c)| p + c.len_utf8());
                 ["AND", "OR", "NOT", "THEN", "ELSE", "WHEN", "WHERE", "CASE", "IN", "BETWEEN", "LIKE"]
                     .iter()
                     .any(|w| before[start..].eq_ignore_ascii_case(w))

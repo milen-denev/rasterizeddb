@@ -7,6 +7,9 @@ written (sharding-plan.md, the cluster test bar).
 
 With rdb-shard, a fourth shard joins at the end: half of shard 1's range
 moves onto it online (`rdb-shard split --online`) while a writer runs.
+Build that rdb-shard with `--features fault_points`: the failed_moves phase
+makes moves fail on purpose (RDB_SHARD_FAIL). The core for the shards needs
+`--features sharding_raft,sharding_2pc`, as the release builds it.
 
 Each check prints PASS or FAIL with what it saw; the exit code is the
 number of failures. Every process is killed at the end, and the workdir is
@@ -716,6 +719,14 @@ def main():
     on_every_shard("CREATE TABLE stores (id INT PRIMARY KEY, name TEXT NOT NULL)")
     start_gateway(tls, cmap)
     up(GW, "the gateway")
+    if os.environ.get("CLUSTER_ONLY"):
+        # Only the named phases (ones that need nothing but the running
+        # cluster, comma-separated), e.g. CLUSTER_ONLY=stale_templates.
+        import inspect
+        for name in os.environ["CLUSTER_ONLY"].split(","):
+            phase = globals()[name.strip()]
+            phase(*((tls, cmap) if len(inspect.signature(phase).parameters) == 2 else ()))
+        return
     if os.environ.get("CLUSTER_SERVE") == "1":
         # Up and left running for poking at by hand, until killed.
         print(f"serving: gateway {GW}, shards {PG}", flush=True)
@@ -1032,11 +1043,14 @@ def main():
     config_api(tls, cmap)
     cluster_roles()
     broadcast_limits()
+    stale_templates()
     frontend(tls)
     if RDB_SHARD:
         cluster_backup(tls, cmap)
         split_online(tls, cmap)
         cluster_rebalance()
+        failed_moves()
+        hand_off()
     if os.environ.get("CLUSTER_SERVE") == "after":
         print(f"serving after the checks: gateway {GW}, shards {PG}", flush=True)
         while True:
@@ -1121,6 +1135,159 @@ def cluster_roles():
     check("  ...and the read is refused after it", code != 0, out)
     code, out = psql(GW, "DROP ROLE e2e_app")
     check("  ...the role dropped everywhere", code == 0 and on_shards("e2e_app") == ["0"] * len(SHARDS), (out, on_shards("e2e_app")))
+
+
+def stale_templates():
+    """Statements sent through the gateway before their table exists leave
+    templates (Home: no sharded table named) that nothing drops when the
+    table is then created on the shards directly, since that moves no schema
+    epoch. A shape sent before failed afterwards with RDB02 once on each
+    gateway core holding it (an INSERT whose row the home shard does not own,
+    a count(*) the home shard cannot answer alone); the gateway now drops the
+    template and sends the statement again.
+    The report's own schema: BIGINT keys, a composite primary key, a
+    partition column that is not the whole key."""
+    t = "stale_orders"
+    inserts = [f"INSERT INTO {t} VALUES ({s}, 1, {s * 10})" for s in range(1, 31)]
+    reads = {f"SELECT count(*) FROM {t}": "30", f"SELECT sum(total) FROM {t}": "4650",
+             f"SELECT total FROM {t} WHERE store_id = 7": "70"}
+    prepared = f"SELECT total FROM {t} WHERE store_id = $1 \\bind 11 \\g\n"
+    ddl = (f"CREATE TABLE {t} (store_id BIGINT NOT NULL, id BIGINT NOT NULL, total BIGINT, "
+           f"PRIMARY KEY (store_id, id)) PARTITION BY HASH (store_id)")
+    # Before the table exists: every text classified once, and failing.
+    before = [psql(GW, q)[0] for q in inserts + list(reads)] + [psql_script(GW, prepared)[0]]
+    check("stale templates: statements before the table exists fail", all(c != 0 for c in before), before)
+    on_every_shard(ddl)
+    failed = []
+    for q in inserts:
+        code, out = psql(GW, q)
+        if code != 0:
+            failed.append((q, out))
+    check("stale templates: every INSERT sent before the CREATE lands after it", not failed, failed[:3])
+    counts = []
+    for n in SHARDS:
+        code, out = psql(PG[n], f"SET rdb.shard_part = on; SELECT count(*) FROM {t}")
+        counts.append(int(out.splitlines()[-1]) if code == 0 else -1)
+    check("stale templates: each row on one shard, the shards together hold all 30", sum(counts) == 30 and min(counts) > 0, counts)
+    for q, want in reads.items():
+        got = psql(GW, q)
+        check(f"stale templates: {q}", got == (0, want), got)
+    got = psql_script(GW, prepared)
+    check("stale templates: a prepared keyed read", got == (0, "110"), got)
+    # The texts are routed right from now on, not refused and sent again.
+    # Once more: a core that still holds its own stale copy (the per-core
+    # level) refutes it there and sends again, unseen by the client.
+    again = [psql(GW, q) == (0, want) for q, want in reads.items()] + [psql_script(GW, prepared) == (0, "110")]
+    check("stale templates: the reads again", all(again), again)
+    # Gone again: shard 3 joins later with only orders and stores, and a
+    # rebalance moving this table's blocks onto it would find no table there.
+    for n in SHARDS:
+        code, out = psql(PG[n], f"DROP TABLE {t}")
+        if code != 0:
+            sys.exit(f"shard {n}: DROP TABLE {t}: {out}")
+
+
+def hand_off():
+    """The hand-off of a tenant move from shard 0 to shard 3: the new map
+    goes on the destination, then the source, then the rest. Between the
+    first two the shards disagree on who owns the tenant; a fan-out
+    answered there would count its rows twice or not at all. A read hammered
+    through that window (held open 300 ms) answers every time, exactly. A
+    tool killed in it leaves the hand-off recorded (status handing-off):
+    reads meanwhile are exact or a retryable refusal, never wrong, and the
+    same command run again finishes it."""
+    tables = ("ghost_a", "ghost_b", "ghost_r", "orders")
+    want = {"SELECT count(*) FROM orders": psql(GW, "SELECT count(*) FROM orders"),
+            "SELECT count(*), sum(v) FROM orders": psql(GW, "SELECT count(*), sum(v) FROM orders")}
+    if any(code != 0 for code, _ in want.values()):
+        check("hand-off: the reads to compare with", False, want)
+        return
+    code, out = psql(PG[0], "SET rdb.shard_part = on; SELECT id FROM ghost_a ORDER BY id LIMIT 2")
+    keys = out.splitlines()[-2:] if code == 0 else []
+    if len(keys) != 2:
+        check("hand-off: two tenants on shard 0", False, out)
+        return
+    for key in keys:
+        for t in tables:
+            code, out = psql(PG[0], f"ALTER TABLE {t} ISOLATE KEY (id = {key})")
+            if code != 0:
+                check(f"hand-off: ISOLATE KEY on shard 0 for {t}", False, out)
+                return
+
+    def move(key, map_in, n, fail=None):
+        args = [RDB_SHARD, "move-tenant", "--map", map_in, "--key", key, "--key-type", "int", "--to", "3", "--online",
+                "--out", f"{WORK}/handoff{n}.map", "--state", f"{WORK}/handoff{n}.state", "--user", "rasterized",
+                "--database", "postgres"]
+        for t in tables:
+            args += ["--table", f"{t}:id"]
+        for i in ALL:
+            args += ["--native", f"{i}=127.0.0.1:{RDB[i]}"]
+        env = dict(ENV, RDB_PASSWORD="pw")
+        if fail:
+            env["RDB_SHARD_FAIL"] = fail
+        return subprocess.run(args, env=env, capture_output=True, text=True, timeout=600)
+
+    def hammer(name, n=600):
+        qs = list(want)
+        return psql_script_bg(GW, "".join(f"{qs[i % len(qs)]};\n" for i in range(n)), name), [want[qs[i % len(qs)]][1] for i in range(n)]
+
+    def wrong(proc, expected):
+        out, _ = proc.communicate(timeout=600)
+        lines = out.splitlines()
+        answers = [l for l in lines if "ERROR" not in l and not l.startswith("psql:")]
+        errors = [l for l in lines if "ERROR" in l]
+        allowed = set(expected)
+        return [a for a in answers if a not in allowed], errors, len(answers)
+
+    # 1. The window held open: every answer exact, none refused. Meanwhile
+    # the moving tenant's row is updated over and over: an update in flight
+    # when the source was fenced must not be lost behind the move.
+    v_before = int(psql(GW, f"SELECT v FROM ghost_a WHERE id = {keys[0]}")[1])
+    writer = psql_script_bg(GW, "".join(f"UPDATE ghost_a SET v = v + 1 WHERE id = {keys[0]};\n" for _ in range(1500)), "updater")
+    proc, expected = hammer("hammer1", 6000)
+    time.sleep(0.3)
+    r = move(keys[0], f"{WORK}/tenant.map", 1, "after-install:destination:sleep300")
+    # Started before the move and still going after it: it read through it.
+    overlapped = proc.poll() is None and writer.poll() is None
+    bad, errors, answered = wrong(proc, expected)
+    wout, _ = writer.communicate(timeout=600)
+    updated = wout.count("UPDATE 1")
+    v_after = psql(GW, f"SELECT v FROM ghost_a WHERE id = {keys[0]}")
+    check("  ...the hammer and the writer ran through the whole move", overlapped, (answered, updated))
+    check("  ...every update of the moving tenant kept, none twice", "UPDATE 0" not in wout and v_after == (0, str(v_before + updated)),
+          (v_before, updated, v_after, [l for l in wout.splitlines() if "ERROR" in l][:3]))
+    check("hand-off: a tenant move with the destination a map ahead for 300 ms", r.returncode == 0 and "moved to shard 3" in r.stdout,
+          r.stdout + r.stderr)
+    check("  ...a count and a sum hammered through it: every answer exact", not bad and answered > 0, (bad[:5], answered))
+    check("  ...and none refused", not errors, errors[:3])
+
+    # 2. The tool killed between the destination's install and the source's.
+    r = move(keys[1], f"{WORK}/handoff1.map", 2, "after-install:destination:exit")
+    check("hand-off: the tool dying after the destination's install", r.returncode == 9, r.stdout + r.stderr)
+    state = open(f"{WORK}/handoff2.state").read() if os.path.exists(f"{WORK}/handoff2.state") else ""
+    check("  ...leaves the hand-off recorded", "status handing-off" in state, state)
+    proc, expected = hammer("hammer2", 40)
+    bad, errors, answered = wrong(proc, expected)
+    check("  ...meanwhile every read is exact, or refused for the moving map", not bad
+          and all("57P03" in e or "moving" in e or "map epoch" in e for e in errors), (bad[:5], errors[:3]))
+
+    # 3. The same command again finishes it.
+    r = move(keys[1], f"{WORK}/handoff1.map", 2)
+    check("hand-off: run again, it finishes the hand-off", r.returncode == 0 and "finished the hand-off" in r.stdout, r.stdout + r.stderr)
+    state = open(f"{WORK}/handoff2.state").read()
+    check("  ...recorded as moved", "status moved" in state, state)
+    epochs = []
+    for i in ALL:
+        code, out = psql(PG[i], "SHOW SHARDS")
+        mine = [l.split("|") for l in out.splitlines() if l.split("|")[1:2] == ["t"]] if code == 0 else []
+        epochs.append(mine[0][6] if mine else out)
+    check("  ...every shard at one map epoch", len(set(epochs)) == 1, epochs)
+    got = {q: psql(GW, q) for q in want}
+    check("  ...every row once, through the gateway", got == want, (want, got))
+    code, out = psql(GW, f"UPDATE ghost_a SET v = v + 1 WHERE id = {keys[1]}")
+    check("  ...the source unfenced: the moved tenant takes writes", code == 0, out)
+    got = psql(GW, f"SELECT v FROM ghost_a WHERE id = {keys[1]}")
+    check("  ...on shard 3", got == (0, str(int(keys[1]) + 1)), got)
 
 
 def broadcast_limits():
@@ -1342,6 +1509,38 @@ def cluster_rebalance():
     check("  ...idle before any run", psql(GW, "SHOW REBALANCE STATUS") == (0, "state|idle"), psql(GW, "SHOW REBALANCE STATUS"))
     before = psql(GW, "SELECT count(*), sum(v) FROM orders")
     epoch_before = int(gateway_value("map_epoch") or 0)
+    # A sharded table shard 3 (joined later) does not have: the move onto it
+    # is refused before anything is copied, not found mid-move with the
+    # tables before it already on shard 3, where reads counted them twice.
+    ghost = "CREATE TABLE ghost_r (id INT PRIMARY KEY, v INT NOT NULL) PARTITION BY HASH (id)"
+    on_every_shard(ghost)
+    # Keys on shard 3 are refused (no table there); the rest land.
+    for k in range(1, 41):
+        psql(GW, f"INSERT INTO ghost_r VALUES ({k}, {k})")
+    def ghost_on(shards):
+        rows, total = 0, 0
+        for n in shards:
+            code, out = psql(PG[n], "SET rdb.shard_part = on; SELECT count(*), coalesce(sum(v), 0) FROM ghost_r")
+            c, v = out.splitlines()[-1].split("|") if code == 0 else ("-1", "0")
+            rows, total = rows + int(c), total + int(v)
+        return (0, f"{rows}|{total}")
+    # Read on each shard that has it: a fan-out also reaches shard 3.
+    ghost_before = ghost_on(SHARDS)
+    code, out = psql(GW, "REBALANCE CLUSTER MAX MOVES 1")
+    state, out = "running", ""
+    end = time.time() + 120
+    while time.time() < end:
+        out = psql(GW, "SHOW REBALANCE STATUS")[1]
+        state = dict(l.split("|", 1) for l in out.splitlines() if l.startswith("state|")).get("state", "?")
+        if state != "running":
+            break
+        time.sleep(0.5)
+    check("rebalance: a table missing on the destination is refused before the move", state == "failed"
+          and "ghost_r on shard 3" in out and "nothing was moved" in out and "rows copied" not in out, out[-2000:])
+    check("  ...nothing counted twice", psql(GW, "SELECT count(*), sum(v) FROM orders") == before and ghost_on(SHARDS) == ghost_before,
+          (before, psql(GW, "SELECT count(*), sum(v) FROM orders"), ghost_before, ghost_on(SHARDS)))
+    check("  ...the map did not move", int(gateway_value("map_epoch") or 0) == epoch_before, (epoch_before, gateway_value("map_epoch")))
+    on_every_shard_of([3], ghost)
     code, out = psql(GW, "SHOW REBALANCE PLAN")
     moves = [l for l in out.splitlines() if l.startswith("move|")]
     loads = [l for l in out.splitlines() if l.startswith("load|")]
@@ -1371,6 +1570,101 @@ def cluster_rebalance():
     check("  ...every row once, through the gateway", after == before, (before, after))
     check("  ...keyed reads after the move", all(psql(GW, f"SELECT count(*) FROM orders WHERE id = {k}") == (0, "1") for k in (1, 150, 300)),
           [psql(GW, f"SELECT count(*) FROM orders WHERE id = {k}") for k in (1, 150, 300)])
+    check("  ...the table that was missing, every row once", psql(GW, "SELECT count(*), sum(v) FROM ghost_r") == ghost_before,
+          (ghost_before, psql(GW, "SELECT count(*), sum(v) FROM ghost_r")))
+
+
+def failed_moves():
+    """A move that fails between two tables, and one whose tool dies there
+    (RDB_SHARD_FAIL), of one tenant from shard 0 to shard 3: the first table
+    is already copied when it stops. Nothing is counted twice (a fan-out's
+    part reads only what the map gives its shard, so an incoming copy is not
+    read), a failed move gives its copy back, and the next run, starting
+    clean, moves it. Needs rdb-shard built with `--features fault_points`
+    (cargo build -p rasterizeddb_client --bin rdb-shard --features
+    fault_points), which no release build has."""
+    probe = subprocess.run([RDB_SHARD, "fault-points"], capture_output=True, text=True, timeout=30)
+    if probe.stdout.strip() != "on":
+        check("failed moves: rdb-shard injects failures (build it with --features fault_points)", False,
+              (probe.stdout + probe.stderr).strip()[-300:])
+        return
+    for t in ("ghost_a", "ghost_b"):
+        on_every_shard_of(ALL, f"CREATE TABLE {t} (id INT PRIMARY KEY, v INT NOT NULL) PARTITION BY HASH (id)")
+        for k in range(1, 61):
+            psql(GW, f"INSERT INTO {t} VALUES ({k}, {k})")
+    # Every partitioned table: the hand-off gives the tenant's block up in
+    # each, so the move names them all.
+    moved = ("ghost_a", "ghost_b", "ghost_r", "orders")
+    sums = lambda: [psql(GW, f"SELECT count(*), sum(v) FROM {t}") for t in moved]
+    want = sums()
+    code, out = psql(PG[0], "SET rdb.shard_part = on; SELECT id FROM ghost_a ORDER BY id LIMIT 1")
+    if code != 0:
+        check("failed moves: a key on shard 0", False, out)
+        return
+    key = out.splitlines()[-1]
+    def move(fail=None, tables=moved):
+        args = [RDB_SHARD, "move-tenant", "--map", f"{WORK}/cluster.map", "--key", key, "--key-type", "int", "--to", "3",
+                "--online", "--out", f"{WORK}/tenant.map", "--state", f"{WORK}/tenant.state", "--user", "rasterized",
+                "--database", "postgres"]
+        for t in tables:
+            args += ["--table", f"{t}:id"]
+        for n in ALL:
+            args += ["--native", f"{n}=127.0.0.1:{RDB[n]}"]
+        env = dict(ENV, RDB_PASSWORD="pw")
+        if fail:
+            env["RDB_SHARD_FAIL"] = fail
+        return subprocess.run(args, env=env, capture_output=True, text=True, timeout=600)
+    on3 = lambda t: psql(PG[3], f"SELECT count(*) FROM {t} WHERE id = {key}")
+
+    # Naming only some tables: the others' rows in the block would be left
+    # unread, so the move is refused before anything changes.
+    r = move(tables=("ghost_a", "ghost_b"))
+    out = r.stdout + r.stderr
+    check("failed moves: a move leaving a partitioned table out is refused before the move", r.returncode != 0
+          and "move it as well (--table)" in out and "nothing was moved" in out and "rows copied" not in out, out)
+    # The tenant's block shares a partition on shard 0: the hand-off could
+    # not give it away, so the move is refused before anything changes.
+    r = move()
+    out = r.stdout + r.stderr
+    check("failed moves: a tenant sharing a partition is refused before the move", r.returncode != 0
+          and "ISOLATE KEY (id = " in out and "nothing was moved" in out and "rows copied" not in out, out)
+    check("  ...nothing counted twice", sums() == want, (want, sums()))
+    for t in moved:
+        code, out = psql(PG[0], f"ALTER TABLE {t} ISOLATE KEY (id = {key})")
+        if code != 0:
+            check(f"failed moves: ISOLATE KEY on shard 0 for {t}", False, out)
+            return
+
+    r = move("after-table:ghost_a")
+    out = r.stdout + r.stderr
+    check("failed moves: a move failing after its first table", r.returncode != 0 and "ghost_a: 1 rows copied" in out
+          and "The move was undone:" in out, out)
+    check("  ...nothing counted twice", sums() == want, (want, sums()))
+    # Given back, the span is another shard's again: read there directly,
+    # it is refused (or holds nothing).
+    gone = on3("ghost_a")
+    check("  ...the copy is given back", gone == (0, "0") or (gone[0] != 0 and "FOREIGN" in gone[1]), gone)
+
+    r = move("after-table:ghost_a:exit")
+    out = r.stdout + r.stderr
+    check("failed moves: the tool dying after the first table", r.returncode == 9 and "ghost_a: 1 rows copied" in out, out)
+    check("  ...its copy left on shard 3 is not read by a fan-out", sums() == want, (want, sums()))
+    check("  ...though shard 3 holds it", on3("ghost_a") == (0, "1"), on3("ghost_a"))
+
+    r = move()
+    out = r.stdout + r.stderr
+    check("failed moves: the next run starts clean and moves the tenant", r.returncode == 0 and "moved to shard 3" in out, out)
+    end = time.time() + 30
+    while time.time() < end and sums() != want:
+        time.sleep(0.5)
+    check("  ...every row once, through the gateway", sums() == want, (want, sums()))
+    # Read as a fan-out's part (only what the map gives the shard): shard 3
+    # answers for the tenant now, and shard 0 no longer does.
+    owned = lambda n, t: psql(PG[n], f"SET rdb.shard_part = on; SELECT count(*) FROM {t} WHERE id = {key}")[1].splitlines()[-1:]
+    got = [owned(n, t) for n in (3, 0) for t in moved]
+    check("  ...the hand-off: shard 3 answers for the tenant, shard 0 not", got == [["1"]] * len(moved) + [["0"]] * len(moved), got)
+    got = [psql(GW, f"SELECT v FROM {t} WHERE id = {key}") for t in ("ghost_a", "ghost_b")]
+    check("  ...keyed reads of the moved tenant", got == [(0, key), (0, key)], got)
 
 
 def split_online(tls, cmap):
@@ -1390,6 +1684,8 @@ def split_online(tls, cmap):
     r = subprocess.run(args, env=dict(ENV, RDB_PASSWORD="pw"), capture_output=True, text=True, timeout=600)
     check("rdb-shard split --online", r.returncode == 0, r.stdout + r.stderr)
     wout, _ = writer.communicate(timeout=300)
+    with open(f"{WORK}/writer.out", "w") as f:
+        f.write(wout)
     failed = [l for l in wout.splitlines() if "ERROR" in l]
     # A writer may see a retryable refusal at the hand-off; every other
     # insert lands.
@@ -1397,7 +1693,27 @@ def split_online(tls, cmap):
     landed = int(got[1]) if got[0] == 0 else -1
     if landed < 0:
         check("  ...a count after the split", False, got)
-    check("  ...the writer kept writing", landed + len(failed) == 200 and len(failed) <= 5, f"{landed} landed, {failed[:3]}")
+    detail = f"{landed} landed, {failed[:3]}"
+    if landed + len(failed) != 200:
+        # Which ids are missing, and what the writer was told for each.
+        code, out = psql(GW, "SELECT id FROM orders WHERE id >= 6000")
+        have = {int(x) for x in out.split()} if code == 0 else set()
+        missing = sorted(set(range(6000, 6200)) - have)
+        tags = [l for l in wout.splitlines() if l.strip()]
+        odd = [l for l in tags if l != "INSERT 0 1"]
+        on = {}
+        for n in ALL:
+            c, o = psql(PG[n], "SET rdb.shard_part = on; SELECT id FROM orders WHERE id >= 6000")
+            on[n] = sorted(set(int(x) for x in o.split()[1:]) & set(missing)) if c == 0 else o[-200:]
+        detail += f"; missing {missing[:10]}; {len(tags)} replies, unusual {odd[:5]}; read directly per shard {on}"
+        # Keyed, not as a part: a live span answers (incoming or not), a
+        # FOREIGN one refuses.
+        for k in missing[:3]:
+            detail += f"; id {k}: " + ", ".join(f"{n}={psql(PG[n], f'SELECT id FROM orders WHERE id = {k}')}" for n in ALL)
+        detail += "; epochs " + ", ".join(f"{n}={[l.split('|')[6] for l in psql(PG[n], 'SHOW SHARDS')[1].splitlines() if l.split('|')[1:2] == ['t']]}" for n in ALL)
+        with open(f"{WORK}/split.out", "w") as f:
+            f.write(r.stdout + r.stderr)
+    check("  ...the writer kept writing", landed + len(failed) == 200 and len(failed) <= 5, detail)
     code, out = psql(PG[3], "SET rdb.shard_part = on; SELECT count(*) FROM orders")
     on3 = int(out.splitlines()[-1]) if code == 0 else -1
     check("  ...shard 3 holds rows", on3 > 0, out)

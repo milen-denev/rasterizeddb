@@ -190,9 +190,15 @@ async fn a_select_list_subquery_runs_for_the_rows_kept() {
             assert_eq!(runs, 2 * ids.len(), "partitioned {partitioned}: {sql}");
         }
 
-        // Not applied first: a call, which could be volatile. Still right,
-        // every customer run.
+        // Applied first too: a call of a function that answers the same
+        // every time (lateral::is_immutable_function), so only the kept
+        // customers run.
         let sql = query(customers, orders, "WHERE abs(ocq.id) < 4");
+        let (got, runs) = answers(&db, &mut s, &sql, customers, ALIAS).await;
+        assert_eq!(got, want(1..4), "partitioned {partitioned}");
+        assert_eq!(runs, 2 * 3, "partitioned {partitioned}: {sql}");
+        // Not applied first: a volatile call. Still right, every customer run.
+        let sql = query(customers, orders, "WHERE ocq.id < 4 + 0 * random()");
         let (got, runs) = answers(&db, &mut s, &sql, customers, ALIAS).await;
         assert_eq!(got, want(1..4), "partitioned {partitioned}");
         assert_eq!(runs, 2 * CUSTOMERS as usize, "partitioned {partitioned}: {sql}");
@@ -249,18 +255,20 @@ fn only_the_outer_item_s_own_conjuncts_are_applied_first() {
         "c.d::text = '1'",
         "NOT c.flag",
         "c.a IS DISTINCT FROM 3",
+        "abs(c.id) < 6",
+        "c.id = $1",
     ] {
         assert!(reads_only(yes, "c"), "{yes}");
     }
     for no in [
-        "abs(c.id) < 6",
         "c.id < p.id",
         "id < 6",
         "c.id = (SELECT 1)",
-        "c.id = $1",
         "\"c\".id = 1",
         "c.id < random()",
         "1 = 1",
+        // A type name of two words reads as a bare word: left to the
+        // statement, which is only slower.
         "c.v::double precision > 1",
         "__cs0.__v = 0",
     ] {
@@ -417,9 +425,8 @@ async fn the_related_items_statement_runs_its_subqueries_for_the_tagged() {
     assert_eq!(take_narrowed_copies(ALIAS_RI), 2);
     assert_eq!(take_runs("ri\u{2024}erp\u{2024}products", ALIAS_RI), 2 * 2);
 
-    // A statement whose WHERE keeps an outer row the filter alone would
-    // not decide (an OR with another item is left to the statement): the
-    // copy is whole, the answer the same as without the subqueries.
+    // A filter over an immutable call narrows the item's copy as a plain
+    // column filter does; the answer is the same as without the subqueries.
     let all = format!(
         "SELECT {ALIAS_RI}.n, (SELECT d2.price FROM {pr} AS d2 WHERE {ALIAS_RI}.id = d2.productid LIMIT 1) FROM {p} AS {ALIAS_RI} \
          WHERE abs({ALIAS_RI}.n) < 4 ORDER BY {ALIAS_RI}.n"
@@ -427,7 +434,7 @@ async fn the_related_items_statement_runs_its_subqueries_for_the_tagged() {
     let rows = pg_rows(&db, &mut s, &all).await;
     assert_eq!(rows.iter().map(|r| r[0].clone().unwrap_or_default()).collect::<Vec<_>>(), ["1", "2", "3"]);
     assert_eq!(rows[2][1].as_deref(), Some("3.500000"));
-    assert_eq!(take_narrowed_copies(ALIAS_RI), 0);
+    assert_eq!(take_narrowed_copies(ALIAS_RI), 1);
 }
 
 /// One distinct tuple of outer values (a point lookup, or several outer

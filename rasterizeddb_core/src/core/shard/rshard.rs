@@ -42,6 +42,7 @@ use rasterizeddb_router::rshard::{
 use rclite::Arc;
 use tokio::sync::Mutex;
 
+use super::ownership;
 use crate::core::database::catalog::DatabaseCatalog;
 
 /// Bytes of backend messages one reply carries before the rest waits for
@@ -186,6 +187,10 @@ struct VSession {
     /// Query or Sync it carried (a deferred `BEGIN` before the statement is
     /// two), so the reply is not cut at the first.
     ready_left: usize,
+    /// The ownership the request being run was accepted under
+    /// ([`owned_at`]): what its fan-out parts read here, and the epoch a
+    /// coordinator asks its peers at.
+    owned: Option<StdArc<ownership::Ownership>>,
 }
 
 /// Starts the listener; runs until the process ends.
@@ -317,13 +322,21 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
             if let Some(r) = epoch_refusal(map_epoch, served.map.epoch()) {
                 return r;
             }
-            pg(conn, session, &bytes, routed).await
+            let owned = match owned_at(map_epoch) {
+                Ok(o) => o,
+                Err(r) => return r,
+            };
+            pg(conn, session, &bytes, routed, owned).await
         }
         Request::Coordinate { session, map_epoch, partials, bytes } => {
             if let Some(r) = epoch_refusal(map_epoch, served.map.epoch()) {
                 return r;
             }
-            coordinate_given(conn, session, partials, &bytes).await
+            let owned = match owned_at(map_epoch) {
+                Ok(o) => o,
+                Err(r) => return r,
+            };
+            coordinate_given(conn, session, partials, &bytes, owned).await
         }
         Request::Continue { session } => continue_reply(conn, session).await,
         Request::ResetSession { session } => reset_session(conn, session).await,
@@ -340,7 +353,11 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
             if let Some(r) = epoch_refusal(map_epoch, served.map.epoch()) {
                 return r;
             }
-            exec_part(conn, session, merge, &bytes).await
+            let owned = match owned_at(map_epoch) {
+                Ok(o) => o,
+                Err(r) => return r,
+            };
+            exec_part(conn, session, merge, &bytes, owned).await
         }
         Request::Cancel { backend_key } => {
             crate::core::cancel::cancel_request((backend_key >> 32) as i32, backend_key as u32 as i32);
@@ -397,6 +414,38 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
             None => refuse(*b"3D000", true, format!("database \"{database}\" does not exist")),
         },
     }
+}
+
+/// The ownership a request routed at map epoch `theirs` is answered under:
+/// this shard's, taken once and checked against that epoch. The served map
+/// and the ownership are installed one after the other (`SHARD MAP
+/// INSTALL`), so a request between the two is refused before effect, as a
+/// gateway one epoch apart is. A part's reads use this, never the live
+/// ownership: a map installed while it runs would otherwise move its ranges
+/// mid-statement, and one fan-out would count a moved range on both shards,
+/// or on neither.
+fn owned_at(theirs: u64) -> Result<Option<StdArc<ownership::Ownership>>, Response> {
+    match ownership::current() {
+        Some(o) if o.map_epoch != theirs => Err(epoch_refusal(theirs, o.map_epoch).expect("the epochs differ")),
+        o => Ok(o),
+    }
+}
+
+/// The map epoch a coordinator asks its peers at: the one its own request
+/// was accepted at, so every part of the statement answers for one map.
+fn part_epoch(s: &VSession) -> u64 {
+    s.owned.as_ref().map_or_else(epoch, |o| o.map_epoch)
+}
+
+/// Marks a peer's refusal a gateway retries on (a map epoch apart, before
+/// anything ran), so the coordinator passes it back as one.
+const RETRY_MARK: &str = "\u{1}retry\u{1}";
+
+/// A peer error that is a retryable refusal, as the coordinator's own
+/// refusal: nothing ran on the peer, and the coordinator's own part only
+/// read.
+fn retry_of(e: &str) -> Option<Response> {
+    e.strip_prefix(RETRY_MARK).map(|m| refuse(FENCED, true, m.to_string()))
 }
 
 fn epoch_refusal(theirs: u64, mine: u64) -> Option<Response> {
@@ -691,6 +740,7 @@ async fn open_session(conn: &Conn, session: u64, database: &str, role: &str, par
             pending: Vec::new(),
             finished: true,
             ready_left: 0,
+            owned: None,
         })),
     );
     if previous.is_some() {
@@ -749,11 +799,12 @@ fn last_tag(bytes: &[u8]) -> Option<u8> {
     (i == bytes.len()).then_some(last).flatten()
 }
 
-async fn pg(conn: &Conn, session: u64, bytes: &[u8], routed: bool) -> Response {
+async fn pg(conn: &Conn, session: u64, bytes: &[u8], routed: bool, owned: Option<StdArc<ownership::Ownership>>) -> Response {
     let Some(s) = session_of(conn, session) else {
         return refuse(SESSION_GONE, true, format!("session {session} is gone"));
     };
     let mut s = s.lock().await;
+    s.owned = owned;
     match last_tag(bytes) {
         None => return refuse(PROTOCOL, true, "a Pg request must carry whole frontend messages"),
         Some(b'H') => return refuse(*b"0A000", true, "a batch ending in Flush is not in rshard version 1; end it with Sync"),
@@ -885,6 +936,7 @@ impl PartGuard {
     fn on(s: &VSession) -> PartGuard {
         let c = crate::core::cancel::session_by_pid(s.bridge.pid);
         if let Some(c) = &c {
+            *c.part_owned.lock().unwrap_or_else(|e| e.into_inner()) = s.owned.clone();
             c.fan_out_part.store(true, Ordering::Release);
         }
         PartGuard(c)
@@ -895,6 +947,7 @@ impl Drop for PartGuard {
     fn drop(&mut self) {
         if let Some(c) = &self.0 {
             c.fan_out_part.store(false, Ordering::Release);
+            *c.part_owned.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
 }
@@ -1019,9 +1072,9 @@ fn ext_head(st: &super::topn_ext::Statement, fields: &Option<Vec<u8>>) -> Vec<u8
 /// and every peer's (each from `bytes`, the client's statement) merged by
 /// key, `offset` skipped, `limit` kept, answered as the client's batch asks.
 async fn coordinate_topn_ext(session: u64, s: &mut VSession, st: &super::topn_ext::Statement, plan: super::topn_ext::Plan, bytes: &[u8]) -> Response {
-    let (database, role) = (s.database.clone(), s.role.clone());
+    let (database, role, at) = (s.database.clone(), s.role.clone(), part_epoch(s));
     let merge = Merge::TopN { limit: plan.limit.saturating_add(plan.offset), offset: 0 };
-    let (mine, peers) = tokio::join!(ext_top_part(s, st, &plan), peer_parts(&database, &role, bytes, merge));
+    let (mine, peers) = tokio::join!(ext_top_part(s, st, &plan), peer_parts(&database, &role, bytes, merge, at));
     let status = s.bridge.status;
     let fail = |code: &str, msg: &str| Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply(code, msg, status) };
     let mine = match mine {
@@ -1049,7 +1102,12 @@ async fn coordinate_topn_ext(session: u64, s: &mut VSession, st: &super::topn_ex
                 }
                 rows.extend(p.rows);
             }
-            Err(e) => return fail("XX000", &format!("the coordinator could not gather shard {id}'s part: {e}")),
+            Err(e) => {
+                if let Some(r) = retry_of(&e) {
+                    return r;
+                }
+                return fail("XX000", &format!("the coordinator could not gather shard {id}'s part: {e}"));
+            }
         }
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1069,7 +1127,7 @@ async fn coordinate_topn_ext(session: u64, s: &mut VSession, st: &super::topn_ex
 /// every peer's, each row kept once by its bytes (in the client's formats,
 /// the same on every shard).
 async fn coordinate_distinct_ext(session: u64, s: &mut VSession, bytes: &[u8]) -> Response {
-    let (database, role) = (s.database.clone(), s.role.clone());
+    let (database, role, at) = (s.database.clone(), s.role.clone(), part_epoch(s));
     let local = async {
         let _part = PartGuard::on(s);
         s.bridge.raw(bytes);
@@ -1090,7 +1148,7 @@ async fn coordinate_distinct_ext(session: u64, s: &mut VSession, bytes: &[u8]) -
         }
         Ok((head, rows, error))
     };
-    let (mine, peers) = tokio::join!(local, peer_parts(&database, &role, bytes, Merge::Concat));
+    let (mine, peers) = tokio::join!(local, peer_parts(&database, &role, bytes, Merge::Concat, at));
     let status = s.bridge.status;
     let fail = |code: &str, msg: &str| Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply(code, msg, status) };
     let (head, mine, error) = match mine {
@@ -1129,7 +1187,12 @@ async fn coordinate_distinct_ext(session: u64, s: &mut VSession, bytes: &[u8]) -
                     return fail("54000", "a coordinated result passed 256 MiB");
                 }
             }
-            Err(e) => return fail("XX000", &format!("the coordinator could not gather shard {id}'s part: {e}")),
+            Err(e) => {
+                if let Some(r) = retry_of(&e) {
+                    return r;
+                }
+                return fail("XX000", &format!("the coordinator could not gather shard {id}'s part: {e}"));
+            }
         }
     }
     let mut out = head;
@@ -1191,8 +1254,8 @@ async fn coordinate_distinct(session: u64, s: &mut VSession, sql: &str) -> Respo
     // Keys are not needed: a top-N with no keys and no limit is the plain run.
     let plain = super::topn::TopN { keys: Vec::new(), limit: u64::MAX, offset: 0, part_sql: sql.to_string() };
     let request = query_message(sql);
-    let (database, role) = (s.database.clone(), s.role.clone());
-    let (mine, peers) = tokio::join!(top_part(s, &plain), peer_parts(&database, &role, &request, Merge::Concat));
+    let (database, role, at) = (s.database.clone(), s.role.clone(), part_epoch(s));
+    let (mine, peers) = tokio::join!(top_part(s, &plain), peer_parts(&database, &role, &request, Merge::Concat, at));
     let mine = match mine {
         Ok(p) => p,
         Err(e) => {
@@ -1236,6 +1299,9 @@ async fn coordinate_distinct(session: u64, s: &mut VSession, sql: &str) -> Respo
                 }
             }
             Err(e) => {
+                if let Some(r) = retry_of(&e) {
+                    return r;
+                }
                 let st = status_of(s);
                 let msg = format!("the coordinator could not gather shard {id}'s part: {e}");
                 return Response::PgReply { session, map_epoch: epoch(), more: false, status: st, bytes: error_reply("XX000", &msg, st) };
@@ -1358,12 +1424,12 @@ fn partial_of(id: u32, part: Result<PartReply, String>) -> Result<Vec<u8>, Resul
 
 /// Every other shard's part of `bytes` under `merge`, asked for at once
 /// (one round trip of latency, not one per shard), in map order.
-async fn peer_parts(database: &str, role: &str, bytes: &[u8], merge: Merge) -> Vec<(u32, Result<PartReply, String>)> {
+async fn peer_parts(database: &str, role: &str, bytes: &[u8], merge: Merge, at: u64) -> Vec<(u32, Result<PartReply, String>)> {
     let Some(served) = served() else {
         return Vec::new();
     };
     let ids: Vec<u32> = served.map.shards().iter().map(|i| i.id).filter(|&id| id != served.shard_id).collect();
-    let asks = ids.iter().map(|&id| peer_part(id, database, role, bytes, merge.clone()));
+    let asks = ids.iter().map(|&id| peer_part(id, database, role, bytes, merge.clone(), at));
     ids.iter().copied().zip(futures::future::join_all(asks).await).collect()
 }
 
@@ -1373,7 +1439,7 @@ async fn peer_parts(database: &str, role: &str, bytes: &[u8], merge: Merge) -> V
 /// its Hello (or the connection), and opening the session says so before
 /// anything ran there, so the link is made afresh and the open tried once
 /// more.
-async fn peer_part(id: u32, database: &str, role: &str, bytes: &[u8], merge: Merge) -> Result<PartReply, String> {
+async fn peer_part(id: u32, database: &str, role: &str, bytes: &[u8], merge: Merge, at: u64) -> Result<PartReply, String> {
     let session = NEXT_PEER_SESSION.fetch_add(1, Ordering::Relaxed);
     let e = |x: rastcp::error::RastcpError| x.to_string();
     let open = Request::OpenSession {
@@ -1405,11 +1471,14 @@ async fn peer_part(id: u32, database: &str, role: &str, bytes: &[u8], merge: Mer
             client = peer_client(id).await?;
         }
     }
-    let req = Request::ExecPart { session, map_epoch: epoch(), merge, bytes: bytes.to_vec() };
+    let req = Request::ExecPart { session, map_epoch: at, merge, bytes: bytes.to_vec() };
     let answer = Response::decode(&client.send(&req.encode()).await.map_err(e)?);
     let _ = client.send(&Request::CloseSession { session }.encode()).await;
     match answer? {
         Response::PartReply(p) => Ok(p),
+        Response::Refused(r) if r.before_effect && (r.sqlstate == MOVED || r.sqlstate == FENCED) => {
+            Err(format!("{RETRY_MARK}shard {id}: {}", r.message))
+        }
         Response::Refused(r) => Err(format!("shard {id}: {}", r.message)),
         other => Err(format!("shard {id} answered ExecPart with {other:?}")),
     }
@@ -1425,7 +1494,8 @@ async fn coordinate(session: u64, s: &mut VSession, bytes: &[u8]) -> Response {
         return refuse(PROTOCOL, true, "this node is not a shard");
     }
     let mut partials = Vec::new();
-    for (id, part) in peer_parts(&s.database, &s.role, bytes, Merge::Coordinator).await {
+    let at = part_epoch(s);
+    for (id, part) in peer_parts(&s.database, &s.role, bytes, Merge::Coordinator, at).await {
         match partial_of(id, part) {
             Ok(p) => partials.push(p),
             Err(Ok(body)) => {
@@ -1435,6 +1505,9 @@ async fn coordinate(session: u64, s: &mut VSession, bytes: &[u8]) -> Response {
                 return Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes };
             }
             Err(Err(e)) => {
+                if let Some(r) = retry_of(&e) {
+                    return r;
+                }
                 let msg = format!("the coordinator could not gather shard {id}'s part: {e}");
                 return Response::PgReply { session, map_epoch: epoch(), more: false, status: s.bridge.status, bytes: error_reply("XX000", &msg, s.bridge.status) };
             }
@@ -1446,7 +1519,7 @@ async fn coordinate(session: u64, s: &mut VSession, bytes: &[u8]) -> Response {
 /// `Request::Coordinate`: the aggregate run on the gateway's session
 /// `session` with the other shards' partials it gathered itself, inside the
 /// transaction their parts ran in.
-async fn coordinate_given(conn: &Conn, session: u64, partials: Vec<Vec<u8>>, bytes: &[u8]) -> Response {
+async fn coordinate_given(conn: &Conn, session: u64, partials: Vec<Vec<u8>>, bytes: &[u8], owned: Option<StdArc<ownership::Ownership>>) -> Response {
     if served().is_none() {
         return refuse(PROTOCOL, true, "this node is not a shard");
     }
@@ -1457,6 +1530,7 @@ async fn coordinate_given(conn: &Conn, session: u64, partials: Vec<Vec<u8>>, byt
         return refuse(SESSION_GONE, true, format!("session {session} is gone"));
     };
     let mut s = s.lock().await;
+    s.owned = owned;
     s.finished = true;
     merge_partials(session, &mut s, partials, bytes).await
 }
@@ -1596,7 +1670,7 @@ async fn read_chunk(session: u64, s: &mut VSession) -> Response {
 
 /// One shard's part of a fan-out: the statement run as a Pg batch, its
 /// DataRows split out for the gateway to concatenate or sum.
-async fn exec_part(conn: &Conn, session: u64, merge: Merge, bytes: &[u8]) -> Response {
+async fn exec_part(conn: &Conn, session: u64, merge: Merge, bytes: &[u8], owned: Option<StdArc<ownership::Ownership>>) -> Response {
     if let Merge::TopN { .. } = merge {
         // A top-N's part: the statement rewritten so its keys come back in
         // text whatever formats the client asked for (module docs of
@@ -1617,6 +1691,7 @@ async fn exec_part(conn: &Conn, session: u64, merge: Merge, bytes: &[u8]) -> Res
             return refuse(SESSION_GONE, true, format!("session {session} is gone"));
         };
         let mut s = s.lock().await;
+        s.owned = owned;
         return match ext_top_part(&mut s, &st, &plan).await {
             Ok(p) => {
                 let head = ext_head(&st, &p.fields);
@@ -1632,6 +1707,7 @@ async fn exec_part(conn: &Conn, session: u64, merge: Merge, bytes: &[u8]) -> Res
         return refuse(SESSION_GONE, true, format!("session {session} is gone"));
     };
     let mut s = s.lock().await;
+    s.owned = owned;
     if last_tag(bytes).is_none() {
         return refuse(PROTOCOL, true, "an ExecPart request must carry whole frontend messages");
     }

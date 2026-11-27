@@ -295,9 +295,12 @@ fn per_row(sql: &str, at: usize) -> bool {
     }
     open.iter().any(|&paren| {
         let before = sql[..paren].trim_end();
+        // Past the whole character: `+ 1` cut a multibyte one.
         let word_start = before
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .map_or(0, |p| p + 1);
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |(p, c)| p + c.len_utf8());
         let word = before[word_start..].to_ascii_lowercase();
         word == "filter" || crate::core::rql::distinct_on::AGGREGATES.contains(&word.as_str())
     })
@@ -693,8 +696,9 @@ fn rewrite_write_where_inner(
     // subquery that fails on some row the statement does not touch
     // (`jsonb_each` of a document that is no object) failed the write, where
     // PostgreSQL filters first. Only terms with no subquery's value and no
-    // call (one may answer differently when asked twice); a term left out
-    // only keeps more rows.
+    // call but of a function that answers the same every time
+    // (`lateral::is_immutable_function`); a term left out only keeps more
+    // rows.
     let own_terms: Vec<String> = crate::core::rql::lateral::conjuncts(condition)
         .into_iter()
         .filter(|term| {
@@ -702,12 +706,14 @@ fn rewrite_write_where_inner(
             let calls = (0..bytes.len()).any(|i| {
                 bytes[i] == b'(' && {
                     let before = term[..i].trim_end();
-                    let word_at = before.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |p| p + 1);
+                    let word_at = before.char_indices().rev().find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |(p, c)| p + c.len_utf8());
                     let word = &before[word_at..];
-                    !word.is_empty() && !["IN", "AND", "OR", "NOT"].iter().any(|k| word.eq_ignore_ascii_case(k))
+                    !word.is_empty()
+                        && !["IN", "AND", "OR", "NOT", "CAST"].iter().any(|k| word.eq_ignore_ascii_case(k))
+                        && !crate::core::rql::lateral::is_immutable_function(word)
                 }
             });
-            !term.trim().is_empty() && !term.contains("__cw.") && !term.contains('$') && !calls
+            !term.trim().is_empty() && !term.contains("__cw.") && !calls
         })
         .collect();
     let narrowed = if own_terms.is_empty() { String::new() } else { format!(" WHERE {}", own_terms.join(" AND ")) };
