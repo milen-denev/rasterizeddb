@@ -88,3 +88,51 @@ async fn a_write_evaluates_its_subquery_for_the_rows_it_may_touch() {
     ];
     check(&pool, cases).await;
 }
+
+/// A condition calling a function that answers the same every time
+/// (`lower`, `coalesce`, `substr`, …) or casting narrows the rows too. It
+/// was left out of what is pushed, as any call was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_condition_over_an_immutable_function_or_a_cast_narrows_too() {
+    let (_server, pool) = start().await;
+    let cases: &[(&str, &[&str])] = &[
+        (r#"SELECT id FROM jp WHERE lower(k) = 'obj' AND EXISTS (SELECT 1 FROM jsonb_each(jp.jb) AS m WHERE m.key = 'a') ORDER BY id"#, &[r#"1"#][..]),
+        (r#"SELECT id FROM jp WHERE upper(jp.k) LIKE '%OBJ' AND length(k) < 5 AND (SELECT count(*) FROM jsonb_each(jp.jb)) >= 0 ORDER BY id"#, &[r#"1"#, r#"7"#][..]),
+        (r#"SELECT id FROM jp WHERE coalesce(id, 0) + 1 = 2 AND EXISTS (SELECT 1 FROM jsonb_each_text(jp.jb) AS m WHERE m.value = '1')"#, &[r#"1"#][..]),
+        (r#"SELECT id FROM jp WHERE CAST(id AS text) = '1' AND 'a' IN (SELECT jsonb_object_keys(jb))"#, &[r#"1"#][..]),
+        (r#"SELECT id FROM jp WHERE id::text = '7' AND NOT EXISTS (SELECT 1 FROM jsonb_each(jp.jb) AS m)"#, &[r#"7"#][..]),
+        (r#"SELECT jp.id, m.key FROM jp CROSS JOIN LATERAL jsonb_each(jp.jb) AS m WHERE substr(k, 1, 3) = 'obj' ORDER BY m.key"#, &[r#"1|0"#, r#"1|a"#, r#"1|b"#, r#"1|n"#, r#"1|s"#][..]),
+        (r#"UPDATE jp SET t = 'c!' WHERE lower(k) = 'obj' AND EXISTS (SELECT 1 FROM jsonb_each(jp.jb) AS m WHERE m.key = 'a') RETURNING id"#, &[r#"1"#][..]),
+    ];
+    check(&pool, cases).await;
+}
+
+/// And one comparing the row with a parameter, which is one value for the
+/// whole statement.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_condition_over_a_parameter_narrows_too() {
+    let server = TestServer::start().await.expect("server");
+    let (client, connection) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(connection);
+    client.batch_execute(SETUP).await.expect("setup");
+    let one = client
+        .query("SELECT id FROM jp WHERE id = $1 AND EXISTS (SELECT 1 FROM jsonb_each(jp.jb) AS m WHERE m.key = 'a')", &[&1i32])
+        .await
+        .expect("an integer parameter");
+    assert_eq!(one.iter().map(|r| r.get::<_, i32>(0)).collect::<Vec<_>>(), [1]);
+    let two = client
+        .query("SELECT id FROM jp WHERE lower(k) = $1 AND EXISTS (SELECT 1 FROM jsonb_each(jp.jb) AS m WHERE m.key = $2)", &[&"obj", &"a"])
+        .await
+        .expect("two text parameters");
+    assert_eq!(two.iter().map(|r| r.get::<_, i32>(0)).collect::<Vec<_>>(), [1]);
+    let counted = client
+        .query("SELECT id FROM jp WHERE k = $1 AND (SELECT count(*) FROM jsonb_object_keys(jp.jb)) = 5", &[&"obj"])
+        .await
+        .expect("a scalar subquery");
+    assert_eq!(counted.iter().map(|r| r.get::<_, i32>(0)).collect::<Vec<_>>(), [1]);
+    let written = client
+        .query("UPDATE jp SET t = 'd!' WHERE id = $1 AND EXISTS (SELECT 1 FROM jsonb_each(jp.jb) AS m WHERE m.key = 'a') RETURNING id", &[&1i32])
+        .await
+        .expect("a write");
+    assert_eq!(written.iter().map(|r| r.get::<_, i32>(0)).collect::<Vec<_>>(), [1]);
+}
