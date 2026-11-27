@@ -174,8 +174,21 @@ jobs:
       # network, not to code a training run would cover). Built, not run: it
       # opens a window at start.
       - name: Build RasterizedDB Studio (release profile)
-        if: matrix.p.studio && matrix.edition == 'gpl'
-        run: cargo build --locked --release --target ${{ matrix.p.target }} -p rdb_studio
+        if: matrix.p.studio
+        shell: bash
+        run: |
+          if [ "${{ matrix.edition }}" = enterprise ]; then
+            # With the LEDGER page (ledger tables, vaults, encrypted columns).
+            cargo build --locked --release --target ${{ matrix.p.target }} -p rdb_studio --features enterprise
+          else
+            cargo build --locked --release --target ${{ matrix.p.target }} -p rdb_studio
+          fi
+
+      # The offline ledger checker, for the enterprise archive: its defaults
+      # (ledger, ledger_s3) are the features it needs.
+      - name: Build rdb-ledger-verify (release profile)
+        if: matrix.edition == 'enterprise'
+        run: cargo build --locked --release --target ${{ matrix.p.target }} -p rasterizeddb_enterprise --bin rdb-ledger-verify
 
       - name: Package
         id: package
@@ -201,10 +214,21 @@ jobs:
             mkdir -p "dist/$server"
             cp "$rel/rasterizeddb_core_enterprise$ext" "dist/$server/rasterizeddb-enterprise$ext"
             cp "$rel/rasterizeddb_gateway_enterprise$ext" "dist/$server/rasterizeddb-gateway-enterprise$ext"
+            cp "$rel/rdb-ledger-verify$ext" "dist/$server/rdb-ledger-verify$ext"
             cp README.md LICENSE-POLYFORM-SB "dist/$server/"
             cp branding/rasterizeddb.svg "dist/$server/rasterizeddb.svg"
             cd dist
             echo "server=$(pack "$server")" >> "$GITHUB_OUTPUT"
+            if [ "${{ matrix.p.studio }}" = true ]; then
+              studio="rdb-studio-enterprise-$version-${{ matrix.p.name }}"
+              mkdir -p "$studio"
+              cp "../$rel/rdb_studio$ext" "$studio/rdb-studio$ext"
+              cp ../rdb_studio/README.md "$studio/README.md"
+              cp ../LICENSE-POLYFORM-SB "$studio/"
+              cp ../branding/rasterizeddb.svg "$studio/rdb_studio.svg"
+              case "${{ matrix.p.target }}" in *linux*) cp ../rdb_studio/packaging/rdb_studio.desktop "$studio/" ;; esac
+              echo "studio=$(pack "$studio")" >> "$GITHUB_OUTPUT"
+            fi
             exit 0
           fi
           server="rasterizeddb-server-$version-${{ matrix.p.name }}"
@@ -503,7 +527,7 @@ jobs:
 
             **The gateway** (`rasterizeddb-gateway-*`), which routes clients across shards, on the same six platforms.
 
-            **Enterprise edition** (`rasterizeddb-enterprise-*`), under `LICENSE-POLYFORM-SB`: the enterprise server (`rasterizeddb-enterprise`) and gateway (`rasterizeddb-gateway-enterprise`) in one archive per platform, with every feature: tenant isolation, segregation policies, per-user routing and client statistics, on top of everything in the GPL server.
+            **Enterprise edition** (`rasterizeddb-enterprise-*`), under `LICENSE-POLYFORM-SB`: the enterprise server (`rasterizeddb-enterprise`) and gateway (`rasterizeddb-gateway-enterprise`) in one archive per platform, with every feature: tenant isolation, segregation policies, per-user routing and client statistics, ledger tables (VERIFY LEDGER, legal holds, versioned tables, S3 anchors), secret vaults and encrypted columns (file, PKCS#11 and ML-KEM key providers), on top of everything in the GPL server. The archive also holds `rdb-ledger-verify`, which checks a ledger's chain offline. `rdb-studio-enterprise-*` is Studio with its LEDGER page, under the same licence.
 
             Every server is built with all its release features: the broker (native, Kafka, AMQP, MQTT), sharding with Raft and two-phase commit, branching, storage pools and compression, key/value storage and cache, persistent indexes, the MySQL and SQL Server front ends, S3 backups and the PostgreSQL importer.
 
