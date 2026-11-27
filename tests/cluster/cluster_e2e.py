@@ -1172,6 +1172,12 @@ def stale_templates():
     # level) refutes it there and sends again, unseen by the client.
     again = [psql(GW, q) == (0, want) for q, want in reads.items()] + [psql_script(GW, prepared) == (0, "110")]
     check("stale templates: the reads again", all(again), again)
+    # Gone again: shard 3 joins later with only orders and stores, and a
+    # rebalance moving this table's blocks onto it would find no table there.
+    for n in SHARDS:
+        code, out = psql(PG[n], f"DROP TABLE {t}")
+        if code != 0:
+            sys.exit(f"shard {n}: DROP TABLE {t}: {out}")
 
 
 def broadcast_limits():
