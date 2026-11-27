@@ -201,6 +201,14 @@ fn parse_time(s: &str) -> Result<i64, String> {
 struct Keyring {
     path: Option<std::path::PathBuf>,
     keys: BTreeMap<(String, i64), Vec<u8>>,
+    /// The provider that wrapped its keys (`provider <uri>`, its first
+    /// line), written by the same rename that rewraps them: a ROTATE KEY
+    /// is then one atomic step. Before, the keys were rewrapped and the
+    /// policy record naming the new provider written after; a failure or a
+    /// crash between left every key wrapped under one provider and the
+    /// policy naming the other, and nothing could be unwrapped. `None` for
+    /// a keyring never rotated: the policy's provider wrapped it.
+    provider: Option<String>,
 }
 
 static KEYRINGS: OnceLock<Mutex<HashMap<(String, u128), Arc<Mutex<Keyring>>>>> = OnceLock::new();
@@ -218,10 +226,15 @@ fn keyring(store_key: &str, vault: u128) -> Result<Arc<Mutex<Keyring>>, String> 
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let mut keys = BTreeMap::new();
+    let mut wrapped_by = None;
     if let Some(p) = &path {
         match std::fs::read_to_string(p) {
             Ok(t) => {
                 for line in t.lines() {
+                    if let Some(uri) = line.strip_prefix("provider ") {
+                        wrapped_by = Some(uri.trim().to_string());
+                        continue;
+                    }
                     let mut f = line.split_whitespace();
                     let (Some(name), Some(v), Some(w)) = (f.next(), f.next(), f.next()) else { continue };
                     let name = unhex(name).and_then(|b| String::from_utf8(b).ok()).ok_or("XX001: the vault keyring is damaged")?;
@@ -233,7 +246,7 @@ fn keyring(store_key: &str, vault: u128) -> Result<Arc<Mutex<Keyring>>, String> 
             Err(e) => return Err(format!("{}: {e}", p.display())),
         }
     }
-    let k = Arc::new(Mutex::new(Keyring { path, keys }));
+    let k = Arc::new(Mutex::new(Keyring { path, keys, provider: wrapped_by }));
     map.insert((store_key.to_string(), vault), k.clone());
     Ok(k)
 }
@@ -273,6 +286,9 @@ impl Keyring {
         use std::io::Write;
         let tmp = p.with_extension("keys.tmp");
         let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        if let Some(uri) = &self.provider {
+            f.write_all(format!("provider {uri}\n").as_bytes()).map_err(|e| e.to_string())?;
+        }
         for ((n, v), w) in &self.keys {
             f.write_all(Self::line(n, *v, w).as_bytes()).map_err(|e| e.to_string())?;
         }
@@ -318,6 +334,13 @@ pub(crate) fn check_provider(uri: &str) -> Result<(), String> {
     })
 }
 
+/// The provider `ring`'s keys are wrapped by: the one its header names, or
+/// the policy's for a keyring never rotated.
+fn wrapped_by(ring: &Keyring, policy: &crate::ledger::policy::LedgerPolicy) -> Result<Arc<dyn KeyProvider>, String> {
+    let uri = ring.provider.as_deref().or(policy.key_provider.as_deref()).ok_or("XX001: the vault has no key provider")?;
+    provider(uri)
+}
+
 /// What the keyring records for a key that lives in the HSM.
 const HSM_MARKER: &[u8] = b"hsm";
 
@@ -356,7 +379,7 @@ fn key_use(g: &LedgerGuard, store_key: &str, vault: &TableSchema, name: &str) ->
         .get(&(full, 1))
         .cloned()
         .ok_or_else(|| format!("42704: vault \"{}\" has no key '{name}' (VAULT {} CREATE KEY '{name}')", vault.name, vault.name))?;
-    let provider = provider(policy.key_provider.as_deref().ok_or("XX001: the vault has no key provider")?)?;
+    let provider = wrapped_by(&keyring(store_key, policy.id)?.lock(), &policy)?;
     if wrapped == HSM_MARKER {
         provider.hsm().ok_or("0A000: the vault's key provider has no HSM")?;
         return Ok(KeyUse::Hsm(provider, hsm_label(policy.id, name)));
@@ -462,6 +485,20 @@ fn current(rows: &[VRow]) -> BTreeMap<String, (Option<VRow>, String)> {
 /// could not bring either back, so neither runs inside a transaction block
 /// (25001, as PostgreSQL refuses VACUUM there). A batch holding one runs
 /// statement by statement (`pgwire::opens_an_implicit_block`).
+/// The secret verbs do not apply to a key (`key:<name>`, `CREATE KEY`):
+/// disabling, deleting or purging one changed only its row, and the
+/// encrypted columns its material wraps went on encrypting and decrypting
+/// (from their cached data keys, after a purge too).
+fn not_a_key(name: &str) -> Result<(), String> {
+    if name.starts_with("key:") {
+        return Err(format!(
+            "42602: '{name}' is one of the vault's keys, not a secret: DISABLE, ENABLE, DELETE, RECOVER, PURGE and GET \
+             SECRET do not apply to it"
+        ));
+    }
+    Ok(())
+}
+
 fn refuse_in_block(what: &str) -> Result<(), String> {
     use rasterizeddb_core::core::mvcc::owner::{OwnerKind, current};
     if current().is_some_and(|o| o.kind == OwnerKind::Block) {
@@ -539,13 +576,31 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
             if secrets.get(&name).is_some_and(|(_, s)| s == "deleted") {
                 return Err(format!("55000: secret '{name}' is deleted; RECOVER it or PURGE it first"));
             }
-            let version = rows.iter().filter(|r| r.name == name).map(|r| r.version).max().unwrap_or(0) + 1;
-            let provider = provider(policy.key_provider.as_deref().ok_or("XX001: the vault has no key provider")?)?;
+            // Wrapped and added under the keyring's lock, by the provider it
+            // names then: a ROTATE KEY between the two would leave this key
+            // wrapped by the provider it replaced.
+            let ring = keyring(store_key, vault)?;
+            let mut ring = ring.lock();
+            // Past every version the rows and the keyring know: the rows
+            // show committed ones only, so two SETs at once took the same
+            // number and the later one's key replaced the earlier's in the
+            // keyring (the earlier version unreadable once it committed). A
+            // version a rollback left in the keyring is skipped, never reused.
+            let version = rows
+                .iter()
+                .filter(|r| r.name == name)
+                .map(|r| r.version)
+                .chain(ring.keys.keys().filter(|(n, _)| *n == name).map(|(_, v)| *v))
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let provider = wrapped_by(&ring, &policy)?;
             let dek = crypto::new_dek()?;
             let wrapped = provider.wrap(&dek)?;
             let sealed = crypto::seal(&dek, value.as_slice(), &aad(vault, &name, version))?;
             drop(dek);
-            keyring(store_key, vault)?.lock().add(&name, version, wrapped)?;
+            ring.add(&name, version, wrapped)?;
+            drop(ring);
             g.audit_at_commit(store_key, vault, req.tx, format!("SET {} '{name}' v{version} by {role}", table.name))?;
             let b64 = base64::engine::general_purpose::STANDARD.encode(sealed);
             Ok(reply(vec![format!("{name} version {version}")], vec![insert(&name, version, &b64, "active", &ct, nb, exp, &tags)]))
@@ -561,8 +616,8 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
                 other => return Err(format!("42601: unexpected {other} in VAULT GET ALL")),
             };
             let now = clock::now_micros();
-            let provider = provider(policy.key_provider.as_deref().ok_or("XX001: the vault has no key provider")?)?;
             let ring = keyring(store_key, vault)?;
+            let provider = wrapped_by(&ring.lock(), &policy)?;
             let mut out = Vec::new();
             for (name, (newest, state)) in &secrets {
                 if name.starts_with("key:") || state != "active" || prefix.as_ref().is_some_and(|p| !name.starts_with(p.as_str())) {
@@ -589,6 +644,7 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
                 return Err("42601: VAULT v GET SECRET 'name' [VERSION n]".to_string());
             }
             let name = quoted(w.get(4), "the secret's name")?;
+            not_a_key(&name)?;
             let wanted: Option<i64> = match at(5) {
                 "VERSION" => Some(at(6).parse().map_err(|_| "42601: VERSION takes a number")?),
                 "" => None,
@@ -619,7 +675,7 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
             let Some(wrapped) = keyring(store_key, vault)?.lock().keys.get(&(name.clone(), row.version)).cloned() else {
                 return refuse("its key was purged; it can no longer be read");
             };
-            let provider = provider(policy.key_provider.as_deref().ok_or("XX001: the vault has no key provider")?)?;
+            let provider = wrapped_by(&keyring(store_key, vault)?.lock(), &policy)?;
             let dek = provider.unwrap(&wrapped)?;
             let sealed = base64::engine::general_purpose::STANDARD
                 .decode(row.value.as_bytes())
@@ -671,13 +727,16 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
         }
         verb @ ("DISABLE" | "ENABLE" | "DELETE" | "RECOVER") => {
             let name = quoted(w.get(4), "the secret's name")?;
+            not_a_key(&name)?;
             let Some((_, state)) = secrets.get(&name) else {
                 return Err(format!("42704: no secret '{name}'"));
             };
             let (from_ok, to) = match verb {
                 "DISABLE" => (state == "active", "disabled"),
                 "ENABLE" => (state == "disabled", "active"),
-                "DELETE" => (state != "deleted", "deleted"),
+                // Not a purged one: a RECOVER would then mark active versions
+                // that can never be read.
+                "DELETE" => (state != "deleted" && state != "purged", "deleted"),
                 _ => (state == "deleted", "active"),
             };
             if !from_ok {
@@ -689,6 +748,7 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
         "PURGE" => {
             refuse_in_block("PURGE")?;
             let name = quoted(w.get(4), "the secret's name")?;
+            not_a_key(&name)?;
             let Some((_, state)) = secrets.get(&name) else {
                 return Err(format!("42704: no secret '{name}'"));
             };
@@ -709,14 +769,24 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
             let gone = before - ring.keys.len();
             ring.rewrite()?;
             audit(store_key, vault, &format!("PURGE {} '{name}' by {role}: {gone} key(s) destroyed", table.name))?;
-            Ok(reply(vec![format!("{name} purged: {gone} version(s) can never be decrypted again")], Vec::new()))
+            // Its state is `purged` from now: it stayed `deleted`, which SET
+            // refused for good ("RECOVER it or PURGE it first") and a second
+            // PURGE took as one more to do.
+            Ok(reply(
+                vec![format!("{name} purged: {gone} version(s) can never be decrypted again")],
+                vec![insert(&name, 0, "", "purged", "", 0, 0, "")],
+            ))
         }
         "ROTATE" => {
             if at(3) != "KEY" {
                 return Err("42601: VAULT v ROTATE KEY [TO '<provider>']".to_string());
             }
             refuse_in_block("ROTATE KEY")?;
-            let old_uri = policy.key_provider.clone().ok_or("XX001: the vault has no key provider")?;
+            let old_uri = {
+                let ring = keyring(store_key, vault)?;
+                let ring = ring.lock();
+                ring.provider.clone().or(policy.key_provider.clone()).ok_or("XX001: the vault has no key provider")?
+            };
             let new_uri = match at(4) {
                 "TO" => quoted(w.get(5), "a key provider")?,
                 _ => old_uri.clone(),
@@ -736,8 +806,16 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
                 rewrapped.insert(k.clone(), new.wrap(&dek)?);
             }
             let n = rewrapped.len();
-            ring.keys = rewrapped;
-            ring.rewrite()?;
+            // The keys and the provider that wrapped them, in one rename;
+            // undone in memory if it fails, so this process goes on
+            // unwrapping with the old one.
+            let (old_keys, old_by) = (std::mem::replace(&mut ring.keys, rewrapped), ring.provider.replace(new_uri.clone()));
+            if let Err(e) = ring.rewrite() {
+                ring.keys = old_keys;
+                ring.provider = old_by;
+                return Err(e);
+            }
+            drop(ring);
             audit(store_key, vault, &format!("ROTATE KEY {} by {role}: {n} key(s) rewrapped under {}", table.name, new.describe()))?;
             let mut out = reply(vec![format!("{n} data key(s) rewrapped under {}", new.describe())], Vec::new());
             if new_uri != old_uri {
@@ -824,7 +902,7 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
                     vec![insert(&full, 1, "", "active", &kind, 0, 0, "")],
                 ));
             }
-            let provider = provider(policy.key_provider.as_deref().ok_or("XX001: the vault has no key provider")?)?;
+            let provider = wrapped_by(&keyring(store_key, vault)?.lock(), &policy)?;
             if kind.starts_with("hsm-") {
                 // Made inside the token and used there; the keyring only
                 // records that it exists.
@@ -836,7 +914,12 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
                 return Ok(reply(vec![format!("key {name} ({kind}, inside the HSM)")], vec![insert(&full, 1, "", "active", &kind, 0, 0, "")]));
             }
             let material = crypto::new_dek()?;
-            keyring(store_key, vault)?.lock().add(&full, 1, provider.wrap(&material)?)?;
+            {
+                let ring = keyring(store_key, vault)?;
+                let mut ring = ring.lock();
+                let provider = wrapped_by(&ring, &policy)?;
+                ring.add(&full, 1, provider.wrap(&material)?)?;
+            }
             g.audit_at_commit(store_key, vault, req.tx, format!("CREATE KEY {} '{name}' {kind} by {role}", table.name))?;
             Ok(reply(vec![format!("key {name} ({kind})")], vec![insert(&full, 1, "", "active", &kind, 0, 0, "")]))
         }
@@ -856,7 +939,7 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
                 .get(&(full.clone(), 1))
                 .cloned()
                 .ok_or_else(|| format!("55000: key '{name}' was purged"))?;
-            let provider = provider(policy.key_provider.as_deref().ok_or("XX001: the vault has no key provider")?)?;
+            let provider = wrapped_by(&keyring(store_key, vault)?.lock(), &policy)?;
             let value = || quoted(w.get(6), "a value").map(|v| (v, at(5) == "VALUE"));
             let aad_k = aad(vault, &full, 1);
             if kind.starts_with("hsm-") {

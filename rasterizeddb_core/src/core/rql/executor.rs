@@ -10677,6 +10677,7 @@ async fn execute_ledger_statement(sql: &str, database: &Arc<Database>, depth: us
         role: &role,
         superuser,
         tx,
+        aborted: Some(&|t| database.transactions.outcome(t) == crate::core::mvcc::TxOutcome::Aborted),
     };
     let reply = crate::core::ledger_hooks::statement(&database.ledger_store(), request)?;
     for insert in &reply.inserts {
@@ -13906,7 +13907,14 @@ async fn run_conversion(
     };
     let table = conversion.table.clone();
     match database.relation_for(&table, owner(), TableMode::AccessExclusive).await {
-        Ok(Some(crate::core::database::relation::Relation::Plain(_))) => {}
+        // A ledger table or vault is never converted: the partitioned table
+        // it became was a plain one (`rewrite_definition` builds no ledger
+        // kind), which took UPDATE, DELETE and DROP inside its retention.
+        Ok(Some(relation @ crate::core::database::relation::Relation::Plain(_))) => {
+            if let Err(e) = crate::core::ledger_hooks::admit(relation.schema(), crate::core::ledger_hooks::WriteKind::Alter("PARTITION BY")) {
+                return ddl_error(&e);
+            }
+        }
         Ok(Some(crate::core::database::relation::Relation::Partitioned(_))) => {
             return ddl_error(&format!("table \"{table}\" is already partitioned (not supported)"));
         }
@@ -23075,6 +23083,9 @@ async fn execute_in_txn_body(query: QueryPurpose, database: Arc<Database>, tx: T
         // Every attempt runs under the same transaction, so under the same
         // owner: a block's root, or the statement's O its transaction acts for.
         crate::owner_probe!(crate::core::mvcc::owner::probe::Site::InTxnAttempt, tx, database);
+        // A replayed attempt applied nothing, but may have noted a ledger
+        // row's deletion for the chain before its write met the conflict.
+        let ledger_mark = crate::core::ledger_hooks::pending_mark(tx);
         // See `execute_with_sync`: a prepared `SELECT` skips the box sized for
         // every statement arm.
         let (response, blocker) = match query {
@@ -23097,7 +23108,7 @@ async fn execute_in_txn_body(query: QueryPurpose, database: Arc<Database>, tx: T
         // Until the transaction that won ends: a real wait, in the graph.
         let waiter = database.row_locks.owner_of(tx);
         match pacing.pause(&database, waiter, blocker, MAX_CONFLICT_RETRIES).await {
-            crate::core::rql::conflict_wait::Pause::Retry => {}
+            crate::core::rql::conflict_wait::Pause::Retry => crate::core::ledger_hooks::rewind_pending(tx, ledger_mark),
             crate::core::rql::conflict_wait::Pause::GiveUp => return strip_conflict_marker(response),
             crate::core::rql::conflict_wait::Pause::Fail(message) => return ddl_error(&message),
         }

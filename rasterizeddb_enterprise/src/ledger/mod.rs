@@ -30,7 +30,11 @@ use store::{Item, OP_DELETE, OP_INSERT, OP_UPDATE};
 /// The installed guard and its state.
 pub struct LedgerGuard {
     /// Items written by running transactions, by writer id.
-    pending: Mutex<HashMap<TxId, Vec<Item>>>,
+    /// Each with the order it was written in (`WRITES`): a family's members
+    /// are taken in id order at its commit, and a versioned row's versions
+    /// written around a savepoint were chained out of order (VERIFY then
+    /// called the newest "differs from what was committed").
+    pending: Mutex<HashMap<TxId, Vec<(u64, Item)>>>,
     /// Folded policies, by (incarnation, sidecar length, overlay length).
     policies: RwLock<HashMap<(u128, usize, usize), Arc<LedgerPolicy>>>,
     /// Policy records an `ALTER LEDGER TABLE` appended in this process,
@@ -53,6 +57,13 @@ fn what(table: &TableSchema) -> &'static str {
     }
 }
 
+/// The write order of pending items, across every transaction.
+static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_write() -> u64 {
+    WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl LedgerGuard {
     pub fn new() -> LedgerGuard {
         LedgerGuard {
@@ -61,6 +72,19 @@ impl LedgerGuard {
             overlay: RwLock::new(HashMap::new()),
             anchors_of: RwLock::new(HashMap::new()),
             audits: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The anchors `policy` names now, for the commits of its rows: on every
+    /// kind of write, and replaced when they changed. Learned once and on
+    /// inserts only, an `ADD ANCHOR` after the first insert never reached
+    /// its sink, and a commit that only deleted reached none.
+    fn note_anchors(&self, policy: &LedgerPolicy) {
+        if policy.anchors.is_empty() {
+            return;
+        }
+        if self.anchors_of.read().get(&policy.id) != Some(&policy.anchors) {
+            self.anchors_of.write().insert(policy.id, policy.anchors.clone());
         }
     }
 
@@ -115,6 +139,27 @@ impl LedgerGuard {
         // start) counts as now, so a drop waits rather than slips through.
         let known = store::last_insert(policy.id);
         let last = known.unwrap_or(now);
+        // A drop deletes every row: none may be under a hold, nor inside its
+        // retention (the newest row's passing means every row's has). Only
+        // the drop-idle time was asked, and a table with no NO DROP clause,
+        // or under a hold, dropped at once with all its rows.
+        if let Some((hold, _)) = policy.holds.iter().next() {
+            return Err(format!(
+                "55000: \"{}\" is under legal hold \"{hold}\"; it is not dropped until the hold is released",
+                table.name
+            ));
+        }
+        if policy.kind != SpecialTable::Vault && known.is_some() && !clock::retention_passed(last, policy.retention_us) {
+            return Err(format!(
+                "55000: \"{}\" holds rows inside their retention ({} s after insert; the newest was inserted {} s ago): \
+                 it is not dropped until they pass",
+                table.name,
+                policy.retention_us / 1_000_000,
+                (now - last).max(0) / 1_000_000
+            ));
+        }
+        // No row chained (the chain is read when the database opens,
+        // `database_opened`): nothing to keep.
         if policy.drop_idle_us == 0 || now >= last.saturating_add(policy.drop_idle_us) {
             return Ok(());
         }
@@ -216,23 +261,22 @@ impl LedgerHooks for LedgerGuard {
     fn on_insert(&self, table: &TableSchema, tx: TxId, ts: i64, cells: &[(u32, &[u8])]) {
         let Ok(policy) = self.policy(table) else { return };
         let (width, leaf) = store::leaf(policy.id, ts, cells);
-        if !policy.anchors.is_empty() && !self.anchors_of.read().contains_key(&policy.id) {
-            self.anchors_of.write().insert(policy.id, policy.anchors.clone());
-        }
+        self.note_anchors(&policy);
         self.pending
             .lock()
             .entry(tx)
             .or_default()
-            .push(Item { op: OP_INSERT, ledger: policy.id, row_ts: ts, width, leaf });
+            .push((next_write(), Item { op: OP_INSERT, ledger: policy.id, row_ts: ts, width, leaf }));
     }
 
     fn on_delete(&self, table: &TableSchema, tx: TxId, ts: i64) {
         let Ok(policy) = self.policy(table) else { return };
+        self.note_anchors(&policy);
         self.pending
             .lock()
             .entry(tx)
             .or_default()
-            .push(Item { op: OP_DELETE, ledger: policy.id, row_ts: ts, width: 0, leaf: [0; 32] });
+            .push((next_write(), Item { op: OP_DELETE, ledger: policy.id, row_ts: ts, width: 0, leaf: [0; 32] }));
     }
 
     fn admit_row_update(&self, table: &TableSchema, _ts: i64) -> Result<(), String> {
@@ -246,7 +290,8 @@ impl LedgerHooks for LedgerGuard {
     fn on_update(&self, table: &TableSchema, tx: TxId, ts: i64, cells: &[(u32, &[u8])]) {
         let Ok(policy) = self.policy(table) else { return };
         let (width, leaf) = store::leaf(policy.id, ts, cells);
-        self.pending.lock().entry(tx).or_default().push(Item { op: OP_UPDATE, ledger: policy.id, row_ts: ts, width, leaf });
+        self.note_anchors(&policy);
+        self.pending.lock().entry(tx).or_default().push((next_write(), Item { op: OP_UPDATE, ledger: policy.id, row_ts: ts, width, leaf }));
     }
 
     fn keeps_versions(&self, table: &TableSchema) -> bool {
@@ -259,23 +304,37 @@ impl LedgerHooks for LedgerGuard {
         ids.iter().any(|id| pending.contains_key(id) || audits.contains_key(id))
     }
 
+    fn pending_mark(&self, tx: TxId) -> usize {
+        self.pending.lock().get(&tx).map_or(0, Vec::len)
+    }
+
+    fn rewind_pending(&self, tx: TxId, mark: usize) {
+        if let Some(mine) = self.pending.lock().get_mut(&tx) {
+            mine.truncate(mark);
+        }
+    }
+
     fn discard(&self, tx: TxId) {
         self.pending.lock().remove(&tx);
         self.audits.lock().remove(&tx);
     }
 
     fn prepare_commit(&self, store_key: &str, members: &[(TxId, bool)]) -> Result<(), String> {
-        let mut items = Vec::new();
+        let mut ordered: Vec<(u64, Item)> = Vec::new();
         {
             let mut pending = self.pending.lock();
             for (id, survives) in members {
                 if let Some(mut mine) = pending.remove(id) {
                     if *survives {
-                        items.append(&mut mine);
+                        ordered.append(&mut mine);
                     }
                 }
             }
         }
+        // In the order they were written, whichever member wrote them.
+        ordered.sort_by_key(|(at, _)| *at);
+        #[cfg_attr(not(feature = "vault"), allow(unused_mut))]
+        let mut items: Vec<Item> = ordered.into_iter().map(|(_, item)| item).collect();
         // The vault changes of the members that survive: audited now, in
         // the same chain entry as their rows. A rolled-back savepoint's are
         // dropped with it.

@@ -106,12 +106,26 @@ fn verify(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<L
             read.entries.last().map_or_else(|| "(empty)".to_string(), |e| store::hex(&e.hash))
         )),
     }
+    // Every verified table's own sinks: they reached the store's list only
+    // as rows were written, so after a restart VERIFY checked none of them
+    // until a new row committed, and a chain cut back while the server was
+    // down read as "no anchors".
+    for (table, _) in &req.tables {
+        if let Ok(policy) = g.policy(table) {
+            anchor::add_sinks(store_key, &policy.anchors);
+        }
+    }
     lines.extend(anchor::verify_lines(store_key, &read));
     for (table, rows) in &req.tables {
         let policy = g.policy(table)?;
         // Every row the chain says was inserted, and whether it was deleted.
         let mut chained: HashMap<i64, (u32, store::Hash, bool)> = HashMap::new();
         for e in &read.entries {
+            // An entry whose transaction aborted after it was written: its
+            // rows never committed.
+            if req.aborted.is_some_and(|aborted| aborted(e.txid)) {
+                continue;
+            }
             for i in e.items.iter().filter(|i| i.ledger == policy.id) {
                 match i.op {
                     OP_INSERT => {
@@ -131,7 +145,12 @@ fn verify(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<L
         let mut matched = 0u64;
         let mut seen = HashSet::new();
         for (ts, cells) in rows {
-            seen.insert(*ts);
+            // A stamp names one row: a second row with it is a copy made past
+            // the guard, which matched the chain twice and read as OK.
+            if !seen.insert(*ts) {
+                problems.push(format!("row stamped {ts} appears more than once: a copy written past the guard"));
+                continue;
+            }
             let refs: Vec<(u32, &[u8])> = cells.iter().map(|(o, b)| (*o, b.as_slice())).collect();
             match chained.get(ts) {
                 None => problems.push(format!("row stamped {ts} is not in the chain: written past the guard")),

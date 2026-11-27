@@ -1458,6 +1458,11 @@ impl DatabaseCatalog {
                 meta.parent
             ));
         }
+        // A reset replaces the branch's tables with its parent's: its ledger
+        // tables and vaults would go, retention, holds and all.
+        if let Some(branch) = self.get(name) {
+            branch.admit_every_special(crate::core::ledger_hooks::WriteKind::Rewind)?;
+        }
         // Refused before the copy, not after it.
         {
             let entry = self.databases.get(name).ok_or("branch vanished")?;
@@ -1553,6 +1558,11 @@ impl DatabaseCatalog {
                 "cannot promote over the default database \"{parent}\": it is the catalogue root and \
                  cannot be swapped while the server runs"
             ));
+        }
+        // A promotion replaces the parent with the branch: the parent's
+        // ledger tables and vaults would be swapped for the branch's copies.
+        if let Some(parent_db) = self.get(&parent) {
+            parent_db.admit_every_special(crate::core::ledger_hooks::WriteKind::Rewind)?;
         }
         // Both checked before either is detached.
         for n in [name, parent.as_str()] {

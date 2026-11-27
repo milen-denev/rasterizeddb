@@ -456,7 +456,19 @@ impl Database {
             // A ledger table or vault stays one: the rewrite's definition is
             // built from the columns, and would otherwise create a plain
             // table under the guarded one's name.
-            let kept = (old.schema.special, old.schema.ledger_policy.clone());
+            // Its policy as the sidecar holds it now, not as the table was
+            // opened with: an ALTER LEDGER TABLE (a legal hold, a raised
+            // retention) appends a record without reloading the table, and a
+            // rewrite from the opened bytes dropped it at the next restart.
+            let policy = if old.schema.special.is_special() {
+                match crate::core::ledger_hooks::policy_sidecar::load(&old.io_schema).await {
+                    Ok(bytes) if !bytes.is_empty() => bytes,
+                    _ => old.schema.ledger_policy.clone(),
+                }
+            } else {
+                Vec::new()
+            };
+            let kept = (old.schema.special, policy);
             let (mut create, plan) = read(old).await?;
             if kept.0.is_special() {
                 create.special = kept.0;

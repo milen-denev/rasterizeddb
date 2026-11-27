@@ -2367,6 +2367,20 @@ impl Database {
         }
     }
 
+    /// Whether every ledger table and vault here admits `write`: what a
+    /// statement that destroys or replaces the whole database asks first
+    /// (`DROP DATABASE` a drop, a branch reset or promotion a rewind). They
+    /// asked nothing, and took ledger rows inside their retention, under a
+    /// hold or before their drop-idle time with them.
+    pub(crate) fn admit_every_special(&self, write: crate::core::ledger_hooks::WriteKind<'_>) -> Result<(), String> {
+        for name in self.relation_names() {
+            if let Some(relation) = self.relation(&name) {
+                crate::core::ledger_hooks::admit(relation.schema(), write)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Chains `tx`'s family's ledger rows before it commits
     /// (`ledger_hooks::prepare_commit`). Nothing without installed hooks,
     /// and nothing for a family that wrote no ledger table.
@@ -7179,10 +7193,21 @@ async fn process_native_request_plain(
     }
 
     let statement_timeout = context.statement_timeout;
+    // Who reads, for a database with encrypted columns: the executor
+    // decrypts a ciphertext cell for a role holding its vault's SELECT, and
+    // for anyone when no role is said (an in-process caller). This path said
+    // none, so a statement naming no encrypted table (`SELECT 'rdbenc1:…'`,
+    // a copy of a cell in another table) had any connection's ciphertext
+    // decrypted. Asked only where there is something to decrypt.
+    let reader = if crate::core::column_crypto::active(&context.database) {
+        Some((principal.user.clone(), native_admin(&context, &principal, session).await))
+    } else {
+        None
+    };
 
     #[cfg(not(feature = "query_stats"))]
     {
-        run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices).await
+        as_reader(reader, run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices)).await
     }
 
     // Recorded for `SHOW QUERIES` the same way a statement arriving over the
@@ -7191,13 +7216,19 @@ async fn process_native_request_plain(
     #[cfg(feature = "query_stats")]
     {
         let Some(recording) = crate::core::query_stats::begin() else {
-            return run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices)
-                .await;
+            return as_reader(
+                reader,
+                run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices),
+            )
+            .await;
         };
         let database_name = context.database.name.clone();
         let response = crate::core::query_stats::observe(recording.probe(), async {
-            let response =
-                run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices).await;
+            let response = as_reader(
+                reader,
+                run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices),
+            )
+            .await;
             // Counted inside the scope: outside it the statement's counters are
             // no longer the ones this task can reach.
             crate::core::query_stats::note_rows(rows_of(&response));
@@ -7216,6 +7247,15 @@ async fn process_native_request_plain(
             failure.as_deref(),
         );
         response
+    }
+}
+
+/// `f` under the ledger session `reader` names (`ledger_hooks::session`),
+/// or as it is without one.
+async fn as_reader<F: std::future::Future>(reader: Option<(String, bool)>, f: F) -> F::Output {
+    match reader {
+        Some((role, superuser)) => crate::core::ledger_hooks::with_session(role, superuser, f).await,
+        None => f.await,
     }
 }
 

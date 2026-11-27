@@ -155,6 +155,22 @@ fn cols(store: &str) -> Result<Vec<Col>, String> {
     Ok(s.cols.clone())
 }
 
+/// Serialises every change to a registry: each reads it, edits and writes
+/// it back, and two at once kept only the later one's (a column's entry,
+/// and with it its wrapped data key, lost for good at the next restart).
+static EDITS: Mutex<()> = Mutex::new(());
+
+/// Reads the store's registry, applies `f`, and writes it back when `f`
+/// says it changed it, all under [`EDITS`].
+fn edit_cols(store: &str, f: impl FnOnce(&mut Vec<Col>) -> bool) -> Result<(), String> {
+    let _one = EDITS.lock();
+    let mut all = cols(store)?;
+    if f(&mut all) {
+        set_cols(store, all)?;
+    }
+    Ok(())
+}
+
 fn set_cols(store: &str, cols: Vec<Col>) -> Result<(), String> {
     write_sidecar(store, &cols)?;
     let all = STORES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -402,6 +418,11 @@ fn whole_item(t: &[Tok], i: usize, head: usize, end: usize) -> Result<Option<Str
     }
     // `q.col` / `q.*`: the item starts at the qualifier.
     let start = if i >= 2 && t[i - 1].is('.') && matches!(t[i - 2].k, K::Word | K::QWord) { i - 2 } else { i };
+    // `SELECT.ssn` puts the qualifier at the list's head, or before it:
+    // not an item (and `start - 1` wrapped, a panic any role could cause).
+    if start <= head {
+        return Err(());
+    }
     let before = &t[start - 1];
     if !(start - 1 == head || before.is(',') || before.kw("ALL")) {
         return Err(());
@@ -433,7 +454,11 @@ fn analyze(all: &[Col], sql: &str, mode: Mode, database: Option<&Database>) -> R
     let mut an = Analysis::default();
 
     // A declaration: CREATE [..] TABLE with ENCRYPTED WITH VAULT.
-    if first.kw("CREATE") && t.iter().any(|x| x.kw("ENCRYPTED")) {
+    // `ENCRYPTED` anywhere but where a column's name goes: a column named
+    // `encrypted` (`CREATE TABLE f (id INT, encrypted BOOLEAN)`) declares
+    // nothing, and was refused as a malformed declaration.
+    let declares = (0..t.len()).any(|j| t[j].kw("ENCRYPTED") && !(j > 0 && (t[j - 1].is('(') || t[j - 1].is(','))));
+    if first.kw("CREATE") && declares {
         return declare(&t, sql, mode, database).map(Some);
     }
     if t.iter().any(|x| x.kw("ENCRYPTED")) && t.iter().any(|x| x.kw("VAULT")) && (first.kw("ALTER")) {
@@ -534,10 +559,29 @@ fn analyze(all: &[Col], sql: &str, mode: Mode, database: Option<&Database>) -> R
                     }
                 }
                 // ORDER BY 2 / GROUP BY 1 over a list holding one.
-                if !allowed.is_empty() {
+                // Every element of the list, not only the first: `ORDER BY
+                // id, 2` sorted on ciphertext with no error.
+                if let Some(&first) = allowed.iter().next() {
                     for j in 0..t.len() {
-                        if t[j].depth == 0 && t[j].kw("BY") && t.get(j + 1).is_some_and(|x| x.k == K::Num) {
-                            return Err(refuse(&label(*allowed.iter().next().unwrap()), "a position in ORDER BY or GROUP BY may name it"));
+                        if !(t[j].depth == 0 && t[j].kw("BY")) {
+                            continue;
+                        }
+                        let mut at = j + 1;
+                        while at < t.len() {
+                            let x = &t[at];
+                            if x.depth == 0
+                                && (x.is(';')
+                                    || ["LIMIT", "OFFSET", "HAVING", "ORDER", "WINDOW", "FETCH", "FOR", "UNION", "INTERSECT", "EXCEPT"]
+                                        .iter()
+                                        .any(|k| x.kw(k)))
+                            {
+                                break;
+                            }
+                            let starts_element = t[at - 1].kw("BY") || (t[at - 1].is(',') && t[at - 1].depth == 0);
+                            if x.depth == 0 && x.k == K::Num && starts_element {
+                                return Err(refuse(&label(first), "a position in ORDER BY or GROUP BY may name it"));
+                            }
+                            at += 1;
                         }
                     }
                 }
@@ -545,7 +589,18 @@ fn analyze(all: &[Col], sql: &str, mode: Mode, database: Option<&Database>) -> R
         }
         "INSERT" => {
             // INSERT INTO name [AS a] [(cols)] VALUES … | SELECT … | DEFAULT VALUES
-            let target = t.iter().position(|x| x.kw("INTO")).map(|p| p + 1);
+            // The table is the name's last part: `public.patients` and
+            // `"public"."patients"` write `patients` (the engine keeps the
+            // last segment). Read as its first, they encrypted nothing and
+            // stored the plaintext.
+            let mut target = t.iter().position(|x| x.kw("INTO")).map(|p| p + 1);
+            while let Some(q) = target {
+                if t.get(q + 1).is_some_and(|x| x.is('.')) && t.get(q + 2).and_then(Tok::name).is_some() {
+                    target = Some(q + 2);
+                } else {
+                    break;
+                }
+            }
             let target_name = target.and_then(|p| t.get(p)).and_then(Tok::name);
             let target_enc: Vec<&Col> = named.iter().copied().filter(|c| Some(c.table.to_ascii_lowercase()) == target_name).collect();
             let mut p = target.unwrap_or(0) + 1;
@@ -768,7 +823,10 @@ fn declare(t: &[Tok], sql: &str, mode: Mode, database: Option<&Database>) -> Res
     let mut declared: Vec<Col> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     for &(a, b) in &defs {
-        let Some(enc) = (a..b).find(|&j| t[j].kw("ENCRYPTED")) else { continue };
+        // After the column's name: a column named `encrypted` is not the
+        // marker (searched from its name, the type slice ran backwards, a
+        // panic).
+        let Some(enc) = (a + 1..b).find(|&j| t[j].kw("ENCRYPTED")) else { continue };
         let column = t[a].name().map(|_| t[a].text.clone()).ok_or("42601: a column needs a name")?;
         let label = format!("{table}.{column}");
         // ENCRYPTED WITH VAULT v KEY 'k'
@@ -964,21 +1022,17 @@ impl ColumnCrypto for Cipher {
         if !ok || s != store {
             return;
         }
-        let mut all = match cols(store) {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("encrypted columns: {e}");
-                return;
+        let changed = edit_cols(store, |all| {
+            match p {
+                Pending::Declare(table, new) => {
+                    all.retain(|c| !c.table.eq_ignore_ascii_case(&table));
+                    all.extend(new);
+                }
+                Pending::Forget(tables) => all.retain(|c| !tables.contains(&c.table.to_ascii_lowercase())),
             }
-        };
-        match p {
-            Pending::Declare(table, new) => {
-                all.retain(|c| !c.table.eq_ignore_ascii_case(&table));
-                all.extend(new);
-            }
-            Pending::Forget(tables) => all.retain(|c| !tables.contains(&c.table.to_ascii_lowercase())),
-        }
-        if let Err(e) = set_cols(store, all) {
+            true
+        });
+        if let Err(e) = changed {
             log::error!("encrypted columns: could not record a change: {e}");
         }
     }
@@ -1005,39 +1059,27 @@ impl ColumnCrypto for Cipher {
     }
 
     fn rename_table(&self, store: &str, from: &str, to: &str) {
-        let mut all = match cols(store) {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("encrypted columns: {e}");
-                return;
+        let moved = edit_cols(store, |all| {
+            let mut moved = false;
+            for c in all.iter_mut().filter(|c| c.table.eq_ignore_ascii_case(from)) {
+                c.table = to.to_string();
+                moved = true;
             }
-        };
-        let mut moved = false;
-        for c in all.iter_mut().filter(|c| c.table.eq_ignore_ascii_case(from)) {
-            c.table = to.to_string();
-            moved = true;
-        }
-        if moved {
-            if let Err(e) = set_cols(store, all) {
-                log::error!("encrypted columns: could not follow \"{from}\" to \"{to}\": {e}");
-            }
+            moved
+        });
+        if let Err(e) = moved {
+            log::error!("encrypted columns: could not follow \"{from}\" to \"{to}\": {e}");
         }
     }
 
     fn forget_table(&self, store: &str, table: &str) {
-        let mut all = match cols(store) {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("encrypted columns: {e}");
-                return;
-            }
-        };
-        let before = all.len();
-        all.retain(|c| !c.table.eq_ignore_ascii_case(table));
-        if all.len() != before {
-            if let Err(e) = set_cols(store, all) {
-                log::error!("encrypted columns: could not forget \"{table}\" after its rollback: {e}");
-            }
+        let forgot = edit_cols(store, |all| {
+            let before = all.len();
+            all.retain(|c| !c.table.eq_ignore_ascii_case(table));
+            all.len() != before
+        });
+        if let Err(e) = forgot {
+            log::error!("encrypted columns: could not forget \"{table}\" after its rollback: {e}");
         }
     }
 }

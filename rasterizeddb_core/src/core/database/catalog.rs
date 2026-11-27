@@ -685,6 +685,10 @@ impl DatabaseCatalog {
     /// discarded rather than resurrected, but the space is not reclaimed until
     /// then.
     pub async fn drop_database(&self, name: &str, current: &str) -> Result<(), String> {
+        // Each ledger table and vault in it must admit its own DROP.
+        if let Some(database) = self.get(name) {
+            database.admit_every_special(crate::core::ledger_hooks::WriteKind::Drop)?;
+        }
         // As for a CREATE: a tombstone in the root says the DROP is owed to
         // the peers, from before the database goes until its record is
         // durable (`reconcile_replication`).

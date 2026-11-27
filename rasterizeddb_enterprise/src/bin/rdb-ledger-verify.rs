@@ -157,11 +157,23 @@ fn rows(store_key: &str, data: &str, default_db: &str) -> bool {
                 role: "rdb-ledger-verify",
                 superuser: true,
                 tx: 0,
+                aborted: None,
             };
             match rasterizeddb_core::core::ledger_hooks::statement(&served, request) {
                 Ok(reply) => {
-                    for l in reply.lines.iter().filter(|l| !l.contains(" chain:") && !l.contains("anchor")) {
-                        bad |= l.starts_with("TAMPERED") || l.starts_with("UNKNOWN");
+                    // The chain and the --anchor sinks are checked above; a
+                    // passing line about them is not repeated. A failing one
+                    // is kept (a table's own ANCHOR TO sinks are checked only
+                    // here), and the subject is read where it stands, not
+                    // searched for: "anchor" in a table's name dropped its
+                    // TAMPERED line, and the exit code said 0.
+                    for l in &reply.lines {
+                        let failed = l.starts_with("TAMPERED") || l.starts_with("UNKNOWN");
+                        let subject = l.get(10..).unwrap_or("").trim_start();
+                        if !failed && (subject.starts_with("chain:") || subject.starts_with("anchor ")) {
+                            continue;
+                        }
+                        bad |= failed;
                         println!("{l}   [{name}]");
                     }
                 }

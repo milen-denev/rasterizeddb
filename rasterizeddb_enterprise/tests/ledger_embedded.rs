@@ -156,7 +156,10 @@ async fn ledger_tables_and_vaults() {
     lines(&c, "VAULT sec DELETE SECRET 'db'").await;
     tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
     lines(&c, "VAULT sec PURGE SECRET 'db'").await;
-    lines(&c, "VAULT sec RECOVER SECRET 'db'").await;
+    // A purged secret stays purged: a RECOVER would mark active versions
+    // that can never be read again.
+    let recover = c.query("VAULT sec RECOVER SECRET 'db'", &[]).await.unwrap_err().to_string();
+    assert!(recover.contains("purged"), "{recover}");
     let gone = c.query("VAULT sec GET SECRET 'db'", &[]).await.unwrap_err().to_string();
     assert!(gone.contains("purged"), "{gone}");
 

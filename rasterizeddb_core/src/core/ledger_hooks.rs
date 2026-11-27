@@ -141,6 +141,18 @@ pub trait LedgerHooks: Send + Sync + 'static {
     /// Forgets anything `tx` left pending (it aborted).
     fn discard(&self, tx: TxId);
 
+    /// How many items `tx` has pending: a mark [`Self::rewind_pending`] goes
+    /// back to.
+    fn pending_mark(&self, _tx: TxId) -> usize {
+        0
+    }
+
+    /// Forgets `tx`'s items past `mark`: a statement attempt that is to be
+    /// replayed (a retryable conflict, which applied nothing) noted a row's
+    /// deletion before its write met the conflict, and the replay notes
+    /// what it writes itself.
+    fn rewind_pending(&self, _tx: TxId, _mark: usize) {}
+
     /// Whether any of `ids` has something pending: a commit of a family
     /// with nothing to chain skips [`Self::prepare_commit`].
     fn has_pending(&self, ids: &[TxId]) -> bool;
@@ -196,6 +208,12 @@ impl<T: LedgerHooks> LedgerHooks for &'static T {
     fn has_pending(&self, ids: &[TxId]) -> bool {
         (**self).has_pending(ids)
     }
+    fn pending_mark(&self, tx: TxId) -> usize {
+        (**self).pending_mark(tx)
+    }
+    fn rewind_pending(&self, tx: TxId, mark: usize) {
+        (**self).rewind_pending(tx, mark)
+    }
     fn database_opened(&self, store: &str) {
         (**self).database_opened(store)
     }
@@ -222,6 +240,12 @@ pub struct LedgerRequest<'a> {
     /// verifier): what a vault's change is audited at the commit of, and
     /// forgotten at the abort of (`LedgerHooks::prepare_commit`, `discard`).
     pub tx: TxId,
+    /// Whether a transaction is known to have aborted (`None` where no
+    /// outcome log is at hand, the offline verifier). A chain entry is
+    /// written before its commit, which can still fail (the replication
+    /// record, a crash before the outcome is durable): VERIFY passes over
+    /// such an entry rather than report its rows "missing".
+    pub aborted: Option<&'a (dyn Fn(TxId) -> bool + Sync)>,
 }
 
 /// What a ledger statement returns.
@@ -330,6 +354,18 @@ pub fn database_opened(store: &str) {
 
 /// [`LedgerHooks::discard`]; a no-op without installed hooks.
 #[inline]
+/// See [`LedgerHooks::pending_mark`]; 0 without installed hooks.
+pub fn pending_mark(tx: TxId) -> usize {
+    HOOKS.get().map_or(0, |h| h.pending_mark(tx))
+}
+
+/// See [`LedgerHooks::rewind_pending`].
+pub fn rewind_pending(tx: TxId, mark: usize) {
+    if let Some(h) = HOOKS.get() {
+        h.rewind_pending(tx, mark);
+    }
+}
+
 pub fn discard(tx: TxId) {
     if let Some(h) = HOOKS.get() {
         h.discard(tx);
