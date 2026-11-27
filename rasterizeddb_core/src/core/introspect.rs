@@ -1954,7 +1954,7 @@ async fn shard_admin(database: &Arc<Database>, admin: &ShardAdmin) -> Result<Str
             // made through the old instance meanwhile was acknowledged and
             // then lost to the new one. Writers wait for the lock, then run
             // on the reopened table; given back once the span is changed.
-            let release = crate::core::storage::relocate::MoveRelease::before(database, &name);
+            let release = crate::core::mvcc::table_locks::MoveRelease::before(database, &name);
             database
                 .lock_table(&name, crate::core::mvcc::owner::ensure(), crate::core::mvcc::table_locks::TableMode::AccessExclusive)
                 .await

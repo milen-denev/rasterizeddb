@@ -431,49 +431,9 @@ async fn plan_partitions(database: &Arc<Database>, pool: &StorageManager) -> Res
     Ok(plan)
 }
 
-/// Gives one moved table's ACCESS EXCLUSIVE back when dropped, unless the
-/// statement's owner held it before the move (a block that locked the table
-/// itself keeps it, and keeps any other mode it held: the manager holds a
-/// mode set per owner). Taken before the request, so a failed or cancelled
-/// wait gives back nothing it did not get.
-pub(crate) struct MoveRelease<'a> {
-    database: &'a Database,
-    owner: Option<crate::core::mvcc::table_locks::LockOwner>,
-    table: String,
-}
-
-impl<'a> MoveRelease<'a> {
-    pub(crate) fn before(database: &'a Database, table: &str) -> Self {
-        use crate::core::mvcc::table_locks::TableMode;
-        let key = database.lock_key(table).into_owned();
-        let owner = crate::core::mvcc::owner::ensure()
-            .map(|o| o.owner)
-            .filter(|&o| {
-                !database
-                    .row_locks
-                    .table_locks()
-                    .holds(o, &key)
-                    .contains(TableMode::AccessExclusive)
-            });
-        MoveRelease {
-            database,
-            owner,
-            table: key,
-        }
-    }
-}
-
-impl Drop for MoveRelease<'_> {
-    fn drop(&mut self) {
-        if let Some(owner) = self.owner {
-            self.database.row_locks.table_locks().release_mode(
-                owner,
-                &self.table,
-                crate::core::mvcc::table_locks::TableMode::AccessExclusive,
-            );
-        }
-    }
-}
+// `MoveRelease` lives in mvcc::table_locks: SHARD TAKE/GIVE uses it too,
+// in builds without storage pools.
+pub(crate) use crate::core::mvcc::table_locks::MoveRelease;
 
 /// Works out what should move, without moving anything.
 async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
