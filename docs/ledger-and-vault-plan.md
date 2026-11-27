@@ -341,6 +341,64 @@ Written on `wip/ledger`, `cargo check` pending, **no tests run yet**:
 - PCR-bound sealing (to a measured boot state) is not built.
 - Tested against swtpm.
 
+## 5.7 Encrypted columns (wip/ledger-3)
+
+Ordinary and ledger tables can store a column encrypted under a vault key. A
+statement that would filter, sort, group, join, index or compute on the
+ciphertext is refused (0A000) before it runs: a filter over ciphertext would
+otherwise return a wrong answer with no error.
+
+```sql
+VAULT hr CREATE KEY 'pii' TYPE 'aes256-gcm';           -- or hsm-aes256-gcm on a pkcs11: vault
+CREATE TABLE patients (id BIGINT PRIMARY KEY, name TEXT,
+                       ssn VARCHAR(11) ENCRYPTED WITH VAULT hr KEY 'pii' NOT NULL);
+INSERT INTO patients (id, name, ssn) VALUES (1, 'ann', '123-45-6789');
+SELECT id, ssn FROM patients WHERE id = 1;              -- plaintext, for a role with SELECT on hr
+SELECT id FROM patients WHERE ssn = '123-45-6789';      -- 0A000: column "patients.ssn" is encrypted …
+```
+
+**Storage.**
+- Each column gets its own random 256-bit data key, wrapped by the vault key (AAD: the column id). The wrapped key is kept in `encrypted_columns` beside the chain.
+- Each value is AES-256-GCM under that data key (AAD: the column id), stored as the text `rdbenc1:<column id>:<base64>`. So a column is TEXT or VARCHAR(n); VARCHAR's limit is checked on the plaintext.
+- `ENCRYPTED_VALUES_V1` fences the directory: a build without the hooks refuses to open it, rather than serve ciphertext as values.
+
+**What may name an encrypted column.** An allowlist over the statement's tokens, run twice: on the client's text before any rewrite, and on the text the executor runs. The column may appear:
+- whole, as a select-list or `RETURNING` item (`ssn`, `p.ssn`, `ssn AS s`, `*`);
+- in an `INSERT` column list, with a literal, `NULL` or bound parameter for it in `VALUES`;
+- as `UPDATE … SET ssn = <literal | NULL | $n>`.
+
+Everything else that names it is refused (0A000):
+- `WHERE`, `JOIN … ON`, `ORDER BY` (by name, alias or position), `GROUP BY`, `HAVING`, aggregates;
+- `DISTINCT`, set operations, window `PARTITION BY`, functions, casts, concatenation;
+- subqueries, CTEs, `INSERT … SELECT`, `CREATE TABLE … AS`, `SELECT … INTO`, `ON CONFLICT`, `COPY`;
+- indexes, renaming the table or column, dropping the column, `ALTER TABLE … ADD … ENCRYPTED`.
+
+A declaration takes `NOT NULL` only. A key, unique, check, default or reference would compare or compute on ciphertext.
+
+**Fast paths stay off.** A statement naming such a table never takes a learned or prepared parse, or the native protocol's direct path. It runs on the guarded text path (`column_crypto::touches`), the same rule that holds for temporary tables and the catalogues.
+
+**Who reads plaintext.**
+- Values are encrypted and decrypted only at the task's outermost statement, never inside a subquery.
+- Plaintext is returned to a role holding `SELECT` on the column's vault (the grant `VAULT … DECRYPT` needs), to a superuser, and to an in-process (embedded) caller.
+- Any other role reads the ciphertext. It copies, dumps and restores as text, and Studio shows it as "encrypted".
+- Writing needs the same grant: sealing a value uses the vault's key (42501 otherwise).
+
+**Limits.**
+- A replica runs the statement as rewritten: it stores the same ciphertext, but it does not hold the column registry, so it serves ciphertext.
+- `COPY` into such a table is refused; use `INSERT`.
+- No equality search (deterministic encryption) is offered. It would leak which values repeat, and it is not built.
+
+**Studio.**
+- The LEDGER page lists the encrypted columns (table, column, vault, key, type).
+- Its column editor has an "Encrypted" toggle per column, with a vault and AES key pick.
+- The DATA and QUERY grids show a ciphertext cell as "🔒 encrypted (no access to its vault)".
+
+**Code.**
+- `core::column_crypto` (GPL): the hooks, the executor and wire call sites, the response cell rewrite.
+- `rasterizeddb_enterprise::columns` (licensed): the analysis, the cipher, the registry.
+- `vault::key_seal` / `key_open`: data keys wrapped by a vault key, AES or in the HSM.
+- Tests: `columns` unit tests (what passes, what is refused, declarations); `tests/encrypted_columns.rs` end to end.
+
 ## 6. Phases (implement all first with `cargo check`, then test in one go)
 
 | Phase | Contents |

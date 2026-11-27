@@ -293,7 +293,16 @@ pub fn install() -> Result<(), String> {
     let flags = [LEDGER_V1, rasterizeddb_core::core::database::incompat::VAULT_V1];
     #[cfg(not(feature = "vault"))]
     let flags = [LEDGER_V1];
-    rasterizeddb_core::core::ledger_hooks::install(Box::new(LedgerGuard::new()), &flags)
+    let guard: &'static LedgerGuard = GUARD.get_or_init(|| Box::leak(Box::new(LedgerGuard::new())));
+    rasterizeddb_core::core::ledger_hooks::install(Box::new(guard), &flags)
+}
+
+/// The guard [`install`] put in place: the vault and the column cipher read
+/// policies through it, so they see what an `ALTER` changed in this process.
+static GUARD: std::sync::OnceLock<&'static LedgerGuard> = std::sync::OnceLock::new();
+
+pub(crate) fn guard() -> Option<&'static LedgerGuard> {
+    GUARD.get().copied()
 }
 
 #[cfg(test)]

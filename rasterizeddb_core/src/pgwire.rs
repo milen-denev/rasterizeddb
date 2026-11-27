@@ -7256,6 +7256,16 @@ where
     if let Some((code, message)) = catalogue_guard(state, stmt) {
         return fail_statement(state, stream, code, &message).await;
     }
+    // Encrypted columns (`column_crypto`): the client's text, before any
+    // pass rewrites it, may not compute on one.
+    if let Err(e) = crate::core::column_crypto::guard(database, stmt) {
+        let code = sqlstate_for(&e);
+        let message = match e.split_once(": ") {
+            Some((c, rest)) if c.len() == 5 && c.bytes().all(|b| b.is_ascii_alphanumeric()) => rest,
+            _ => e.as_str(),
+        };
+        return fail_statement(state, stream, code, message).await;
+    }
     // Counted as running until it returns, so the idle trimmer
     // (`idle_trim`) never walks the heap under a statement.
     let _running = crate::idle_trim::statement();
@@ -7883,8 +7893,11 @@ where
     // Nor a statement naming a catalogue: the text path guards and masks
     // it, and a learned parse would do neither.
     let names_a_catalogue = crate::core::rql::privileges::may_name_catalog(query);
+    // Nor one naming a table with an encrypted column: only the text path
+    // is guarded against computing on its ciphertext.
+    let names_encrypted = crate::core::column_crypto::touches(database, query);
     let step = match watched_slot(state, database, &key, true) {
-        _ if names_a_temporary || names_a_catalogue => WatchStep::Text,
+        _ if names_a_temporary || names_a_catalogue || names_encrypted => WatchStep::Text,
         None => WatchStep::Text,
         Some((prepared, sql)) => watch_step(prepared, &sql, generation, &literals, &classes),
     };

@@ -22,6 +22,8 @@ pub mod ledger;
 pub mod crypto;
 #[cfg(feature = "vault")]
 pub mod vault;
+#[cfg(feature = "vault")]
+pub mod columns;
 
 mod config;
 
@@ -34,6 +36,9 @@ pub use config::EnterpriseConfig;
 pub fn install_always() -> Result<(), String> {
     #[cfg(feature = "ledger")]
     ledger::install()?;
+    // After the ledger guard: the cipher reads vault policies through it.
+    #[cfg(feature = "vault")]
+    columns::install()?;
     Ok(())
 }
 

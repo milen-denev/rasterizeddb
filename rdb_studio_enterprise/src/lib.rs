@@ -85,6 +85,8 @@ pub struct Shown {
     pub specials: Vec<Special>,
     /// Anything not read above, shown as it came.
     pub other: Vec<String>,
+    /// `encrypted column t.c: vault v key 'k'[, varchar(n)]`.
+    pub encrypted: Vec<EncryptedColumn>,
 }
 
 fn parse_special(name: &str, rest: &str) -> Option<Special> {
@@ -146,10 +148,35 @@ impl Shown {
             } else if let Some(s) = l.split_once(": ").and_then(|(n, r)| parse_special(n, r)) {
                 out.specials.push(s);
             } else {
-                out.other.push(l.clone());
+                match EncryptedColumn::parse(l) {
+                    Some(e) => out.encrypted.push(e),
+                    None => out.other.push(l.clone()),
+                }
             }
         }
         out
+    }
+}
+
+/// A column stored encrypted (plan §4.7), from `SHOW LEDGER`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EncryptedColumn {
+    pub table: String,
+    pub column: String,
+    pub vault: String,
+    pub key: String,
+    pub max_len: Option<u32>,
+}
+
+impl EncryptedColumn {
+    pub fn parse(line: &str) -> Option<EncryptedColumn> {
+        let rest = line.strip_prefix("encrypted column ")?;
+        let (name, rest) = rest.split_once(": vault ")?;
+        let (table, column) = name.split_once('.')?;
+        let (vault, rest) = rest.split_once(" key '")?;
+        let (key, rest) = rest.split_once('\'')?;
+        let max_len = rest.strip_prefix(", varchar(").and_then(|r| r.strip_suffix(')')).and_then(|n| n.parse().ok());
+        Some(EncryptedColumn { table: table.into(), column: column.into(), vault: vault.into(), key: key.into(), max_len })
     }
 }
 
@@ -309,12 +336,12 @@ pub const DROP_COLUMN: &str = "__drop_column";
 impl LedgerPage {
     /// The vaults `SHOW LEDGER` names (its lines `<name>: vault id …`).
     pub fn vault_names(show: &[String]) -> Vec<String> {
-        Self::named(show, "vault ")
+        Self::named(show, "vault id ")
     }
 
     /// The ledger tables `SHOW LEDGER` names.
     pub fn ledger_names(show: &[String]) -> Vec<String> {
-        Self::named(show, "ledger ")
+        Self::named(show, "ledger id ")
     }
 
     fn named(show: &[String], kind: &str) -> Vec<String> {
@@ -520,6 +547,16 @@ impl LedgerPage {
             (None, None, None) => String::new(),
         };
         let not_null = if self.on(&format!("new:ledger:col:{i}:notnull")) { " NOT NULL" } else { "" };
+        if self.on(&format!("new:ledger:col:{i}:encrypted")) {
+            if !matches!(ty.as_str(), "TEXT" | "VARCHAR") {
+                return Err(format!("Column {name}: an encrypted column is TEXT or VARCHAR (its ciphertext is text)."));
+            }
+            let (vault, key) = (self.get("new:ledger:enc_vault").trim(), self.get("new:ledger:enc_key").trim());
+            if vault.is_empty() || key.is_empty() {
+                return Err("Choose the vault and key that encrypt the encrypted columns.".into());
+            }
+            return Ok(Some(format!("{name} {ty}{size} ENCRYPTED WITH VAULT {vault} KEY {}{not_null}", q(key))));
+        }
         Ok(Some(format!("{name} {ty}{size}{not_null}")))
     }
 
@@ -698,7 +735,7 @@ fn ident_ok(s: &str) -> bool {
 }
 
 /// A column row's inputs: `new:ledger:col:<i>:<field>`.
-const COLUMN_FIELDS: [&str; 6] = ["name", "type", "len", "prec", "scale", "notnull"];
+const COLUMN_FIELDS: [&str; 7] = ["name", "type", "len", "prec", "scale", "notnull", "encrypted"];
 
 const UNITS: [&str; 7] = ["SECONDS", "MINUTES", "HOURS", "DAYS", "WEEKS", "MONTHS", "YEARS"];
 
@@ -869,6 +906,9 @@ pub fn view<'a, M: Clone + 'a, K: Kit<'a, M>>(page: Option<&'a LedgerPage>, a: A
     body = body.push(switch);
     if view == "tables" {
         body = body.push(tables_grid(k, &a, page, &tables));
+        if !shown.encrypted.is_empty() {
+            body = body.push(encrypted_grid(k, &shown.encrypted));
+        }
         if let Some(t) = page.inputs.get(TABLE).and_then(|n| tables.iter().find(|t| &t.name == n)) {
             body = body.push(table_detail(k, &a, page, t));
         }
@@ -1001,6 +1041,54 @@ fn versions_line(l: &str) -> String {
         Some((head, us)) if us.chars().all(|c| c.is_ascii_digit()) && us.len() > 12 => format!("{head} at {}", when(us.parse().unwrap_or(0))),
         _ => l.to_string(),
     }
+}
+
+fn encrypted_grid<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, cols: &[EncryptedColumn]) -> Element<'a, M> {
+    let spec = vec![
+        Col::new("table", "TABLE", 160.0),
+        Col::new("column", "COLUMN", 160.0),
+        Col::new("vault", "VAULT", 140.0),
+        Col::new("key", "KEY", 140.0),
+        Col::new("type", "TYPE", 120.0),
+    ];
+    let rows = cols
+        .iter()
+        .map(|c| {
+            let ty = c.max_len.map_or("text".to_string(), |n| format!("varchar({n})"));
+            GridRow {
+                cells: vec![
+                    Cell::Text(c.table.clone(), Tone::Normal),
+                    Cell::Text(c.column.clone(), Tone::Normal),
+                    Cell::Text(c.vault.clone(), Tone::Dim),
+                    Cell::Text(c.key.clone(), Tone::Dim),
+                    Cell::Text(ty.clone(), Tone::Dim),
+                ],
+                keys: vec![
+                    SortVal::Text(c.table.clone()),
+                    SortVal::Text(c.column.clone()),
+                    SortVal::Text(c.vault.clone()),
+                    SortVal::Text(c.key.clone()),
+                    SortVal::Text(ty),
+                ],
+            }
+        })
+        .collect();
+    k.section(
+        "ENCRYPTED COLUMNS".into(),
+        None,
+        column![
+            k.grid("ledger-encrypted", spec, rows, 260.0),
+            k.text(
+                "Stored as ciphertext under each column's own key, wrapped by the vault key. Read whole by a role with \
+                 SELECT on the vault; any other role reads the ciphertext. Filtering, sorting, grouping, joining or \
+                 indexing on them is refused."
+                    .into(),
+                Tone::Faint
+            ),
+        ]
+        .spacing(6)
+        .into(),
+    )
 }
 
 fn tables_grid<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, tables: &[&Special]) -> Element<'a, M> {
@@ -1234,7 +1322,8 @@ fn create_ledger_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, p
         iced::widget::container(k.text("Column name".into(), Tone::Dim)).width(180),
         iced::widget::container(k.text("Type".into(), Tone::Dim)).width(200),
         iced::widget::container(k.text("Size".into(), Tone::Dim)).width(150),
-        k.text("Not null".into(), Tone::Dim),
+        iced::widget::container(k.text("Not null".into(), Tone::Dim)).width(60),
+        k.text("Encrypted".into(), Tone::Dim),
     ]
     .spacing(8);
     let mut cols = column![header].spacing(4);
@@ -1273,12 +1362,15 @@ fn create_ledger_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, p
         let nn_key = key("notnull");
         let not_null = k.toggle(String::new(), page.get(&nn_key) == "true", Box::new(move |v| input(nn_key.clone(), v.to_string())));
         let help = chosen.map(|t| t.help.clone()).unwrap_or_default();
+        let enc_key = key("encrypted");
+        let encrypted = k.toggle(String::new(), page.get(&enc_key) == "true", Box::new(move |v| input(enc_key.clone(), v.to_string())));
         cols = cols.push(
             row![
                 name,
                 pick,
                 iced::widget::container(size).width(150),
                 iced::widget::container(not_null).width(60),
+                iced::widget::container(encrypted).width(70),
                 k.row_button("×", (n > 1).then(|| input(DROP_COLUMN.into(), i.to_string())), true),
                 k.text(help, Tone::Faint),
             ]
@@ -1287,6 +1379,40 @@ fn create_ledger_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, p
         );
     }
     cols = cols.push(k.row_button("+ ADD COLUMN", Some(input(ADD_COLUMN.into(), String::new())), false));
+    // The vault and key that encrypt the ticked columns.
+    if (0..n).any(|i| page.get(&format!("new:ledger:col:{i}:encrypted")) == "true") {
+        let vaults: Vec<String> = page.vaults.iter().map(|v| v.name.clone()).collect();
+        let chosen_vault = page.get("new:ledger:enc_vault").to_string();
+        let keys: Vec<String> = page
+            .vaults
+            .iter()
+            .find(|v| v.name == chosen_vault)
+            .map(|v| {
+                v.secrets
+                    .iter()
+                    .filter_map(|l| Secret::parse(l))
+                    .filter(|s| s.is_key() && s.state == "active" && s.content_type.ends_with("aes256-gcm"))
+                    .map(|s| s.name.trim_start_matches("key:").to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let note = if vaults.is_empty() {
+            "No vault yet: create one on the VAULTS view, then an AES key in it."
+        } else if !chosen_vault.is_empty() && keys.is_empty() {
+            "This vault has no AES key: create one (KEYS USED IN PLACE, type AES-256-GCM or AES in the HSM)."
+        } else {
+            "Each encrypted column gets its own data key, wrapped by this vault key. Only roles with SELECT on the vault read the values; nothing can filter, sort, group, join or index on them."
+        };
+        cols = cols.push(
+            row![
+                k.pick("Encrypt with vault".into(), vaults, (!chosen_vault.is_empty()).then(|| chosen_vault.clone()), 200.0, Box::new(move |v| input("new:ledger:enc_vault".into(), v))),
+                k.pick("Key".into(), keys, Some(page.get("new:ledger:enc_key").to_string()).filter(|k| !k.is_empty()), 200.0, Box::new(move |v| input("new:ledger:enc_key".into(), v))),
+                lowered(k.text(note.into(), Tone::Faint)),
+            ]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Bottom),
+        );
+    }
     let versioned = page.get("new:ledger:versioned") == "true";
     let body = column![
         row![
@@ -1805,6 +1931,10 @@ mod tests {
         assert_eq!(shown.specials[2].key_provider.as_deref(), Some("file:/k"));
         assert!(shown.other.is_empty());
         assert_eq!(LedgerPage::vault_names(&s(&["sec: vault id 0e6e, retention 1 s"])), ["sec"]);
+        // An encrypted column's line names a vault too, and is not one.
+        let with_column = s(&["sec: vault id 0e6e, retention 1 s", "encrypted column patients.ssn: vault sec key 'k'"]);
+        assert_eq!(LedgerPage::vault_names(&with_column), ["sec"]);
+        assert_eq!(Shown::parse(&with_column).encrypted.len(), 1);
     }
 
     #[test]
@@ -1891,6 +2021,20 @@ mod tests {
         assert_eq!(p.get("new:ledger:col:0:type"), "NUMERIC");
         p.input("new:ledger:col:0:type".into(), "INT); DROP TABLE x; --".into());
         assert!(p.create_ledger_sql().is_err());
+        // An encrypted column: text only, with its vault and key.
+        p.input("new:ledger:col:0:type".into(), "NUMERIC\u{1}12\u{1}2".into());
+        p.input("new:ledger:col:1:encrypted".into(), "true".into());
+        assert!(p.create_ledger_sql().unwrap_err().contains("vault and key"));
+        p.input("new:ledger:enc_vault".into(), "hr".into());
+        p.input("new:ledger:enc_key".into(), "pii".into());
+        assert!(p.create_ledger_sql().unwrap().contains("memo VARCHAR(255) ENCRYPTED WITH VAULT hr KEY 'pii'"), "{:?}", p.create_ledger_sql());
+        p.input("new:ledger:col:1:type".into(), "BIGINT".into());
+        assert!(p.create_ledger_sql().unwrap_err().contains("TEXT or VARCHAR"));
+        p.input("new:ledger:col:1:encrypted".into(), "false".into());
+        assert_eq!(
+            EncryptedColumn::parse("encrypted column patients.ssn: vault hr key 'pii', varchar(11)").unwrap(),
+            EncryptedColumn { table: "patients".into(), column: "ssn".into(), vault: "hr".into(), key: "pii".into(), max_len: Some(11) }
+        );
         assert_eq!(date_problem("2027-06-31").unwrap(), "2027-06-31 has no day 31.");
         assert_eq!(date_problem(""), None);
         assert_eq!(date_problem("2027-06-30 18:00"), None);

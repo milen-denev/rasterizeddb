@@ -23604,9 +23604,104 @@ fn execute_in_statement_scope(
     })
 }
 
+tokio::task_local! {
+    /// Set while a task's outermost statement runs: the statements it runs
+    /// in turn (subqueries, key actions, a CTE's parts) are not guarded or
+    /// decrypted again (`column_crypto`).
+    static OUTERMOST_STATEMENT: ();
+}
+
+/// A statement as `column_crypto` sees it: guarded and planned before it
+/// runs, its literals for encrypted columns encrypted, and its rows'
+/// ciphertext decrypted for a role holding the vault's `SELECT` once it
+/// has run. Only for a task's outermost statement, and only when the
+/// licensed cipher is installed: otherwise the statement runs as it is.
+pub(crate) async fn execute_with_need(
+    query: QueryPurpose,
+    database: Arc<Database>,
+    depth: usize,
+    tx: TxId,
+    need: SubqueryNeed,
+) -> Vec<u8> {
+    if !crate::core::column_crypto::installed() || OUTERMOST_STATEMENT.try_with(|_| ()).is_ok() {
+        return execute_with_need_inner(query, database, depth, tx, need).await;
+    }
+    OUTERMOST_STATEMENT.scope((), Box::pin(execute_encrypted(query, database, depth, tx, need))).await
+}
+
+#[inline(never)]
+async fn execute_encrypted(query: QueryPurpose, database: Arc<Database>, depth: usize, tx: TxId, need: SubqueryNeed) -> Vec<u8> {
+    let text = statement_lock_text(&query).map(str::to_string);
+    let plan = match text.as_deref().map(|sql| crate::core::column_crypto::plan(&database, sql)) {
+        Some(Err(e)) => return ddl_error(&e),
+        Some(Ok(p)) => p,
+        None => None,
+    };
+    let session = crate::core::ledger_hooks::session();
+    let mut query = query;
+    let mut token = None;
+    if let Some(plan) = plan {
+        // Encrypting under a vault's key is using it: `SELECT` on the vault,
+        // as `VAULT … ENCRYPT` needs.
+        if let Some((role, false)) = &session {
+            if !plan.vaults.is_empty() {
+                let acl = match crate::core::rql::privileges::load(&database, Some(tx)).await {
+                    Ok(acl) => acl,
+                    Err(e) => return ddl_error(&e),
+                };
+                for vault in &plan.vaults {
+                    if !crate::core::rql::privileges::allows(&acl, role, vault, "SELECT") {
+                        return ddl_error(&format!(
+                            "42501: permission denied for vault \"{vault}\" (SELECT): its key encrypts this column"
+                        ));
+                    }
+                }
+            }
+        }
+        if plan.declares {
+            if let Some(root) = database.location.as_deref() {
+                if let Err(e) = crate::core::database::incompat::require(std::path::Path::new(root), crate::core::database::incompat::ENCRYPTED_VALUES_V1) {
+                    return ddl_error(&format!("could not mark the directory as holding encrypted columns: {e}"));
+                }
+            }
+        }
+        if let Some(sql) = plan.sql {
+            match crate::core::rql::lexer_s1::recognize_query_purpose(&sql) {
+                Some(p) => query = p,
+                None => return ddl_error("internal error: the encrypted statement did not parse"),
+            }
+        }
+        token = plan.token;
+    }
+    let response = Box::pin(execute_with_need_inner(query, database.clone(), depth, tx, need)).await;
+    if let Some(t) = token {
+        crate::core::column_crypto::finish(&database, t, response.first() != Some(&3));
+    }
+    if response.first() != Some(&2) || !crate::core::column_crypto::active(&database) {
+        return response;
+    }
+    // Who may read the plaintext: an in-process caller (no session) and a
+    // superuser always; a role, for the vaults it may `SELECT`.
+    let vaults = crate::core::column_crypto::vaults_in(&database, &response);
+    if vaults.is_empty() {
+        return response;
+    }
+    let allowed: Vec<String> = match &session {
+        None | Some((_, true)) => vaults,
+        Some((role, false)) => match crate::core::rql::privileges::load(&database, Some(tx)).await {
+            Ok(acl) => vaults.into_iter().filter(|v| crate::core::rql::privileges::allows(&acl, role, v, "SELECT")).collect(),
+            Err(_) => Vec::new(),
+        },
+    };
+    match crate::core::column_crypto::decrypt_response(&database, response, &allowed) {
+        Ok(r) => r,
+        Err(e) => ddl_error(&e),
+    }
+}
+
 /// [`execute_with_context`] for a statement whose caller needs only part of
 /// its result. See [`SubqueryNeed`].
-pub(crate) async fn execute_with_need(
+async fn execute_with_need_inner(
     query: QueryPurpose,
     database: Arc<Database>,
     depth: usize,

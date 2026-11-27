@@ -2076,6 +2076,14 @@ pub fn metric_grid(
 pub fn plain_cell(value: Option<&str>, numeric: bool) -> Element<'_, Message> {
     let content: Element<'_, Message> = match value {
         None => text("∅").size(12).font(theme::MONO).color(theme::TEXT_FAINT).into(),
+        // An encrypted column's value, read by a role without its vault's
+        // SELECT (RasterizedDB enterprise): what it is, not base64 noise.
+        Some(v) if v.starts_with("rdbenc1:") => text("🔒 encrypted (no access to its vault)")
+            .size(12)
+            .font(theme::MONO)
+            .color(theme::TEXT_FAINT)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
         // One line, cut at the cell's edge rather than wrapped onto the
         // rows below; a narrow column is widened by dragging its edge.
         Some(text_value) => text(elide(text_value, 220))

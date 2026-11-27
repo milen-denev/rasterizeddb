@@ -746,6 +746,11 @@ impl NativeSession {
         if crate::core::ledger_hooks::is_ledger_statement(stmt) {
             return true;
         }
+        // A table with an encrypted column: the session path guards the
+        // text and knows whose role may read the plaintext.
+        if crate::core::column_crypto::touches(database, stmt) {
+            return true;
+        }
         // The schema-object statements below each begin with CREATE, DROP,
         // ALTER, CALL, MERGE, GRANT or REVOKE, so a statement that begins
         // with a reading or writing verb is none of them. Each parser

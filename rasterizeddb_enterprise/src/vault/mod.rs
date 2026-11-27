@@ -323,6 +323,52 @@ fn aad(vault: u128, name: &str, version: i64) -> Vec<u8> {
     a
 }
 
+// ---- keys lent to encrypted columns --------------------------------------
+
+/// What the vault key `name` (`aes256-gcm`, or `hsm-aes256-gcm` inside the
+/// vault's HSM) seals with: the material, or the HSM label.
+enum KeyUse {
+    Material(crypto::Dek),
+    Hsm(Arc<dyn KeyProvider>, String),
+}
+
+fn key_use(g: &LedgerGuard, store_key: &str, vault: &TableSchema, name: &str) -> Result<KeyUse, String> {
+    let policy = g.policy(vault)?;
+    if policy.kind != rasterizeddb_core::core::row::schema::SpecialTable::Vault {
+        return Err(format!("42809: \"{}\" is not a vault", vault.name));
+    }
+    let full = format!("key:{name}");
+    let wrapped = keyring(store_key, policy.id)?
+        .lock()
+        .keys
+        .get(&(full, 1))
+        .cloned()
+        .ok_or_else(|| format!("42704: vault \"{}\" has no key '{name}' (VAULT {} CREATE KEY '{name}')", vault.name, vault.name))?;
+    let provider = provider(policy.key_provider.as_deref().ok_or("XX001: the vault has no key provider")?)?;
+    if wrapped == HSM_MARKER {
+        provider.hsm().ok_or("0A000: the vault's key provider has no HSM")?;
+        return Ok(KeyUse::Hsm(provider, hsm_label(policy.id, name)));
+    }
+    Ok(KeyUse::Material(provider.unwrap(&wrapped)?))
+}
+
+/// `plain` sealed under the vault key `name`, bound to `aad`: how an
+/// encrypted column's data key is wrapped (`crate::columns`).
+pub(crate) fn key_seal(g: &LedgerGuard, store_key: &str, vault: &TableSchema, name: &str, plain: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
+    match key_use(g, store_key, vault, name)? {
+        KeyUse::Material(m) => crypto::seal(&m, plain, aad),
+        KeyUse::Hsm(p, label) => p.hsm().ok_or("0A000: no HSM")?.aes_encrypt(&label, plain, aad),
+    }
+}
+
+/// [`key_seal`] undone.
+pub(crate) fn key_open(g: &LedgerGuard, store_key: &str, vault: &TableSchema, name: &str, sealed: &[u8], aad: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    match key_use(g, store_key, vault, name)? {
+        KeyUse::Material(m) => crypto::open(&m, sealed, aad),
+        KeyUse::Hsm(p, label) => p.hsm().ok_or("0A000: no HSM")?.aes_decrypt(&label, sealed, aad),
+    }
+}
+
 // ---- audit ----------------------------------------------------------------
 
 static AUDIT_MEMORY: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();

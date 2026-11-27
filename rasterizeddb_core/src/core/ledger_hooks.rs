@@ -154,6 +154,56 @@ pub trait LedgerHooks: Send + Sync + 'static {
     fn statement(&self, store: &str, request: LedgerRequest<'_>) -> Result<LedgerReply, String>;
 }
 
+/// One set of hooks installed here and kept by its crate too (a leaked
+/// `&'static`), so the crate's other hooks share its state.
+impl<T: LedgerHooks> LedgerHooks for &'static T {
+    fn check_open(&self, table: &TableSchema) -> Result<(), String> {
+        (**self).check_open(table)
+    }
+    fn admit(&self, table: &TableSchema, write: WriteKind<'_>) -> Result<(), String> {
+        (**self).admit(table, write)
+    }
+    fn admit_row_delete(&self, table: &TableSchema, inserted_at_micros: i64) -> Result<(), String> {
+        (**self).admit_row_delete(table, inserted_at_micros)
+    }
+    fn create_policy(&self, kind: SpecialTable, clauses: &str) -> Result<Vec<u8>, String> {
+        (**self).create_policy(kind, clauses)
+    }
+    fn now_micros(&self) -> i64 {
+        (**self).now_micros()
+    }
+    fn on_insert(&self, table: &TableSchema, tx: TxId, ts: i64, cells: &[(u32, &[u8])]) {
+        (**self).on_insert(table, tx, ts, cells)
+    }
+    fn on_delete(&self, table: &TableSchema, tx: TxId, ts: i64) {
+        (**self).on_delete(table, tx, ts)
+    }
+    fn admit_row_update(&self, table: &TableSchema, ts: i64) -> Result<(), String> {
+        (**self).admit_row_update(table, ts)
+    }
+    fn on_update(&self, table: &TableSchema, tx: TxId, ts: i64, cells: &[(u32, &[u8])]) {
+        (**self).on_update(table, tx, ts, cells)
+    }
+    fn keeps_versions(&self, table: &TableSchema) -> bool {
+        (**self).keeps_versions(table)
+    }
+    fn prepare_commit(&self, store: &str, members: &[(TxId, bool)]) -> Result<(), String> {
+        (**self).prepare_commit(store, members)
+    }
+    fn discard(&self, tx: TxId) {
+        (**self).discard(tx)
+    }
+    fn has_pending(&self, ids: &[TxId]) -> bool {
+        (**self).has_pending(ids)
+    }
+    fn database_opened(&self, store: &str) {
+        (**self).database_opened(store)
+    }
+    fn statement(&self, store: &str, request: LedgerRequest<'_>) -> Result<LedgerReply, String> {
+        (**self).statement(store, request)
+    }
+}
+
 /// What a ledger statement hands the hooks: the statement, and the tables
 /// and rows core read for it.
 pub struct LedgerRequest<'a> {
