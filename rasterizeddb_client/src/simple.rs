@@ -212,16 +212,25 @@ pub(crate) fn decode(response: Vec<u8>) -> Result<SimpleAnswer> {
 /// whatever the answer was, error or not: `None` only when the answer did not
 /// say (a damaged one, or a refusal).
 pub(crate) fn decode_status(response: Vec<u8>) -> (Result<SimpleAnswer>, Option<TransactionStatus>) {
+    let (result, status, _) = decode_with_notices(response);
+    (result, status)
+}
+
+/// [`decode_status`], and the notices of an answer that failed: the error
+/// alone is returned, and they would be lost with the rest of the answer
+/// (the server's note that a request's earlier statements were rolled
+/// back with the one that failed is one).
+pub(crate) fn decode_with_notices(response: Vec<u8>) -> (Result<SimpleAnswer>, Option<TransactionStatus>, Vec<String>) {
     match response.first() {
         Some(&ANSWER) => match read_messages(&response[1..]) {
             Ok((answer, None)) => {
                 let status = answer.transaction;
-                (Ok(answer), Some(status))
+                (Ok(answer), Some(status), Vec::new())
             }
-            Ok((answer, Some(error))) => (Err(error), Some(answer.transaction)),
-            Err(e) => (Err(e), None),
+            Ok((answer, Some(error))) => (Err(error), Some(answer.transaction), answer.notices),
+            Err(e) => (Err(e), None, Vec::new()),
         },
-        _ => (refusal(&response), None),
+        _ => (refusal(&response), None, Vec::new()),
     }
 }
 
@@ -630,6 +639,24 @@ mod tests {
         let (result, status) = decode_status(vec![3u8, b'x']);
         assert!(result.is_err());
         assert_eq!(status, None);
+    }
+
+    /// A failed answer's notices come back beside its error: the server's
+    /// note that the request's earlier statements were rolled back is one.
+    #[test]
+    fn a_failed_answer_keeps_its_notices() {
+        let mut notice = error("00000", "the statement before the one that failed was rolled back with it");
+        notice[0] = b'N';
+        let (result, status, notices) = decode_with_notices(answer(
+            &[complete("CREATE ROLE"), error("42P01", "no such table"), notice],
+            b'I',
+        ));
+        assert!(matches!(result, Err(Error::Server(m)) if m.contains("42P01")));
+        assert_eq!(status, Some(TransactionStatus::Idle));
+        assert_eq!(notices, vec!["the statement before the one that failed was rolled back with it".to_string()]);
+        // An answer that succeeded keeps its own, in the answer.
+        let (result, _, notices) = decode_with_notices(answer(&[complete("SELECT 0")], b'I'));
+        assert!(result.is_ok() && notices.is_empty());
     }
 
     #[test]

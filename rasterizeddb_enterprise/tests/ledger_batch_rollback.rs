@@ -1,0 +1,111 @@
+//! A failed request of several statements takes all of them with it, its
+//! vault and ledger DDL included, and says so; a vault whose key provider
+//! does not open is never made; a key whose row rolled back is kept, never
+//! minted again over the columns that use it. One test function: the
+//! vault's settings are read from the environment once per process.
+
+use rasterizeddb_embedded::{Builder, Client};
+
+async fn col(c: &Client, sql: &str) -> Vec<Option<String>> {
+    let rows = c.query(sql, &[]).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    rows.iter().map(|r| r.get::<Option<String>>(0).unwrap()).collect()
+}
+
+async fn run(c: &Client, sql: &str) {
+    c.execute(sql, &[]).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+async fn refused(c: &Client, sql: &str) -> String {
+    match c.query(sql, &[]).await {
+        Ok(rows) => panic!("{sql} was answered ({} rows)", rows.len()),
+        Err(e) => e.to_string(),
+    }
+}
+
+async fn table_exists(c: &Client, name: &str) -> bool {
+    !col(c, &format!("SELECT table_name FROM information_schema.tables WHERE table_name = '{name}'")).await.is_empty()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_batch_takes_its_vault_and_ledger_ddl_with_it() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    // SAFETY: set before the engine starts, in the only test of this process.
+    unsafe {
+        std::env::set_var("RDB_VAULT_ALLOW_FILE_KEY", "1");
+    }
+    let key = root.path().join("kek");
+    std::fs::write(&key, "33".repeat(32)).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    rasterizeddb_enterprise::install_always().unwrap();
+    let db = Builder::open(&data).worker_threads(2).password("admin", "adminpw").start().await.unwrap();
+    let admin = db.connect().await.unwrap();
+
+    // --- a key provider that does not open: no vault is made -----------------
+    let missing = root.path().join("no-such-dir").join("vault.key");
+    let e = refused(&admin, &format!("CREATE VAULT broken KEY PROVIDER 'mlkem:{};create'", missing.display())).await;
+    assert!(e.contains("No such file"), "{e}");
+    assert!(!table_exists(&admin, "broken").await, "a vault whose key provider failed was made");
+    let e = refused(&admin, "CREATE VAULT broken2 KEY PROVIDER 'pkcs11:module=/nonexistent/libnone.so;token=t;key=k'").await;
+    assert!(e.contains("PIN"), "{e}");
+    assert!(!table_exists(&admin, "broken2").await);
+
+    // --- one request, failing at its last statement ---------------------------
+    let setup = format!(
+        "CREATE ROLE \"batch-role\" LOGIN PASSWORD 'pw'; \
+         CREATE VAULT bv KEY PROVIDER 'file:{}'; \
+         VAULT bv CREATE KEY 'k' TYPE 'aes256-gcm'; \
+         CREATE LEDGER TABLE bl (id BIGINT NOT NULL, p TEXT ENCRYPTED WITH VAULT bv KEY 'k' NOT NULL) \
+           NO DELETE UNTIL 1 HOUR AFTER INSERT NO DROP UNTIL 90 DAYS IDLE; \
+         INSERT INTO bl (id, p) VALUES (1, 'secret'); \
+         GRANT SELECT ON bl TO \"batch-role\"",
+        key.display()
+    );
+    let session = admin.simple_session().await.unwrap();
+    let failed = session.query(&format!("{setup}; SELECT * FROM no_such_table")).await;
+    assert!(failed.is_err(), "the last statement fails");
+    let notices = session.failure_notices();
+    assert!(
+        notices.iter().any(|n| n.contains("the 6 statements before the one that failed were rolled back with it")),
+        "{notices:?}"
+    );
+    // Every one of them, the DDL with the rest.
+    assert!(!table_exists(&admin, "bl").await, "the ledger table outlived its rollback");
+    assert!(!table_exists(&admin, "bv").await, "the vault outlived its rollback");
+    assert!(col(&admin, "SELECT rolname FROM pg_roles WHERE rolname = 'batch-role'").await.is_empty());
+    let show = col(&admin, "SHOW LEDGER").await;
+    assert!(!show.iter().flatten().any(|l| l.contains("encrypted column bl.")), "{show:?}");
+
+    // Nothing is left in the way: the same request, whole, now runs.
+    session.query(&setup).await.unwrap_or_else(|e| panic!("the request again: {e}"));
+    assert!(session.failure_notices().is_empty());
+    assert_eq!(col(&admin, "SELECT p FROM bl").await, vec![Some("secret".into())]);
+    assert_eq!(col(&admin, "SELECT rolname FROM pg_roles WHERE rolname = 'batch-role'").await, vec![Some("batch-role".into())]);
+    // A lone statement that fails rolls back nothing else: no note.
+    assert!(session.query("SELECT * FROM no_such_table").await.is_err());
+    assert!(session.failure_notices().is_empty(), "{:?}", session.failure_notices());
+
+    // --- a key whose row rolled back is kept ----------------------------------
+    // The keyring (a file) keeps the material the rolled-back statement made;
+    // a column declared since wraps its data key with it.
+    assert!(session.query("VAULT bv CREATE KEY 'k2'; SELECT * FROM no_such_table").await.is_err());
+    run(&admin, "CREATE TABLE kc (id BIGINT, s TEXT ENCRYPTED WITH VAULT bv KEY 'k2')").await;
+    run(&admin, "INSERT INTO kc (id, s) VALUES (1, 'kept')").await;
+    // Of another kind than the keyring holds: refused, not replaced.
+    let e = refused(&admin, "VAULT bv CREATE KEY 'k2' TYPE 'hsm-aes256-gcm'").await;
+    assert!(e.contains("42710") || e.contains("keyring"), "{e}");
+    let made = col(&admin, "VAULT bv CREATE KEY 'k2'").await;
+    assert!(made.iter().flatten().any(|l| l.contains("kept")), "{made:?}");
+    assert_eq!(col(&admin, "SELECT s FROM kc").await, vec![Some("kept".into())], "the column's key was replaced");
+    // Its row is back: a second CREATE finds it.
+    let e = refused(&admin, "VAULT bv CREATE KEY 'k2'").await;
+    assert!(e.contains("exists"), "{e}");
+
+    drop(session);
+    drop(admin);
+    db.shutdown().await.unwrap();
+}

@@ -950,9 +950,13 @@ impl Session {
                         result: Ok(outcomes(answer)),
                         transaction,
                     },
+                    // A failed run's notices too: among them the server's
+                    // note that the statements before the failure were
+                    // rolled back with it, without which a script's earlier
+                    // statements looked to have stayed.
                     Err(e) => EditorAnswer {
                         result: Err(native_error(&e)),
-                        notices: Vec::new(),
+                        notices: editor.failure_notices(),
                         transaction,
                     },
                 }

@@ -2708,7 +2708,7 @@ impl Database {
     /// reports an error at any point.
     pub async fn drop_table(&self, table_name: &str) -> io::Result<bool> {
         let _changed = SchemaChanged::unless_internal(&self.schema_generation, table_name);
-        self.drop_table_to_depth(table_name, 0).await
+        self.drop_table_to_depth(table_name, 0, true).await
     }
 
     /// `drop_table`, tracking how far into a chain of JSON shadow tables it has
@@ -2718,7 +2718,7 @@ impl Database {
     /// creation by `json_map::MAX_NESTING_DEPTH`, so reaching the cap here means
     /// a sidecar names a shadow that names it back. Stopping is right in that
     /// case — leaking a table is recoverable, recursing forever is not.
-    async fn drop_table_to_depth(&self, table_name: &str, depth: usize) -> io::Result<bool> {
+    async fn drop_table_to_depth(&self, table_name: &str, depth: usize, admit: bool) -> io::Result<bool> {
         // The map key DDL mutates (`resolve_key`): where identifier case
         // folding drops in, so every mutator removes the slot a lookup finds.
         let resolved = self.resolve_key(table_name);
@@ -2742,7 +2742,9 @@ impl Database {
         // A ledger table or vault is dropped only when its policy admits it
         // (`ledger_hooks`: its drop-idle time has passed). A JSON shadow
         // table is its parent's, dropped with it once the parent was admitted.
-        if depth == 0 {
+        // Not for a table its own block made and now undoes
+        // (`drop_table_for_rollback`): nothing of it ever committed.
+        if admit {
             if let Some(relation) = self.relation(table_name) {
                 crate::core::ledger_hooks::admit_io(relation.schema(), crate::core::ledger_hooks::WriteKind::Drop)?;
             }
@@ -2910,7 +2912,7 @@ impl Database {
                 }
                 // A shadow can itself hold JSON columns, so this walks the chain.
                 if let Err(e) =
-                    Box::pin(self.drop_table_to_depth(&json.shadow_table, depth + 1)).await
+                    Box::pin(self.drop_table_to_depth(&json.shadow_table, depth + 1, false)).await
                 {
                     // The parent is already gone; failing here would report a
                     // drop that did happen as one that did not.

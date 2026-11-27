@@ -176,6 +176,14 @@ impl LedgerHooks for LedgerGuard {
 
     fn create_policy(&self, kind: SpecialTable, clauses: &str) -> Result<Vec<u8>, String> {
         let policy = clauses::parse(kind, clauses).map_err(|e| format!("42601: {e}"))?;
+        // A vault's key provider is opened now, before the vault exists: a
+        // missing PIN, key file directory or token otherwise surfaced only
+        // at its first use, past a CREATE VAULT that had succeeded and
+        // left a vault no key could ever be made in.
+        #[cfg(feature = "vault")]
+        if let Some(uri) = policy.key_provider.as_deref() {
+            crate::vault::check_provider(uri)?;
+        }
         Ok(policy::record(&policy.creation_payload()))
     }
 

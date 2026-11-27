@@ -12135,12 +12135,16 @@ where
     // statement failed kept its first two. A string holding transaction
     // control, or a statement that refuses a block, runs statement by
     // statement as before (`opens_an_implicit_block`).
-    if statements.len() > 1
+    let implicit = statements.len() > 1
         && state.transaction.is_none()
-        && statements.iter().all(|stmt| opens_an_implicit_block(stmt))
-    {
+        && statements.iter().all(|stmt| opens_an_implicit_block(stmt));
+    if implicit {
         open_implicit_block(database, state);
     }
+    // How many ran before one failed: rolled back with it, which a client
+    // shown only the failure's error took to have stayed (a role a script
+    // created, then found missing).
+    let mut completed = 0usize;
 
     // Where each statement starts in the client's text, for an error's
     // position: only where the text was not rewritten before the split.
@@ -12170,8 +12174,23 @@ where
         if state.statement_failed {
             break;
         }
+        completed += 1;
     }
+    let rolled_back = implicit && state.statement_failed && completed > 0;
     close_implicit_block(database, state, stream).await?;
+    if rolled_back {
+        send_notice(
+            stream,
+            "00000",
+            &format!(
+                "{} before the one that failed {} rolled back with it: several statements sent as one \
+                 request run as one transaction",
+                if completed == 1 { "the statement".to_string() } else { format!("the {completed} statements") },
+                if completed == 1 { "was" } else { "were" }
+            ),
+        )
+        .await?;
+    }
 
     let status = state.ready_status();
     send_ready_for_query(stream, status).await?;

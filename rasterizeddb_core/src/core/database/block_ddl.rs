@@ -286,6 +286,29 @@ pub(crate) fn targets(database: &Database, sql: &str) -> Option<(Vec<(String, Fi
         (!name.is_empty()).then_some(name)
     };
     match (upper(0).as_str(), upper(1).as_str()) {
+        // `CREATE LEDGER TABLE` and `CREATE VAULT` (`rql::ledger_ddl`) make a
+        // table as `CREATE TABLE` does, and are undone the same way. Left
+        // out, they stayed through the ROLLBACK of a script whose role and
+        // grant statements went with it (`drop_table_for_rollback` passes
+        // their drop-idle lock: the block made the table).
+        ("CREATE", "LEDGER") | ("CREATE", "VAULT") => {
+            let mut i = if upper(1) == "LEDGER" {
+                if upper(2) != "TABLE" {
+                    return None;
+                }
+                3
+            } else {
+                2
+            };
+            if upper(i) == "IF" && upper(i + 1) == "NOT" && upper(i + 2) == "EXISTS" {
+                i += 3;
+            }
+            let name = name_at(i)?;
+            if database.relation(&name).is_some() {
+                return Some((Vec::new(), Vec::new()));
+            }
+            Some((Vec::new(), vec![name]))
+        }
         ("CREATE", "TABLE") => {
             let mut i = 2;
             if upper(2) == "IF" && upper(3) == "NOT" && upper(4) == "EXISTS" {
@@ -427,7 +450,16 @@ impl Database {
         if !(self.has_table(table) || self.is_partitioned(table)) {
             return Ok(());
         }
-        self.drop_table(table).await.map(|_| ())
+        // Without the ledger's drop admission: a ledger table or vault the
+        // block created holds nothing committed, and its `NO DROP UNTIL …
+        // IDLE` (counted from now while it has no row) refused the undo,
+        // which left the table behind a ROLLBACK.
+        let _changed = super::SchemaChanged::unless_internal(&self.schema_generation, table);
+        self.drop_table_to_depth(table, 0, false).await?;
+        // Its encrypted columns' entries, which the CREATE recorded when it
+        // ran: left, a later table of the name would be taken to have them.
+        crate::core::column_crypto::forget_table(self, table);
+        Ok(())
     }
 
     /// Whether a block's `sql` rolls back with it (what

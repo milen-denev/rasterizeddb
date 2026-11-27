@@ -985,6 +985,23 @@ impl ColumnCrypto for Cipher {
     fn show_lines(&self, store: &str) -> Vec<String> {
         show_lines(store)
     }
+
+    fn forget_table(&self, store: &str, table: &str) {
+        let mut all = match cols(store) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("encrypted columns: {e}");
+                return;
+            }
+        };
+        let before = all.len();
+        all.retain(|c| !c.table.eq_ignore_ascii_case(table));
+        if all.len() != before {
+            if let Err(e) = set_cols(store, all) {
+                log::error!("encrypted columns: could not forget \"{table}\" after its rollback: {e}");
+            }
+        }
+    }
 }
 
 /// `SHOW LEDGER`'s lines about encrypted columns.

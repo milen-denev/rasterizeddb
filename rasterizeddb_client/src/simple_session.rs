@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use rastcp::client::TcpClient;
 
-use crate::simple::{SimpleAnswer, SimpleOptions, TransactionStatus, decode_status, request};
+use crate::simple::{SimpleAnswer, SimpleOptions, TransactionStatus, decode_with_notices, request};
 use crate::{Error, Result};
 
 /// A connection of its own for [simple queries](crate::simple), opened by
@@ -36,6 +36,8 @@ pub struct SimpleSession {
     link: tokio::sync::Mutex<Link>,
     /// The last `ReadyForQuery` status, readable without waiting for a call.
     status: std::sync::Mutex<TransactionStatus>,
+    /// The notices of the last call, when it failed.
+    failure_notices: std::sync::Mutex<Vec<String>>,
 }
 
 struct Link {
@@ -61,12 +63,20 @@ impl SimpleSession {
                 in_flight: false,
             }),
             status: std::sync::Mutex::new(TransactionStatus::Idle),
+            failure_notices: std::sync::Mutex::new(Vec::new()),
         })
     }
 
     /// Where the session's transaction stood after its last call.
     pub fn transaction(&self) -> TransactionStatus {
         *self.status.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The notices the last call raised, when it failed: a failed call
+    /// returns its error alone. Empty after a call that succeeded, whose
+    /// [`SimpleAnswer::notices`] carries them.
+    pub fn failure_notices(&self) -> Vec<String> {
+        self.failure_notices.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn set_transaction(&self, status: TransactionStatus) {
@@ -95,6 +105,7 @@ impl SimpleSession {
 
     async fn exchange(&self, request: &[u8]) -> Result<SimpleAnswer> {
         let mut link = self.link.lock().await;
+        self.failure_notices.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let status = self.transaction();
         if link.in_flight {
             link.in_flight = false;
@@ -130,10 +141,11 @@ impl SimpleSession {
         match sent {
             Ok(response) => {
                 link.last_used = Instant::now();
-                let (result, status) = decode_status(response);
+                let (result, status, notices) = decode_with_notices(response);
                 if let Some(status) = status {
                     self.set_transaction(status);
                 }
+                *self.failure_notices.lock().unwrap_or_else(|e| e.into_inner()) = notices;
                 result
             }
             Err(e) => {

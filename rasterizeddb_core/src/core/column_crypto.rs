@@ -74,6 +74,10 @@ pub trait ColumnCrypto: Send + Sync + 'static {
     fn decrypt(&self, database: &Database, cell: &[u8]) -> Result<Vec<u8>, String>;
     /// `SHOW LEDGER`'s lines about encrypted columns.
     fn show_lines(&self, store: &str) -> Vec<String>;
+    /// `table` was dropped by the rollback of the block that created it
+    /// (`Database::drop_table_for_rollback`, also after a crash): its
+    /// columns are forgotten, as a `DROP TABLE` statement's are.
+    fn forget_table(&self, _store: &str, _table: &str) {}
 }
 
 static HOOKS: OnceLock<Box<dyn ColumnCrypto>> = OnceLock::new();
@@ -139,6 +143,13 @@ pub fn plan(database: &Database, sql: &str) -> Result<Option<Plan>, String> {
 pub fn finish(database: &Database, token: u64, ok: bool) {
     if let Some(h) = hooks() {
         h.finish(&database.ledger_store(), token, ok);
+    }
+}
+
+/// See [`ColumnCrypto::forget_table`].
+pub fn forget_table(database: &Database, table: &str) {
+    if let Some(h) = hooks() {
+        h.forget_table(&database.ledger_store(), table);
     }
 }
 

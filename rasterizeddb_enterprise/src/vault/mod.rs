@@ -306,6 +306,18 @@ fn provider(uri: &str) -> Result<Arc<dyn KeyProvider>, String> {
     Ok(p)
 }
 
+/// Opens the key provider `uri` names (and keeps it, as a first use
+/// would): `CREATE VAULT` refuses one that cannot open, with its SQLSTATE.
+pub(crate) fn check_provider(uri: &str) -> Result<(), String> {
+    provider(uri).map(drop).map_err(|e| {
+        if e.get(5..7) == Some(": ") && e[..5].bytes().all(|b| b.is_ascii_alphanumeric()) {
+            e
+        } else {
+            format!("58030: the vault's key provider does not open: {e}")
+        }
+    })
+}
+
 /// What the keyring records for a key that lives in the HSM.
 const HSM_MARKER: &[u8] = b"hsm";
 
@@ -756,6 +768,30 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
             let full = format!("key:{name}");
             if secrets.contains_key(&full) {
                 return Err(format!("42710: key '{name}' exists"));
+            }
+            // The keyring can hold the key with no row naming it: the
+            // statement that made it was rolled back, its row with the
+            // transaction, while the keyring (a file) kept the material.
+            // Encrypted columns declared in the meantime wrap their data
+            // keys with it, so it is never replaced: the row is put back and
+            // the material kept. Minting new material here made every such
+            // column unreadable, with no error until a value was read.
+            let kept = keyring(store_key, vault)?.lock().keys.get(&(full.clone(), 1)).cloned();
+            if let Some(kept) = kept {
+                let in_hsm = kept == HSM_MARKER;
+                if in_hsm != kind.starts_with("hsm-") {
+                    return Err(format!(
+                        "42710: key '{name}' is already in the vault's keyring as {} key, from a statement that \
+                         rolled back; create it again with an {} TYPE to keep it, or under another name",
+                        if in_hsm { "an HSM" } else { "a software" },
+                        if in_hsm { "hsm-…" } else { "aes256-gcm or mldsa65" }
+                    ));
+                }
+                audit(store_key, vault, &format!("CREATE KEY {} '{name}' {kind} (kept) by {role}", table.name))?;
+                return Ok(reply(
+                    vec![format!("key {name} ({kind}, kept: the keyring held it from a statement that rolled back)")],
+                    vec![insert(&full, 1, "", "active", &kind, 0, 0, "")],
+                ));
             }
             let provider = provider(policy.key_provider.as_deref().ok_or("XX001: the vault has no key provider")?)?;
             if kind.starts_with("hsm-") {
