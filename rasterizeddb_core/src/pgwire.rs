@@ -12639,18 +12639,40 @@ fn deferred_drops(
 /// The table a block's `CREATE TABLE` creates, when the block has a drop of
 /// that name pending.
 fn created_over_pending_drop(database: &Database, root: crate::core::mvcc::TxId, stmt: &str) -> Option<String> {
-    let mut words = stmt.split_whitespace();
-    let (first, second) = (words.next()?, words.next()?);
-    if !first.eq_ignore_ascii_case("CREATE") || !second.eq_ignore_ascii_case("TABLE") {
+    let words: Vec<&str> = stmt.split_whitespace().take(7).collect();
+    let is = |i: usize, w: &str| words.get(i).is_some_and(|x| x.eq_ignore_ascii_case(w));
+    // `CREATE TABLE`, `CREATE LEDGER TABLE`, `CREATE VAULT`: each makes a
+    // table under its name.
+    let name_at = if !is(0, "CREATE") {
         return None;
-    }
+    } else if is(1, "TABLE") || is(1, "VAULT") {
+        2
+    } else if is(1, "LEDGER") && is(2, "TABLE") {
+        3
+    } else {
+        return None;
+    };
     let pending = database.block_drops_pending(root);
     if pending.is_empty() {
         return None;
     }
-    let created = crate::core::rql::lexer_ct::create_table_with_reason(&QueryPurpose::CreateTable(stmt.to_string()))
-        .0?
-        .table_name;
+    // Its name by the parser where it reads the statement; by the word
+    // after the keyword where it does not: a declaration of encrypted
+    // columns (`ENCRYPTED WITH VAULT`, rewritten only later) and the ledger
+    // and vault forms are not its grammar, and over a pending drop of
+    // their name they were refused as "already exists".
+    let created = match crate::core::rql::lexer_ct::create_table_with_reason(&QueryPurpose::CreateTable(stmt.to_string())).0 {
+        Some(ct) if name_at == 2 && is(1, "TABLE") => ct.table_name,
+        _ => {
+            let at = if is(name_at, "IF") && is(name_at + 1, "NOT") && is(name_at + 2, "EXISTS") { name_at + 3 } else { name_at };
+            let raw = words.get(at)?.split('(').next()?;
+            let name = crate::core::sql_scan::bare_name(raw);
+            if name.is_empty() {
+                return None;
+            }
+            name
+        }
+    };
     pending.into_iter().find(|p| p.eq_ignore_ascii_case(&created))
 }
 

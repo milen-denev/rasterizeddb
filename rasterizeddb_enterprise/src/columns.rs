@@ -440,9 +440,27 @@ fn analyze(all: &[Col], sql: &str, mode: Mode, database: Option<&Database>) -> R
         return Err("0A000: a column is declared ENCRYPTED when its table is created (CREATE TABLE … ENCRYPTED WITH VAULT v KEY 'k'); ALTER TABLE cannot add one".into());
     }
 
+    // A CREATE defines its table anew: the registry's columns of that name
+    // are a table it replaces (dropped earlier in the block, and set aside)
+    // or one the CREATE fails on (42P07), never the columns it declares.
+    // Applied to them, a block's DROP TABLE t then CREATE TABLE t (…) was
+    // refused for naming t's old encrypted column. What it selects from
+    // (`CREATE TABLE c AS SELECT … FROM t`) still counts.
+    let created: Option<String> = if first.kw("CREATE") {
+        t.iter().take(4).position(|x| x.kw("TABLE")).and_then(|at| {
+            let mut p = at + 1;
+            if t.get(p).is_some_and(|x| x.kw("IF")) {
+                p += 3;
+            }
+            t.get(p).filter(|x| matches!(x.k, K::Word | K::QWord)).map(|x| x.text.clone())
+        })
+    } else {
+        None
+    };
     // The tables with encrypted columns this statement names.
     let named: Vec<&Col> = all
         .iter()
+        .filter(|c| !created.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&c.table)))
         .filter(|c| t.iter().any(|x| match x.k {
             K::Word => x.text.eq_ignore_ascii_case(&c.table),
             K::QWord => x.text == c.table,
@@ -984,6 +1002,26 @@ impl ColumnCrypto for Cipher {
 
     fn show_lines(&self, store: &str) -> Vec<String> {
         show_lines(store)
+    }
+
+    fn rename_table(&self, store: &str, from: &str, to: &str) {
+        let mut all = match cols(store) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("encrypted columns: {e}");
+                return;
+            }
+        };
+        let mut moved = false;
+        for c in all.iter_mut().filter(|c| c.table.eq_ignore_ascii_case(from)) {
+            c.table = to.to_string();
+            moved = true;
+        }
+        if moved {
+            if let Err(e) = set_cols(store, all) {
+                log::error!("encrypted columns: could not follow \"{from}\" to \"{to}\": {e}");
+            }
+        }
     }
 
     fn forget_table(&self, store: &str, table: &str) {

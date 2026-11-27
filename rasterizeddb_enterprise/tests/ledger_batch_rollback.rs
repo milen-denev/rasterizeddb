@@ -108,6 +108,25 @@ async fn a_failed_batch_takes_its_vault_and_ledger_ddl_with_it() {
     let e = refused(&admin, "VAULT bv CREATE KEY 'k2'").await;
     assert!(e.contains("exists"), "{e}");
 
+    // --- a table dropped and made again in a block that rolls back ------------
+    // The dropped one is set aside under a hidden name and comes back with
+    // its rows; its encrypted columns' keys must come back with it, whether
+    // the new table declares encrypted columns or none.
+    for again in [
+        "CREATE TABLE kc (id BIGINT, s TEXT)",
+        "CREATE TABLE kc (id BIGINT, s TEXT ENCRYPTED WITH VAULT bv KEY 'k2')",
+    ] {
+        session
+            .query(&format!("BEGIN; DROP TABLE kc; {again}; ROLLBACK"))
+            .await
+            .unwrap_or_else(|e| panic!("{again}: {e}"));
+        assert_eq!(col(&admin, "SELECT s FROM kc").await, vec![Some("kept".into())], "after {again}");
+    }
+    // And a committed one is the new table: plain, so filtered on freely.
+    session.query("BEGIN; DROP TABLE kc; CREATE TABLE kc (id BIGINT, s TEXT); COMMIT").await.unwrap();
+    run(&admin, "INSERT INTO kc (id, s) VALUES (2, 'plain')").await;
+    assert_eq!(col(&admin, "SELECT s FROM kc WHERE s = 'plain'").await, vec![Some("plain".into())]);
+
     drop(session);
     drop(admin);
     db.shutdown().await.unwrap();

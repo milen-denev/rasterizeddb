@@ -78,6 +78,11 @@ pub trait ColumnCrypto: Send + Sync + 'static {
     /// (`Database::drop_table_for_rollback`, also after a crash): its
     /// columns are forgotten, as a `DROP TABLE` statement's are.
     fn forget_table(&self, _store: &str, _table: &str) {}
+    /// Block DDL renamed `from` to `to`: a dropped table set aside under a
+    /// hidden name for a new one of its name, or renamed back by a
+    /// rollback (`block_ddl::set_aside`, `rename_back`). Its columns follow
+    /// it, so the new table neither inherits nor clobbers them.
+    fn rename_table(&self, _store: &str, _from: &str, _to: &str) {}
 }
 
 static HOOKS: OnceLock<Box<dyn ColumnCrypto>> = OnceLock::new();
@@ -143,6 +148,13 @@ pub fn plan(database: &Database, sql: &str) -> Result<Option<Plan>, String> {
 pub fn finish(database: &Database, token: u64, ok: bool) {
     if let Some(h) = hooks() {
         h.finish(&database.ledger_store(), token, ok);
+    }
+}
+
+/// See [`ColumnCrypto::rename_table`].
+pub fn rename_table(database: &Database, from: &str, to: &str) {
+    if let Some(h) = hooks() {
+        h.rename_table(&database.ledger_store(), from, to);
     }
 }
 

@@ -1095,6 +1095,9 @@ impl Database {
         };
         let sequences = owned(to);
         self.rename_table(to, from).await?;
+        // Its encrypted columns' entries follow it back (`set_aside` moved
+        // them to the hidden name).
+        crate::core::column_crypto::rename_table(self, to, from);
         // A drop the block still has pending of the renamed table follows
         // it back (a ROLLBACK TO undid a set-aside, `set_aside`).
         if let Err(e) = self.retarget_pending_drop(root, to, from) {
@@ -1188,6 +1191,10 @@ pub(crate) async fn set_aside(database: &rclite::Arc<Database>, root: TxId, name
         .rename_table(&table, &aside)
         .await
         .map_err(|e| format!("could not set \"{table}\" aside for the table created under its name: {e}"))?;
+    // Its encrypted columns' entries go with it: left under the name, the
+    // new table would have been taken to have them, and a rollback's drop
+    // of the new table forgot them, the old table's keys with them.
+    crate::core::column_crypto::rename_table(database, &table, &aside);
     // Its pending drop follows it, in place: where the DROP was, so a
     // ROLLBACK TO a savepoint set between the DROP and this CREATE undoes
     // the rename (which points the drop back, `rename_back`) and keeps the
