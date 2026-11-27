@@ -1457,7 +1457,8 @@ pub(crate) async fn materialize(
                 // The filter the probe ran with, when it did: the outer
                 // item's copy below takes it too.
                 let mut pushed: Option<String> = None;
-                let filter = outer_only_filter(&current, &item, alias);
+                let bare = bare_outer_columns(&current, alias, relation, database);
+                let filter = outer_only_filter(&current, &item, alias, &bare);
                 // A statement its LIMIT may cut (`limited_outer`) is asked
                 // for the rows the limit keeps and one more, not for every
                 // outer value: more than it keeps is all the cut needs to
@@ -2390,7 +2391,7 @@ fn same_name(a: &str, b: &str) -> bool {
 ///
 /// Dropping a conjunct only keeps more rows, never fewer, so whatever is
 /// left out is still decided by the statement's own `WHERE`.
-fn outer_only_filter(sql: &str, item: &Item, alias: &str) -> Option<String> {
+fn outer_only_filter(sql: &str, item: &Item, alias: &str, bare: &[String]) -> Option<String> {
     let first = items_before(sql, item.start).into_iter().next()?;
     // `AS "d"` and `d` are one alias (a plain lower-case name quoted): an
     // ORM's quoted aliases left every correlated subquery unnarrowed.
@@ -2410,17 +2411,149 @@ fn outer_only_filter(sql: &str, item: &Item, alias: &str) -> Option<String> {
         }
     }
     let clause = sql[body..end].trim().trim_end_matches(';');
+    // A bare column that can only be the outer item's is read as it
+    // (`bare_outer_columns`): `AND id = 1` narrows as `AND t.id = 1` does.
     let terms: Vec<String> = conjuncts(clause)
         .into_iter()
+        .map(|t| qualify_bare(&t, alias, bare))
         .filter(|t| !t.is_empty() && (reads_only(t, alias) || exists_reads_only(t, alias)))
         .collect();
     (!terms.is_empty()).then(|| terms.join(" AND "))
 }
 
+/// The columns of the outer item `alias` (the relation `relation`) that a
+/// bare name in the statement's `WHERE` can only mean: PostgreSQL resolves a
+/// bare name among every `FROM` item, so one is the outer item's alone when
+/// no other table in the `FROM` list has a column of that name and the list
+/// writes the name nowhere but as `alias.name` (a derived table, a `LATERAL`
+/// item or a function there may produce a column called anything its text
+/// says). Anything less certain is left out, and its conjunct is then not
+/// pushed: the statement's own `WHERE` still decides it.
+///
+/// Without this only `t.id = 1` narrowed the rows a `LATERAL` item runs for;
+/// `id = 1` left it running for every row, and an item that fails on some
+/// row the filter refuses (`jsonb_each` of a document that is no object)
+/// failed the statement, where PostgreSQL filters first and answers.
+fn bare_outer_columns(sql: &str, alias: &str, relation: &str, database: &Arc<Database>) -> Vec<String> {
+    let Some(view) = database.schema_view(relation.trim_matches('"')) else {
+        return Vec::new();
+    };
+    let Some(from) = find_keyword(sql, "FROM", 0) else {
+        return Vec::new();
+    };
+    let list_at = from + "FROM".len();
+    let list = &sql[list_at..list_at + clause_end_of_from(&sql[list_at..])];
+    // Every word of the list: where it is written, and what it is qualified by.
+    let bytes = list.as_bytes();
+    let mut words: Vec<(&str, Option<&str>)> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+                continue;
+            }
+            // A quoted name may be any of this: nothing is certain.
+            b'"' => return Vec::new(),
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                let start = i;
+                while i < bytes.len() && is_word(bytes[i]) {
+                    i += 1;
+                }
+                let qualifier = (start > 0 && bytes[start - 1] == b'.').then(|| {
+                    let end = start - 1;
+                    let begin = (0..end).rev().take_while(|&k| is_word(bytes[k])).last().unwrap_or(end);
+                    &list[begin..end]
+                });
+                words.push((&list[start..i], qualifier));
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // The other tables the list names, by their own columns.
+    let outer_name = relation.trim_matches('"');
+    let other_tables: Vec<_> = words
+        .iter()
+        .filter(|(w, q)| q.is_none() && !w.eq_ignore_ascii_case(outer_name))
+        .filter_map(|(w, _)| database.schema_view(w))
+        .collect();
+    view.schema()
+        .fields
+        .iter()
+        .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+        .map(|f| f.name.clone())
+        .filter(|name| {
+            let written_elsewhere = words.iter().any(|(w, q)| w.eq_ignore_ascii_case(name) && !q.is_some_and(|q| same_name(q, alias)));
+            let in_another_table = other_tables.iter().any(|t| t.schema().fields.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name)));
+            !written_elsewhere && !in_another_table
+        })
+        .collect()
+}
+
+/// `term` with each bare word that is one of `columns` written `alias.word`.
+/// A word after a `.`, before a `.` or a `(`, in a string, or naming a type
+/// after `::` is not a bare column.
+fn qualify_bare(term: &str, alias: &str, columns: &[String]) -> String {
+    if columns.is_empty() {
+        return term.to_string();
+    }
+    let bytes = term.as_bytes();
+    let mut out = String::with_capacity(term.len() + 8);
+    let mut i = 0usize;
+    let mut after_cast = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            out.push_str(&term[i..end]);
+            i = end;
+            after_cast = false;
+            continue;
+        }
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < bytes.len() && is_word(bytes[i]) {
+                i += 1;
+            }
+            let word = &term[start..i];
+            let qualified = (start > 0 && bytes[start - 1] == b'.') || bytes.get(i) == Some(&b'.');
+            let called = term[i..].trim_start().starts_with('(');
+            let numeric_tail = start > 0 && bytes[start - 1].is_ascii_digit();
+            if !qualified && !called && !after_cast && !numeric_tail && columns.iter().any(|c| c.eq_ignore_ascii_case(word)) {
+                out.push_str(alias);
+                out.push('.');
+            }
+            out.push_str(word);
+            after_cast = false;
+            continue;
+        }
+        if b == b':' && bytes.get(i + 1) == Some(&b':') {
+            out.push_str("::");
+            i += 2;
+            while i < bytes.len() && bytes[i] == b' ' {
+                out.push(' ');
+                i += 1;
+            }
+            after_cast = true;
+            continue;
+        }
+        if !b.is_ascii_whitespace() {
+            after_cast = false;
+        }
+        // The whole character: a byte of a multibyte one is not text.
+        let ch = term[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// `split_conjuncts`, with a `BETWEEN`'s own `AND` kept inside its term:
 /// split there, `a BETWEEN 1 AND 2 OR b = 5` became `a BETWEEN 1` and
 /// `2 OR b = 5`.
-fn conjuncts(clause: &str) -> Vec<String> {
+pub(crate) fn conjuncts(clause: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut open = false;
     for part in crate::core::rql::join::split_conjuncts(clause) {
@@ -2750,6 +2883,19 @@ async fn rename_columns(item: &Item, built: &str, database: &Arc<Database>, tx: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_outer_column_is_qualified_where_it_stands_as_one() {
+        let columns = vec!["id".to_string(), "k".to_string(), "text".to_string()];
+        let q = |term: &str| qualify_bare(term, "t", &columns);
+        assert_eq!(q("id = 1"), "t.id = 1");
+        assert_eq!(q("k IN ('id', 'k') AND NOT id > 2"), "t.k IN ('id', 'k') AND NOT t.id > 2");
+        // Qualified already, a call, a type, another relation's, a number's tail.
+        assert_eq!(q("t.id = 1 OR u.id = 2"), "t.id = 1 OR u.id = 2");
+        assert_eq!(q("k(1) = id::text"), "k(1) = t.id::text");
+        assert_eq!(q("id = 1e5 AND k = 'é' AND «k» = 2"), "t.id = 1e5 AND t.k = 'é' AND «t.k» = 2");
+        assert_eq!(qualify_bare("id = 1", "t", &[]), "id = 1");
+    }
 
     #[test]
     fn bare_names_are_the_words_that_can_only_be_columns() {
