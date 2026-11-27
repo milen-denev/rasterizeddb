@@ -295,9 +295,12 @@ fn per_row(sql: &str, at: usize) -> bool {
     }
     open.iter().any(|&paren| {
         let before = sql[..paren].trim_end();
+        // Past the whole character: `+ 1` cut a multibyte one.
         let word_start = before
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .map_or(0, |p| p + 1);
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |(p, c)| p + c.len_utf8());
         let word = before[word_start..].to_ascii_lowercase();
         word == "filter" || crate::core::rql::distinct_on::AGGREGATES.contains(&word.as_str())
     })
